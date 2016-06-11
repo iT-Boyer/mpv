@@ -43,6 +43,21 @@ struct priv {
     GLvdpauSurfaceNV vdpgl_video_surface;
     struct mp_vdpau_mixer *mixer;
     bool mapped;
+    struct gl_vao vao;
+    struct gl_shader_cache *sc;
+    struct fbotex fbos[2];
+    GLenum target;
+};
+
+struct vertex {
+    float position[2];
+    float texcoord[2];
+};
+
+static const struct gl_vao_entry vertex_vao[] = {
+    {"position",    2, GL_FLOAT,         false, offsetof(struct vertex, position)},
+    {"texcoord" ,   2, GL_FLOAT,         false, offsetof(struct vertex, texcoord)},
+    {0}
 };
 
 static void unmap(struct gl_hwdec *hw)
@@ -134,6 +149,9 @@ static int create(struct gl_hwdec *hw)
         destroy(hw);
         return -1;
     }
+    p->sc = gl_sc_create(gl, hw->log);
+    gl_vao_init(&p->vao, gl, sizeof(struct vertex), vertex_vao);
+    gl_sc_set_vao(p->sc, &p->vao);
     p->ctx->hwctx.driver_name = hw->driver->name;
     hwdec_devices_add(hw->devs, &p->ctx->hwctx);
     return 0;
@@ -163,15 +181,17 @@ static int reinit(struct gl_hwdec *hw, struct mp_image_params *params)
                                         params->w, params->h, &p->vdp_surface);
     CHECK_VDP_ERROR(p, "Error when calling vdp_output_surface_create");
 
+    p->target = GL_TEXTURE_RECTANGLE;
+
     gl->GenTextures(4, p->gl_textures);
     for (int n = 0; n < 4; n++) {
-        gl->BindTexture(GL_TEXTURE_2D, p->gl_textures[n]);
-        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        gl->BindTexture(p->target, p->gl_textures[n]);
+        gl->TexParameteri(p->target, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        gl->TexParameteri(p->target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        gl->TexParameteri(p->target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl->TexParameteri(p->target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
-    gl->BindTexture(GL_TEXTURE_2D, 0);
+    gl->BindTexture(p->target, 0);
 
     /*
     p->vdpgl_surface = gl->VDPAURegisterOutputSurfaceNV(BRAINDEATH(p->vdp_surface),
@@ -226,7 +246,7 @@ static int map_frame(struct gl_hwdec *hw, struct mp_image *hw_image,
     CHECK_VDP_ERROR(hw, "Error when calling vdp_video_surface_get_parameters");
 
     p->vdpgl_video_surface = gl->VDPAURegisterVideoSurfaceNV(BRAINDEATH(surface),
-                                                             GL_TEXTURE_2D,
+                                                             p->target,
                                                              4, p->gl_textures);
     if (!p->vdpgl_video_surface)
         return -1;
@@ -234,22 +254,62 @@ static int map_frame(struct gl_hwdec *hw, struct mp_image *hw_image,
     gl->VDPAUSurfaceAccessNV(p->vdpgl_video_surface, GL_READ_ONLY);
     gl->VDPAUMapSurfacesNV(1, &p->vdpgl_video_surface);
 
+    int sx[4] = {0, 1};
+    int sy[4] = {0, 1};
+
+    for (int plane = 0; plane < 2; plane++) {
+        int d_w = s_w >> sx[plane];
+        int d_h = s_h >> sy[plane];
+
+        fbotex_change(&p->fbos[plane], gl, hw->log, d_w, d_h,
+                      plane ? GL_RG8 : GL_R8, 0);
+
+        for (int n = 0; n < 2; n++) {
+            gl_sc_uniform_sampler(p->sc, n ? "t1" : "t0", p->target, n);
+            gl->ActiveTexture(GL_TEXTURE0 + n);
+            gl->BindTexture(p->target, p->gl_textures[plane * 2 + n]);
+        }
+
+        struct vertex va[4] = {0};
+
+        for (int n = 0; n < 4; n++) {
+            struct vertex *v = &va[n];
+            v->position[0] = n / 2 * 2 - 1;
+            v->position[1] = n % 2 * 2 - 1;
+            v->texcoord[0] = (n / 2) * (s_w >> sx[plane]);
+            v->texcoord[1] = (n % 2) * (s_h >> sy[plane]) / 2;
+        }
+
+        gl_sc_add(p->sc, "color = fract(gl_FragCoord.y / 2) < 0.5 ? texture(t0, texcoord) "
+                         ": texture(t1, texcoord);");
+        gl_sc_gen_shader_and_reset(p->sc);
+
+        gl->BindFramebuffer(GL_FRAMEBUFFER, p->fbos[plane].fbo);
+
+        gl->Viewport(0, 0, d_w, d_h);
+        gl_vao_draw_data(&p->vao, GL_TRIANGLE_STRIP, va, 4);
+    }
+
+    gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    for (int n = 0; n < 2; n++) {
+        gl->ActiveTexture(GL_TEXTURE0 + n);
+        gl->BindTexture(p->target, 0);
+    }
+    gl->ActiveTexture(GL_TEXTURE0);
+
     p->mapped = true;
     *out_frame = (struct gl_hwdec_frame){
-        .interlaced = true,
+        .interlaced = false,
     };
-    for (int n = 0; n < 4; n++) {
-        bool chroma = n >= 2;
-        out_frame->planes[n] = (struct gl_hwdec_plane){
-            .gl_texture = p->gl_textures[n],
+    for (int plane = 0; plane < 2; plane++) {
+        out_frame->planes[plane] = (struct gl_hwdec_plane){
+            .gl_texture = p->fbos[plane].texture,
             .gl_target = GL_TEXTURE_2D,
-            .tex_w = s_w / (chroma ? 2 : 1),
-            .tex_h = s_h / (chroma ? 4 : 2),
+            .tex_w = s_w >> sx[plane],
+            .tex_h = s_h >> sy[plane],
         };
     };
-    // as a temporary hack: change it from 0/1=luma0/1 & 1/2=chroma0/1 to
-    // 0/1=chroma0/luma0 & 1/2=chroma1/luma1
-    MPSWAP(struct gl_hwdec_plane, out_frame->planes[1], out_frame->planes[2]);
     return 0;
 }
 
