@@ -15,21 +15,20 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <libavutil/common.h>
-
+#include "common/common.h"
 #include "stream.h"
 
 struct priv {
     bstr data;
 };
 
-static int fill_buffer(stream_t *s, char* buffer, int len)
+static int fill_buffer(stream_t *s, void *buffer, int len)
 {
     struct priv *p = s->priv;
     bstr data = p->data;
     if (s->pos < 0 || s->pos > data.len)
         return 0;
-    len = FFMIN(len, data.len - s->pos);
+    len = MPMIN(len, data.len - s->pos);
     memcpy(buffer, data.start + s->pos, len);
     return len;
 }
@@ -39,55 +38,18 @@ static int seek(stream_t *s, int64_t newpos)
     return 1;
 }
 
-static int control(stream_t *s, int cmd, void *arg)
+static int64_t get_size(stream_t *s)
 {
     struct priv *p = s->priv;
-    switch(cmd) {
-    case STREAM_CTRL_GET_SIZE:
-        *(int64_t *)arg = p->data.len;
-        return 1;
-    case STREAM_CTRL_SET_CONTENTS: ;
-        bstr *data = (bstr *)arg;
-        talloc_free(p->data.start);
-        p->data = bstrdup(s, *data);
-        return 1;
-    }
-    return STREAM_UNSUPPORTED;
+    return p->data.len;
 }
 
-static int h_to_i(unsigned char c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-static bool bstr_to_hex_inplace(bstr *h)
-{
-    if (h->len % 2)
-        return false;
-    for (int n = 0; n < h->len / 2; n++) {
-        int hi = h_to_i(h->start[n * 2 + 0]);
-        int lo = h_to_i(h->start[n * 2 + 1]);
-        if (hi < 0 || lo < 0)
-            return false;
-        h->start[n] = (hi << 4) | lo;
-    }
-    h->len /= 2;
-    return true;
-}
-
-static int open_f(stream_t *stream)
+static int open2(stream_t *stream, struct stream_open_args *args)
 {
     stream->fill_buffer = fill_buffer;
     stream->seek = seek;
     stream->seekable = true;
-    stream->control = control;
-    stream->read_chunk = 1024 * 1024;
+    stream->get_size = get_size;
 
     struct priv *p = talloc_zero(stream, struct priv);
     stream->priv = p;
@@ -97,9 +59,13 @@ static int open_f(stream_t *stream)
     bool use_hex = bstr_eatstart0(&data, "hex://");
     if (!use_hex)
         bstr_eatstart0(&data, "memory://");
-    stream_control(stream, STREAM_CTRL_SET_CONTENTS, &data);
 
-    if (use_hex && !bstr_to_hex_inplace(&p->data)) {
+    if (args->special_arg)
+        data = *(bstr *)args->special_arg;
+
+    p->data = bstrdup(stream, data);
+
+    if (use_hex && !bstr_decode_hex(stream, p->data, &p->data)) {
         MP_FATAL(stream, "Invalid data.\n");
         return STREAM_ERROR;
     }
@@ -109,6 +75,26 @@ static int open_f(stream_t *stream)
 
 const stream_info_t stream_info_memory = {
     .name = "memory",
-    .open = open_f,
+    .open2 = open2,
     .protocols = (const char*const[]){ "memory", "hex", NULL },
 };
+
+// The data is copied.
+// Caller may need to set stream.stream_origin correctly.
+struct stream *stream_memory_open(struct mpv_global *global, void *data, int len)
+{
+    assert(len >= 0);
+
+    struct stream_open_args sargs = {
+        .global = global,
+        .url = "memory://",
+        .flags = STREAM_READ | STREAM_SILENT | STREAM_ORIGIN_DIRECT,
+        .sinfo = &stream_info_memory,
+        .special_arg = &(bstr){data, len},
+    };
+
+    struct stream *s = NULL;
+    stream_create_with_args(&sargs, &s);
+    MP_HANDLE_OOM(s);
+    return s;
+}

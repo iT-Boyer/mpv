@@ -31,8 +31,6 @@
 #include "misc/bstr.h"
 #include "sd.h"
 
-#define HAVE_AV_WEBVTT (LIBAVCODEC_VERSION_MICRO >= 100)
-
 struct lavc_conv {
     struct mp_log *log;
     AVCodecContext *avctx;
@@ -57,12 +55,13 @@ static const char *get_lavc_format(const char *format)
 // We always want the user defined style instead.
 static void disable_styles(bstr header)
 {
+    bstr style = bstr0("\nStyle: ");
     while (header.len) {
-        int n = bstr_find(header, bstr0("\nStyle: "));
+        int n = bstr_find(header, style);
         if (n < 0)
             break;
         header.start[n + 1] = '#'; // turn into a comment
-        header = bstr_cut(header, 2);
+        header = bstr_cut(header, n + style.len);
     }
 }
 
@@ -84,6 +83,8 @@ struct lavc_conv *lavc_conv_create(struct mp_log *log, const char *codec_name,
         goto error;
     if (mp_lavc_set_extradata(avctx, extradata, extradata_len) < 0)
         goto error;
+    av_dict_set(&opts, "sub_text_format", "ass", 0);
+    av_dict_set(&opts, "flags2", "+ass_ro_flush_noop", 0);
     if (strcmp(codec_name, "eia_608") == 0)
         av_dict_set(&opts, "real_time", "1", 0);
     if (avcodec_open2(avctx, codec, &opts) < 0)
@@ -91,6 +92,8 @@ struct lavc_conv *lavc_conv_create(struct mp_log *log, const char *codec_name,
     av_dict_free(&opts);
     // Documented as "set by libavcodec", but there is no other way
     avctx->time_base = (AVRational) {1, 1000};
+    avctx->pkt_timebase = avctx->time_base;
+    avctx->sub_charenc_mode = FF_SUB_CHARENC_MODE_IGNORE;
     priv->avctx = avctx;
     priv->extradata = talloc_strndup(priv, avctx->subtitle_header,
                                      avctx->subtitle_header_size);
@@ -109,8 +112,6 @@ char *lavc_conv_get_extradata(struct lavc_conv *priv)
 {
     return priv->extradata;
 }
-
-#if HAVE_AV_WEBVTT
 
 // FFmpeg WebVTT packets are pre-parsed in some way. The FFmpeg Matroska
 // demuxer does this on its own. In order to free our demuxer_mkv.c from
@@ -210,23 +211,14 @@ static int parse_webvtt(AVPacket *in, AVPacket *pkt)
 
     pkt->pts = in->pts;
     pkt->duration = in->duration;
-#if !HAVE_AV_AVPACKET_INT64_DURATION
-    pkt->convergence_duration = in->convergence_duration;
-#endif
     return 0;
 }
 
-#else
-
-static int parse_webvtt(AVPacket *in, AVPacket *pkt)
-{
-    return -1;
-}
-
-#endif
-
-// Return a NULL-terminated list of ASS event lines.
-char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet)
+// Return a NULL-terminated list of ASS event lines and have
+// the AVSubtitle display PTS and duration set to input
+// double variables.
+char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet,
+                        double *sub_pts, double *sub_duration)
 {
     AVCodecContext *avctx = priv->avctx;
     AVPacket pkt;
@@ -237,6 +229,8 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet)
     avsubtitle_free(&priv->cur);
 
     mp_set_av_packet(&pkt, packet, &avctx->time_base);
+    if (pkt.pts < 0)
+        pkt.pts = 0;
 
     if (strcmp(priv->codec, "webvtt-webm") == 0) {
         if (parse_webvtt(&pkt, &parsed_pkt) < 0) {
@@ -250,6 +244,14 @@ char **lavc_conv_decode(struct lavc_conv *priv, struct demux_packet *packet)
     if (ret < 0) {
         MP_ERR(priv, "Error decoding subtitle\n");
     } else if (got_sub) {
+        *sub_pts = packet->pts + mp_pts_from_av(priv->cur.start_display_time,
+                                               &avctx->time_base);
+        *sub_duration = priv->cur.end_display_time == UINT32_MAX ?
+                        UINT32_MAX :
+                        mp_pts_from_av(priv->cur.end_display_time -
+                                       priv->cur.start_display_time,
+                                       &avctx->time_base);
+
         for (int i = 0; i < priv->cur.num_rects; i++) {
             if (priv->cur.rects[i]->w > 0 && priv->cur.rects[i]->h > 0)
                 MP_WARN(priv, "Ignoring bitmap subtitle.\n");

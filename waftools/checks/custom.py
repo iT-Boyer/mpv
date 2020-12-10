@@ -1,10 +1,12 @@
 from waftools import inflector
 from waftools.checks.generic import *
 from waflib import Utils
+from distutils.version import StrictVersion
 import os
 
-__all__ = ["check_pthreads", "check_iconv", "check_lua", "check_oss_4front",
-           "check_cocoa"]
+__all__ = ["check_pthreads", "check_iconv", "check_lua",
+           "check_cocoa", "check_wl_protocols", "check_swift",
+           "check_egl_provider"]
 
 pthreads_program = load_fragment('pthreads.c')
 
@@ -50,20 +52,23 @@ def check_iconv(ctx, dependency_identifier):
     if ctx.env.DEST_OS == 'openbsd' or ctx.env.DEST_OS == 'freebsd':
         args['cflags'] = '-I/usr/local/include'
         args['linkflags'] = '-L/usr/local/lib'
+    elif ctx.env.DEST_OS == 'win32':
+        args['linkflags'] = " ".join(['-L' + x for x in ctx.env.LIBRARY_PATH])
     checkfn = check_cc(**args)
     return check_libs(libs, checkfn)(ctx, dependency_identifier)
 
 def check_lua(ctx, dependency_identifier):
     lua_versions = [
-        ( '51',     'lua >= 5.1.0 lua < 5.2.0'),
-        ( '51obsd', 'lua51 >= 5.1.0'), # OpenBSD
-        ( '51deb',  'lua5.1 >= 5.1.0'), # debian
-        ( '51fbsd', 'lua-5.1 >= 5.1.0'), # FreeBSD
         ( '52',     'lua >= 5.2.0 lua < 5.3.0' ),
         ( '52arch', 'lua52 >= 5.2.0'), # Arch
         ( '52deb',  'lua5.2 >= 5.2.0'), # debian
         ( '52fbsd', 'lua-5.2 >= 5.2.0'), # FreeBSD
         ( 'luajit', 'luajit >= 2.0.0' ),
+        ( '51',     'lua >= 5.1.0 lua < 5.2.0'),
+        ( '51obsd', 'lua51 >= 5.1.0'), # OpenBSD
+        ( '51arch', 'lua51 >= 5.1.0'), # Arch
+        ( '51deb',  'lua5.1 >= 5.1.0'), # debian
+        ( '51fbsd', 'lua-5.1 >= 5.1.0'), # FreeBSD
     ]
 
     if ctx.options.LUA_VER:
@@ -81,30 +86,13 @@ def check_lua(ctx, dependency_identifier):
             return True
     return False
 
-def __get_osslibdir():
-    cmd = ['sh', '-c', '. /etc/oss.conf && echo $OSSLIBDIR']
-    p = Utils.subprocess.Popen(cmd, stdin=Utils.subprocess.PIPE,
-                                    stdout=Utils.subprocess.PIPE,
-                                    stderr=Utils.subprocess.PIPE)
-    return p.communicate()[0].decode().rstrip()
-
-def check_oss_4front(ctx, dependency_identifier):
-    oss_libdir = __get_osslibdir()
-
-    # avoid false positive from native sys/soundcard.h
-    if not oss_libdir:
-        ctx.undefine(inflector.define_key(dependency_identifier))
-        return False
-
-    soundcard_h = os.path.join(oss_libdir, "include/sys/soundcard.h")
-    include_dir = os.path.join(oss_libdir, "include")
-
-    fn = check_cc(header_name=soundcard_h,
-                  defines=['PATH_DEV_DSP="/dev/dsp"',
-                           'PATH_DEV_MIXER="/dev/mixer"'],
-                  cflags='-I{0}'.format(include_dir),
-                  fragment=load_fragment('oss_audio.c'))
-
+def check_wl_protocols(ctx, dependency_identifier):
+    def fn(ctx, dependency_identifier):
+        ret = check_pkg_config_datadir("wayland-protocols", ">= 1.15")
+        ret = ret(ctx, dependency_identifier)
+        if ret != None:
+            ctx.env.WL_PROTO_DIR = ret.split()[0]
+        return ret
     return fn(ctx, dependency_identifier)
 
 def check_cocoa(ctx, dependency_identifier):
@@ -112,7 +100,55 @@ def check_cocoa(ctx, dependency_identifier):
         fragment         = load_fragment('cocoa.m'),
         compile_filename = 'test.m',
         framework_name   = ['Cocoa', 'IOKit', 'OpenGL', 'QuartzCore'],
-        includes         = ctx.srcnode.abspath(),
+        includes         = [ctx.srcnode.abspath()],
         linkflags        = '-fobjc-arc')
 
-    return fn(ctx, dependency_identifier)
+    res = fn(ctx, dependency_identifier)
+    if res and ctx.env.MACOS_SDK:
+        # on macOS we explicitly need to set the SDK path, otherwise it can lead
+        # to linking warnings or errors
+        ctx.env.append_value('LAST_LINKFLAGS', [
+            '-isysroot', ctx.env.MACOS_SDK,
+            '-L/usr/lib',
+            '-L/usr/local/lib'
+        ])
+
+    return res
+
+def check_swift(ctx, dependency_identifier):
+    minVer = StrictVersion("3.0.2")
+    if ctx.env.SWIFT_VERSION:
+        if StrictVersion(ctx.env.SWIFT_VERSION) >= minVer:
+            ctx.add_optional_message(dependency_identifier,
+                                     'version found: ' + str(ctx.env.SWIFT_VERSION))
+            return True
+    ctx.add_optional_message(dependency_identifier,
+                             "'swift >= " + str(minVer) + "' not found, found " +
+                             str(ctx.env.SWIFT_VERSION or None))
+    return False
+
+def check_egl_provider(minVersion=None, name='egl', check=None):
+    def fn(ctx, dependency_identifier, **kw):
+        if not hasattr(ctx, 'egl_provider'):
+            egl_provider_check = check or check_pkg_config(name)
+            if egl_provider_check(ctx, dependency_identifier):
+                ctx.egl_provider = name
+                for ver in ['1.5', '1.4', '1.3', '1.2', '1.1', '1.0']:
+                    stmt = 'int x[EGL_VERSION_{0}]'.format(ver.replace('.','_'))
+                    check_stmt = check_statement(['EGL/egl.h'], stmt)
+                    if check_stmt(ctx, dependency_identifier):
+                        ctx.egl_provider_version = StrictVersion(ver)
+                        break
+                return True
+            else:
+                return False
+        else:
+            minVersionSV = minVersion and StrictVersion(minVersion)
+            if not minVersionSV or ctx.egl_provider_version and \
+                    ctx.egl_provider_version >= minVersionSV:
+                defkey = inflector.define_key(dependency_identifier)
+                ctx.define(defkey, 1)
+                return True
+            else:
+                return False
+    return fn

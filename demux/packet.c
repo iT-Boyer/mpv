@@ -1,19 +1,20 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,13 +27,30 @@
 
 #include "common/av_common.h"
 #include "common/common.h"
+#include "demux.h"
 
 #include "packet.h"
+
+// Free any refcounted data dp holds (but don't free dp itself). This does not
+// care about pointers that are _not_ refcounted (like demux_packet.codec).
+// Normally, a user should use talloc_free(dp). This function is only for
+// annoyingly specific obscure use cases.
+void demux_packet_unref_contents(struct demux_packet *dp)
+{
+    if (dp->avpacket) {
+        assert(!dp->is_cached);
+        av_packet_unref(dp->avpacket);
+        talloc_free(dp->avpacket);
+        dp->avpacket = NULL;
+        dp->buffer = NULL;
+        dp->len = 0;
+    }
+}
 
 static void packet_destroy(void *ptr)
 {
     struct demux_packet *dp = ptr;
-    av_packet_unref(dp->avpacket);
+    demux_packet_unref_contents(dp);
 }
 
 // This actually preserves only data and side data, not PTS/DTS/pos/etc.
@@ -73,6 +91,19 @@ struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
     return dp;
 }
 
+// (buf must include proper padding)
+struct demux_packet *new_demux_packet_from_buf(struct AVBufferRef *buf)
+{
+    if (!buf)
+        return NULL;
+    AVPacket pkt = {
+        .size = buf->size,
+        .data = buf->data,
+        .buf = buf,
+    };
+    return new_demux_packet_from_avpacket(&pkt);
+}
+
 // Input data doesn't need to be padded.
 struct demux_packet *new_demux_packet_from(void *data, size_t len)
 {
@@ -93,8 +124,10 @@ struct demux_packet *new_demux_packet(size_t len)
 void demux_packet_shorten(struct demux_packet *dp, size_t len)
 {
     assert(len <= dp->len);
-    dp->len = len;
-    memset(dp->buffer + dp->len, 0, FF_INPUT_BUFFER_PADDING_SIZE);
+    if (dp->len) {
+        dp->len = len;
+        memset(dp->buffer + dp->len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    }
 }
 
 void free_demux_packet(struct demux_packet *dp)
@@ -108,9 +141,12 @@ void demux_packet_copy_attribs(struct demux_packet *dst, struct demux_packet *sr
     dst->dts = src->dts;
     dst->duration = src->duration;
     dst->pos = src->pos;
+    dst->segmented = src->segmented;
     dst->start = src->start;
     dst->end = src->end;
-    dst->new_segment = src->new_segment;
+    dst->codec = src->codec;
+    dst->back_restart = src->back_restart;
+    dst->back_preroll = src->back_preroll;
     dst->keyframe = src->keyframe;
     dst->stream = src->stream;
 }
@@ -130,10 +166,39 @@ struct demux_packet *demux_copy_packet(struct demux_packet *dp)
     return new;
 }
 
+#define ROUND_ALLOC(s) MP_ALIGN_UP((s), 16)
+
+// Attempt to estimate the total memory consumption of the given packet.
+// This is important if we store thousands of packets and not to exceed
+// user-provided limits. Of course we can't know how much memory internal
+// fragmentation of the libc memory allocator will waste.
+// Note that this should return a "stable" value - e.g. if a new packet ref
+// is created, this should return the same value with the new ref. (This
+// implies the value is not exact and does not return the actual size of
+// memory wasted due to internal fragmentation.)
+size_t demux_packet_estimate_total_size(struct demux_packet *dp)
+{
+    size_t size = ROUND_ALLOC(sizeof(struct demux_packet));
+    size += 8 * sizeof(void *); // ta  overhead
+    size += 10 * sizeof(void *); // additional estimate for ta_ext_header
+    if (dp->avpacket) {
+        assert(!dp->is_cached);
+        size += ROUND_ALLOC(dp->len);
+        size += ROUND_ALLOC(sizeof(AVPacket));
+        size += 8 * sizeof(void *); // ta  overhead
+        size += ROUND_ALLOC(sizeof(AVBufferRef));
+        size += ROUND_ALLOC(64); // upper bound estimate on sizeof(AVBuffer)
+        size += ROUND_ALLOC(dp->avpacket->side_data_elems *
+                            sizeof(dp->avpacket->side_data[0]));
+        for (int n = 0; n < dp->avpacket->side_data_elems; n++)
+            size += ROUND_ALLOC(dp->avpacket->side_data[n].size);
+    }
+    return size;
+}
+
 int demux_packet_set_padding(struct demux_packet *dp, int start, int end)
 {
-#if HAVE_AVFRAME_SKIP_SAMPLES
-    if (!start  && !end)
+    if (!start && !end)
         return 0;
     if (!dp->avpacket)
         return -1;
@@ -143,6 +208,21 @@ int demux_packet_set_padding(struct demux_packet *dp, int start, int end)
 
     AV_WL32(p + 0, start);
     AV_WL32(p + 4, end);
-#endif
+    return 0;
+}
+
+int demux_packet_add_blockadditional(struct demux_packet *dp, uint64_t id,
+                                     void *data, size_t size)
+{
+    if (!dp->avpacket)
+        return -1;
+    uint8_t *sd =  av_packet_new_side_data(dp->avpacket,
+                                           AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+                                           8 + size);
+    if (!sd)
+        return -1;
+    AV_WB64(sd, id);
+    if (size > 0)
+        memcpy(sd + 8, data, size);
     return 0;
 }

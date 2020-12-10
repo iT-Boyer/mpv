@@ -14,14 +14,15 @@ struct timeline *timeline_load(struct mpv_global *global, struct mp_log *log,
     *tl = (struct timeline){
         .global = global,
         .log = log,
-        .cancel = demuxer->stream->cancel,
+        .cancel = demuxer->cancel,
         .demuxer = demuxer,
-        .track_layout = demuxer,
+        .format = "unknown",
+        .stream_origin = demuxer->stream_origin,
     };
 
     demuxer->desc->load_timeline(tl);
 
-    if (tl->num_parts)
+    if (tl->num_pars)
         return tl;
     timeline_destroy(tl);
     return NULL;
@@ -34,7 +35,7 @@ void timeline_destroy(struct timeline *tl)
     for (int n = 0; n < tl->num_sources; n++) {
         struct demuxer *d = tl->sources[n];
         if (d != tl->demuxer)
-            free_demuxer_and_stream(d);
+            demux_free(d);
     }
     talloc_free(tl);
 }

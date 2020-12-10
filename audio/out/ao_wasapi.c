@@ -22,6 +22,7 @@
 #include <libavutil/mathematics.h>
 
 #include "options/m_option.h"
+#include "osdep/threads.h"
 #include "osdep/timer.h"
 #include "osdep/io.h"
 #include "misc/dispatch.h"
@@ -128,11 +129,12 @@ static bool thread_feed(struct ao *ao)
 
     BYTE *data[1] = {pData};
 
-    ao_read_data(ao, (void **)data, frame_count,
-                 mp_time_us() + (int64_t)llrint(delay_us));
+    ao_read_data_converted(ao, &state->convert_format,
+                           (void **)data, frame_count,
+                           mp_time_us() + (int64_t)llrint(delay_us));
 
     // note, we can't use ao_read_data return value here since we already
-    // commited to frame_count above in the GetBuffer call
+    // committed to frame_count above in the GetBuffer call
     hr = IAudioRenderClient_ReleaseBuffer(state->pRenderClient,
                                           frame_count, 0);
     EXIT_ON_ERROR(hr);
@@ -196,11 +198,12 @@ static DWORD __stdcall AudioThread(void *lpParameter)
 {
     struct ao *ao = lpParameter;
     struct wasapi_state *state = ao->priv;
+    mpthread_set_name("wasapi event");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
-    state->init_ret = wasapi_thread_init(ao);
+    state->init_ok = wasapi_thread_init(ao);
     SetEvent(state->hInitDone);
-    if (FAILED(state->init_ret))
+    if (!state->init_ok)
         goto exit_label;
 
     MP_DBG(ao, "Entering dispatch loop\n");
@@ -255,9 +258,9 @@ static void uninit(struct ao *ao)
                "while waiting for audio thread to terminate\n");
     }
 
-    SAFE_RELEASE(state->hInitDone,   CloseHandle(state->hInitDone));
-    SAFE_RELEASE(state->hWake,       CloseHandle(state->hWake));
-    SAFE_RELEASE(state->hAudioThread,CloseHandle(state->hAudioThread));
+    SAFE_DESTROY(state->hInitDone,   CloseHandle(state->hInitDone));
+    SAFE_DESTROY(state->hWake,       CloseHandle(state->hWake));
+    SAFE_DESTROY(state->hAudioThread,CloseHandle(state->hAudioThread));
 
     wasapi_change_uninit(ao);
 
@@ -275,13 +278,18 @@ static int init(struct ao *ao)
     struct wasapi_state *state = ao->priv;
     state->log = ao->log;
 
+    state->opt_exclusive |= ao->init_flags & AO_INIT_EXCLUSIVE;
+
+#if !HAVE_UWP
     state->deviceID = wasapi_find_deviceID(ao);
     if (!state->deviceID) {
         uninit(ao);
         return -1;
     }
+#endif
 
-    wasapi_change_init(ao, false);
+    if (state->deviceID)
+        wasapi_change_init(ao, false);
 
     state->hInitDone = CreateEventW(NULL, FALSE, FALSE, NULL);
     state->hWake     = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -294,7 +302,7 @@ static int init(struct ao *ao)
     state->dispatch = mp_dispatch_create(state);
     mp_dispatch_set_wakeup_fn(state->dispatch, thread_wakeup, ao);
 
-    state->init_ret = E_FAIL;
+    state->init_ok = false;
     state->hAudioThread = CreateThread(NULL, 0, &AudioThread, ao, 0, NULL);
     if (!state->hAudioThread) {
         MP_FATAL(ao, "Failed to create audio thread\n");
@@ -303,8 +311,8 @@ static int init(struct ao *ao)
     }
 
     WaitForSingleObject(state->hInitDone, INFINITE); // wait on init complete
-    SAFE_RELEASE(state->hInitDone,CloseHandle(state->hInitDone));
-    if (FAILED(state->init_ret)) {
+    SAFE_DESTROY(state->hInitDone,CloseHandle(state->hInitDone));
+    if (!state->init_ok) {
         if (!ao->probing)
             MP_FATAL(ao, "Received failure from audio thread\n");
         uninit(ao);
@@ -332,8 +340,6 @@ static int thread_control_exclusive(struct ao *ao, enum aocontrol cmd, void *arg
         if (!(state->vol_hw_support & ENDPOINT_HARDWARE_SUPPORT_MUTE))
             return CONTROL_FALSE;
         break;
-    case AOCONTROL_HAS_PER_APP_VOLUME:
-        return CONTROL_FALSE;
     }
 
     float volume;
@@ -392,8 +398,6 @@ static int thread_control_shared(struct ao *ao, enum aocontrol cmd, void *arg)
         mute = *(bool *)arg;
         ISimpleAudioVolume_SetMute(state->pAudioVolume, mute, NULL);
         return CONTROL_OK;
-    case AOCONTROL_HAS_PER_APP_VOLUME:
-        return CONTROL_TRUE;
     }
     return CONTROL_UNKNOWN;
 }
@@ -416,10 +420,10 @@ static int thread_control(struct ao *ao, enum aocontrol cmd, void *arg)
         do {
             IAudioSessionControl_SetDisplayName(state->pSessionControl, title, NULL);
 
-            SAFE_RELEASE(tmp, CoTaskMemFree(tmp));
+            SAFE_DESTROY(tmp, CoTaskMemFree(tmp));
             IAudioSessionControl_GetDisplayName(state->pSessionControl, &tmp);
-        } while (lstrcmpW(title, tmp));
-        SAFE_RELEASE(tmp, CoTaskMemFree(tmp));
+        } while (wcscmp(title, tmp));
+        SAFE_DESTROY(tmp, CoTaskMemFree(tmp));
         talloc_free(title);
         return CONTROL_OK;
     }
@@ -489,14 +493,9 @@ const struct ao_driver audio_out_wasapi = {
     .uninit         = uninit,
     .control        = control,
     .reset          = audio_reset,
-    .resume         = audio_resume,
+    .start          = audio_resume,
     .list_devs      = wasapi_list_devs,
     .hotplug_init   = hotplug_init,
     .hotplug_uninit = hotplug_uninit,
     .priv_size      = sizeof(wasapi_state),
-    .options        = (const struct m_option[]) {
-        OPT_FLAG("exclusive", opt_exclusive, 0),
-        OPT_STRING("device", opt_device, 0),
-        {NULL},
-    },
 };

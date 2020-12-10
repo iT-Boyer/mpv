@@ -1,12 +1,15 @@
 import os
 import inflector
+from distutils.version import StrictVersion
 from waflib.ConfigSet import ConfigSet
 from waflib import Utils
 
 __all__ = [
-    "check_pkg_config", "check_pkg_config_cflags", "check_cc", "check_statement", "check_libs",
-    "check_headers", "compose_checks", "check_true", "any_version",
-    "load_fragment", "check_stub", "check_ctx_vars", "check_program"]
+    "check_pkg_config", "check_pkg_config_mixed", "check_pkg_config_mixed_all",
+    "check_pkg_config_cflags", "check_cc", "check_statement", "check_libs",
+    "check_headers", "compose_checks", "any_check", "check_true", "any_version",
+    "load_fragment", "check_stub", "check_ctx_vars", "check_program",
+    "check_pkg_config_datadir", "check_macos_sdk"]
 
 any_version = None
 
@@ -69,24 +72,37 @@ def check_cc(**kw_ext):
     return fn
 
 def check_pkg_config(*args, **kw_ext):
-    return _check_pkg_config(["--libs", "--cflags"], *args, **kw_ext)
+    return _check_pkg_config([], ["--libs", "--cflags"], *args, **kw_ext)
+
+def check_pkg_config_mixed(_dyn_libs, *args, **kw_ext):
+    return _check_pkg_config([_dyn_libs], ["--libs", "--cflags"], *args, **kw_ext)
+
+def check_pkg_config_mixed_all(*all_args, **kw_ext):
+    args = [all_args[i] for i in [n for n in range(0, len(all_args)) if n % 3]]
+    return _check_pkg_config(all_args[::3], ["--libs", "--cflags"], *args, **kw_ext)
 
 def check_pkg_config_cflags(*args, **kw_ext):
-    return _check_pkg_config(["--cflags"], *args, **kw_ext)
+    return _check_pkg_config([], ["--cflags"], *args, **kw_ext)
 
-def _check_pkg_config(_pkgc_args, *args, **kw_ext):
+def check_pkg_config_datadir(*args, **kw_ext):
+    return _check_pkg_config([], ["--variable=pkgdatadir"], *args, **kw_ext)
+
+def _check_pkg_config(_dyn_libs, _pkgc_args, *args, **kw_ext):
     def fn(ctx, dependency_identifier, **kw):
         argsl     = list(args)
         packages  = args[::2]
         verchecks = args[1::2]
         sargs     = []
         pkgc_args = _pkgc_args
+        dyn_libs  = {}
         for i in range(0, len(packages)):
             if i < len(verchecks):
                 sargs.append(packages[i] + ' ' + verchecks[i])
             else:
                 sargs.append(packages[i])
-        if ctx.dependency_satisfied('static-build'):
+            if _dyn_libs and _dyn_libs[i]:
+                dyn_libs[packages[i]] = _dyn_libs[i]
+        if ctx.dependency_satisfied('static-build') and not dyn_libs:
             pkgc_args += ["--static"]
 
         defaults = {
@@ -102,12 +118,14 @@ def _check_pkg_config(_pkgc_args, *args, **kw_ext):
         # added only at its first occurrence.
         original_append_unique  = ConfigSet.append_unique
         ConfigSet.append_unique = ConfigSet.append_value
-        result = bool(ctx.check_cfg(**opts))
+        result = ctx.check_cfg(**opts)
         ConfigSet.append_unique = original_append_unique
 
         defkey = inflector.define_key(dependency_identifier)
         if result:
             ctx.define(defkey, 1)
+            for x in dyn_libs.keys():
+                ctx.env['LIB_'+x] += dyn_libs[x]
         else:
             ctx.add_optional_message(dependency_identifier,
                                      "'{0}' not found".format(" ".join(sargs)))
@@ -117,7 +135,7 @@ def _check_pkg_config(_pkgc_args, *args, **kw_ext):
 
 def check_headers(*headers, **kw_ext):
     def undef_others(ctx, headers, found):
-        not_found_hs = set(headers) - set([found])
+        not_found_hs = set(headers) - {found}
         for not_found_h in not_found_hs:
             ctx.undefine(inflector.define_key(not_found_h))
 
@@ -162,6 +180,11 @@ def compose_checks(*checks):
         return all([check(ctx, dependency_identifier) for check in checks])
     return fn
 
+def any_check(*checks):
+    def fn(ctx, dependency_identifier):
+        return any(check(ctx, dependency_identifier) for check in checks)
+    return fn
+
 def load_fragment(fragment):
     file_path = os.path.join(os.path.dirname(__file__), '..', 'fragments',
                              fragment)
@@ -169,3 +192,13 @@ def load_fragment(fragment):
     fragment_code = fp.read()
     fp.close()
     return fragment_code
+
+def check_macos_sdk(version):
+    def fn(ctx, dependency_identifier):
+        if ctx.env.MACOS_SDK_VERSION:
+            if StrictVersion(ctx.env.MACOS_SDK_VERSION) >= StrictVersion(version):
+                ctx.define(inflector.define_key(dependency_identifier), 1)
+                return True
+        return False
+
+    return fn

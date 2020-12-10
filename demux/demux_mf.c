@@ -1,20 +1,21 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <strings.h>
@@ -27,6 +28,7 @@
 #include "mpv_talloc.h"
 #include "common/msg.h"
 #include "options/options.h"
+#include "options/m_config.h"
 #include "options/path.h"
 #include "misc/ctype.h"
 
@@ -54,8 +56,9 @@ static void mf_add(mf_t *mf, const char *fname)
     MP_TARRAY_APPEND(mf, mf->names, mf->nr_of_files, entry);
 }
 
-static mf_t *open_mf_pattern(void *talloc_ctx, struct mp_log *log, char *filename)
+static mf_t *open_mf_pattern(void *talloc_ctx, struct demuxer *d, char *filename)
 {
+    struct mp_log *log = d->log;
     int error_count = 0;
     int count = 0;
 
@@ -63,21 +66,33 @@ static mf_t *open_mf_pattern(void *talloc_ctx, struct mp_log *log, char *filenam
     mf->log = log;
 
     if (filename[0] == '@') {
-        FILE *lst_f = fopen(filename + 1, "r");
-        if (lst_f) {
-            char *fname = talloc_size(mf, 512);
-            while (fgets(fname, 512, lst_f)) {
-                /* remove spaces from end of fname */
-                char *t = fname + strlen(fname) - 1;
-                while (t > fname && mp_isspace(*t))
-                    *(t--) = 0;
-                if (!mp_path_exists(fname)) {
-                    mp_verbose(log, "file not found: '%s'\n", fname);
-                } else {
-                    mf_add(mf, fname);
+        struct stream *s = stream_create(filename + 1,
+                            d->stream_origin | STREAM_READ, d->cancel, d->global);
+        if (s) {
+            while (1) {
+                char buf[512];
+                int len = stream_read_peek(s, buf, sizeof(buf));
+                if (!len)
+                    break;
+                bstr data = (bstr){buf, len};
+                int pos = bstrchr(data, '\n');
+                data = bstr_splice(data, 0, pos < 0 ? data.len : pos + 1);
+                bstr fname = bstr_strip(data);
+                if (fname.len) {
+                    if (bstrchr(fname, '\0') >= 0) {
+                        mp_err(log, "invalid filename\n");
+                        break;
+                    }
+                    char *entry = bstrto0(mf, fname);
+                    if (!mp_path_exists(entry)) {
+                        mp_verbose(log, "file not found: '%s'\n", entry);
+                    } else {
+                        MP_TARRAY_APPEND(mf, mf->names, mf->nr_of_files, entry);
+                    }
                 }
+                stream_seek_skip(s, stream_tell(s) + data.len);
             }
-            fclose(lst_f);
+            free_stream(s);
 
             mp_info(log, "number of files: %d\n", mf->nr_of_files);
             goto exit_mf;
@@ -108,7 +123,7 @@ static mf_t *open_mf_pattern(void *talloc_ctx, struct mp_log *log, char *filenam
 
     char *fname = talloc_size(mf, strlen(filename) + 32);
 
-#if HAVE_GLOB || HAVE_GLOB_WIN32_REPLACEMENT
+#if HAVE_GLOB
     if (!strchr(filename, '%')) {
         strcpy(fname, filename);
         if (!strchr(filename, '*'))
@@ -162,24 +177,24 @@ static mf_t *open_mf_single(void *talloc_ctx, struct mp_log *log, char *filename
 static void demux_seek_mf(demuxer_t *demuxer, double seek_pts, int flags)
 {
     mf_t *mf = demuxer->priv;
-    int newpos = seek_pts * mf->sh->codec->fps;
+    double newpos = seek_pts * mf->sh->codec->fps;
     if (flags & SEEK_FACTOR)
         newpos = seek_pts * (mf->nr_of_files - 1);
-    if (newpos < 0)
-        newpos = 0;
-    if (newpos >= mf->nr_of_files)
-        newpos = mf->nr_of_files;
-    mf->curr_frame = newpos;
+    if (flags & SEEK_FORWARD) {
+        newpos = ceil(newpos);
+    } else {
+        newpos = MPMIN(floor(newpos), mf->nr_of_files - 1);
+    }
+    mf->curr_frame = MPCLAMP((int)newpos, 0, mf->nr_of_files);
 }
 
-// return value:
-//     0 = EOF or no stream found
-//     1 = successfully read a packet
-static int demux_mf_fill_buffer(demuxer_t *demuxer)
+static bool demux_mf_read_packet(struct demuxer *demuxer,
+                                 struct demux_packet **pkt)
 {
     mf_t *mf = demuxer->priv;
     if (mf->curr_frame >= mf->nr_of_files)
-        return 0;
+        return false;
+    bool ok = false;
 
     struct stream *entry_stream = NULL;
     if (mf->streams)
@@ -187,8 +202,10 @@ static int demux_mf_fill_buffer(demuxer_t *demuxer)
     struct stream *stream = entry_stream;
     if (!stream) {
         char *filename = mf->names[mf->curr_frame];
-        if (filename)
-            stream = stream_open(filename, demuxer->global);
+        if (filename) {
+            stream = stream_create(filename, demuxer->stream_origin | STREAM_READ,
+                                   demuxer->cancel, demuxer->global);
+        }
     }
 
     if (stream) {
@@ -200,7 +217,9 @@ static int demux_mf_fill_buffer(demuxer_t *demuxer)
                 memcpy(dp->buffer, data.start, data.len);
                 dp->pts = mf->curr_frame / mf->sh->codec->fps;
                 dp->keyframe = true;
-                demux_add_packet(mf->sh, dp);
+                dp->stream = mf->sh->index;
+                *pkt = dp;
+                ok = true;
             }
         }
         talloc_free(data.start);
@@ -210,7 +229,11 @@ static int demux_mf_fill_buffer(demuxer_t *demuxer)
         free_stream(stream);
 
     mf->curr_frame++;
-    return 1;
+
+    if (!ok)
+        MP_ERR(demuxer, "error reading image file\n");
+
+    return true;
 }
 
 // map file extension/type to a codec name
@@ -293,9 +316,10 @@ static int demux_open_mf(demuxer_t *demuxer, enum demux_check check)
     mf_t *mf;
 
     if (strncmp(demuxer->stream->url, "mf://", 5) == 0 &&
-        demuxer->stream->type == STREAMTYPE_MF)
-        mf = open_mf_pattern(demuxer, demuxer->log, demuxer->stream->url + 5);
-    else {
+        demuxer->stream->info && strcmp(demuxer->stream->info->name, "mf") == 0)
+    {
+        mf = open_mf_pattern(demuxer, demuxer, demuxer->stream->url + 5);
+    } else {
         mf = open_mf_single(demuxer, demuxer->log, demuxer->stream->url);
         int bog = 0;
         MP_TARRAY_APPEND(mf, mf->streams, bog, demuxer->stream);
@@ -304,10 +328,15 @@ static int demux_open_mf(demuxer_t *demuxer, enum demux_check check)
     if (!mf || mf->nr_of_files < 1)
         goto error;
 
-    char *force_type = demuxer->opts->mf_type;
+    double mf_fps;
+    char *mf_type;
+    mp_read_option_raw(demuxer->global, "mf-fps", &m_option_type_double, &mf_fps);
+    mp_read_option_raw(demuxer->global, "mf-type", &m_option_type_string, &mf_type);
+
     const char *codec = mp_map_mimetype_to_video_codec(demuxer->stream->mime_type);
-    if (!codec || (force_type && force_type[0]))
-        codec = probe_format(mf, force_type, check);
+    if (!codec || (mf_type && mf_type[0]))
+        codec = probe_format(mf, mf_type, check);
+    talloc_free(mf_type);
     if (!codec)
         goto error;
 
@@ -320,13 +349,15 @@ static int demux_open_mf(demuxer_t *demuxer, enum demux_check check)
     c->codec = codec;
     c->disp_w = 0;
     c->disp_h = 0;
-    c->fps = demuxer->opts->mf_fps;
+    c->fps = mf_fps;
+    c->reliable_fps = true;
 
     demux_add_sh_stream(demuxer, sh);
 
     mf->sh = sh;
     demuxer->priv = (void *)mf;
     demuxer->seekable = true;
+    demuxer->duration = mf->nr_of_files / mf->sh->codec->fps;
 
     return 0;
 
@@ -338,26 +369,11 @@ static void demux_close_mf(demuxer_t *demuxer)
 {
 }
 
-static int demux_control_mf(demuxer_t *demuxer, int cmd, void *arg)
-{
-    mf_t *mf = demuxer->priv;
-
-    switch (cmd) {
-    case DEMUXER_CTRL_GET_TIME_LENGTH:
-        *((double *)arg) = (double)mf->nr_of_files / mf->sh->codec->fps;
-        return DEMUXER_CTRL_OK;
-
-    default:
-        return DEMUXER_CTRL_NOTIMPL;
-    }
-}
-
 const demuxer_desc_t demuxer_desc_mf = {
     .name = "mf",
     .desc = "image files (mf)",
-    .fill_buffer = demux_mf_fill_buffer,
+    .read_packet = demux_mf_read_packet,
     .open = demux_open_mf,
     .close = demux_close_mf,
     .seek = demux_seek_mf,
-    .control = demux_control_mf,
 };

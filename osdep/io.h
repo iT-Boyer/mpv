@@ -27,10 +27,38 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <locale.h>
 
-#if HAVE_GLOB
+#if HAVE_GLOB_POSIX
 #include <glob.h>
 #endif
+
+#if HAVE_ANDROID
+#  include <unistd.h>
+#  include <stdio.h>
+
+// replace lseek with the 64bit variant
+#ifdef lseek
+#  undef lseek
+#endif
+#define lseek(f,p,w) lseek64((f), (p), (w))
+
+// replace possible fseeko with a
+// lseek64 based solution.
+#ifdef fseeko
+#  undef fseeko
+#endif
+static inline int mp_fseeko(FILE* fp, off64_t offset, int whence) {
+    int ret = -1;
+    if ((ret = fflush(fp)) != 0) {
+        return ret;
+    }
+
+    return lseek64(fileno(fp), offset, whence) >= 0 ? 0 : -1;
+}
+#define fseeko(f,p,w) mp_fseeko((f), (p), (w))
+
+#endif // HAVE_ANDROID
 
 #ifndef O_BINARY
 #define O_BINARY 0
@@ -47,6 +75,7 @@
 bool mp_set_cloexec(int fd);
 int mp_make_cloexec_pipe(int pipes[2]);
 int mp_make_wakeup_pipe(int pipes[2]);
+void mp_flush_wakeup_pipe(int pipe_end);
 
 #ifdef _WIN32
 #include <wchar.h>
@@ -74,19 +103,36 @@ DIR *mp_opendir(const char *path);
 struct dirent *mp_readdir(DIR *dir);
 int mp_closedir(DIR *dir);
 int mp_mkdir(const char *path, int mode);
-FILE *mp_tmpfile(void);
+char *mp_win32_getcwd(char *buf, size_t size);
 char *mp_getenv(const char *name);
+
+#ifdef environ  /* mingw defines it as _environ */
+#undef environ
+#endif
+#define environ (*mp_penviron())  /* ensure initialization and l-value */
+char ***mp_penviron(void);
+
 off_t mp_lseek(int fd, off_t offset, int whence);
 
-// MinGW-w64 will define "stat" to something useless. Since this affects both
-// the type (struct stat) and the stat() function, it makes us harder to
-// override these separately.
-// Corresponds to struct _stat64 (copy & pasted, but using public types).
+// mp_stat types. MSVCRT's dev_t and ino_t are way too short to be unique.
+typedef uint64_t mp_dev_t_;
+#ifdef _WIN64
+typedef unsigned __int128 mp_ino_t_;
+#else
+// 32-bit Windows doesn't have a __int128-type, which means ReFS file IDs will
+// be truncated and might collide. This is probably not a problem because ReFS
+// is not available in consumer versions of Windows.
+typedef uint64_t mp_ino_t_;
+#endif
+#define dev_t mp_dev_t_
+#define ino_t mp_ino_t_
+
+// mp_stat uses a different structure to MSVCRT, with 64-bit inodes
 struct mp_stat {
     dev_t st_dev;
     ino_t st_ino;
     unsigned short st_mode;
-    short st_nlink;
+    unsigned int st_nlink;
     short st_uid;
     short st_gid;
     dev_t st_rdev;
@@ -120,7 +166,7 @@ void mp_globfree(mp_glob_t *pglob);
 #define readdir(...) mp_readdir(__VA_ARGS__)
 #define closedir(...) mp_closedir(__VA_ARGS__)
 #define mkdir(...) mp_mkdir(__VA_ARGS__)
-#define tmpfile(...) mp_tmpfile(__VA_ARGS__)
+#define getcwd(...) mp_win32_getcwd(__VA_ARGS__)
 #define getenv(...) mp_getenv(__VA_ARGS__)
 
 #undef lseek
@@ -132,6 +178,9 @@ void mp_globfree(mp_glob_t *pglob);
 
 #undef fstat
 #define fstat(...) mp_fstat(__VA_ARGS__)
+
+#define utime(...) _utime(__VA_ARGS__)
+#define utimbuf _utimbuf
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 int munmap(void *addr, size_t length);
@@ -152,10 +201,21 @@ int msync(void *addr, size_t length, int flags);
 #define glob(...) mp_glob(__VA_ARGS__)
 #define globfree(...) mp_globfree(__VA_ARGS__)
 
+// These are stubs since there is not anything that helps with this on Windows.
+#define locale_t int
+#define LC_CTYPE_MASK 0
+locale_t newlocale(int, const char *, locale_t);
+locale_t uselocale(locale_t);
+void freelocale(locale_t);
+
 #else /* __MINGW32__ */
 
 #include <sys/mman.h>
 
+extern char **environ;
+
 #endif /* __MINGW32__ */
+
+int mp_mkostemps(char *template, int suffixlen, int flags);
 
 #endif

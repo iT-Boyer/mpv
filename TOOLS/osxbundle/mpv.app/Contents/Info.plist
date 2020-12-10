@@ -173,7 +173,7 @@
       </dict>
     </array>
     <key>CFBundleExecutable</key>
-    <string>mpv</string>
+    <string>mpv-bundle</string>
     <key>CFBundleIconFile</key>
     <string>icon</string>
     <key>CFBundleIdentifier</key>
@@ -217,6 +217,7 @@
           <string>ftp</string>
           <string>udp</string>
           <string>smb</string>
+          <string>srt</string>
         </array>
       </dict>
       <dict>

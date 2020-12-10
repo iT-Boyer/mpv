@@ -1,25 +1,20 @@
 /*
- * Get path to config dir/file.
- *
- * Return Values:
- *   Returns the pointer to the ALLOCATED buffer containing the
- *   zero terminated path string. This buffer has to be FREED
- *   by the caller.
- *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * Get path to config dir/file.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <assert.h>
@@ -42,6 +37,7 @@
 #include "mpv_talloc.h"
 #include "osdep/io.h"
 #include "osdep/path.h"
+#include "misc/ctype.h"
 
 // In order of decreasing priority: the first has highest priority.
 static const mp_get_platform_path_cb path_resolvers[] = {
@@ -51,7 +47,9 @@ static const mp_get_platform_path_cb path_resolvers[] = {
 #if !defined(_WIN32) || defined(__CYGWIN__)
     mp_get_platform_path_unix,
 #endif
-#if defined(_WIN32)
+#if HAVE_UWP
+    mp_get_platform_path_uwp,
+#elif defined(_WIN32)
     mp_get_platform_path_win,
 #endif
 };
@@ -61,8 +59,22 @@ static const char *const config_dirs[] = {
     "home",
     "old_home",
     "osxbundle",
+    "exe_dir",
     "global",
 };
+
+void mp_init_paths(struct mpv_global *global, struct MPOpts *opts)
+{
+    TA_FREEP(&global->configdir);
+
+    const char *force_configdir = getenv("MPV_HOME");
+    if (opts->force_configdir && opts->force_configdir[0])
+        force_configdir = opts->force_configdir;
+    if (!opts->load_config)
+        force_configdir = "";
+
+    global->configdir = talloc_strdup(global, force_configdir);
+}
 
 // Return a platform specific path using a path type as defined in osdep/path.h.
 // Keep in mind that the only way to free the return value is freeing talloc_ctx
@@ -73,15 +85,10 @@ static const char *mp_get_platform_path(void *talloc_ctx,
 {
     assert(talloc_ctx);
 
-    const char *force_configdir = getenv("MPV_HOME");
-    if (global->opts->force_configdir && global->opts->force_configdir[0])
-        force_configdir = global->opts->force_configdir;
-    if (!global->opts->load_config)
-        force_configdir = "";
-    if (force_configdir) {
+    if (global->configdir) {
         for (int n = 0; n < MP_ARRAY_SIZE(config_dirs); n++) {
             if (strcmp(config_dirs[n], type) == 0)
-                return (n == 0 && force_configdir[0]) ? force_configdir : NULL;
+                return (n == 0 && global->configdir[0]) ? global->configdir : NULL;
         }
     }
 
@@ -101,7 +108,7 @@ char *mp_find_user_config_file(void *talloc_ctx, struct mpv_global *global,
     if (res)
         res = mp_path_join(talloc_ctx, res, filename);
     talloc_free(tmp);
-    MP_VERBOSE(global, "config path: '%s' -> '%s'\n", filename, res ? res : "-");
+    MP_DBG(global, "config path: '%s' -> '%s'\n", filename, res ? res : "-");
     return res;
 }
 
@@ -122,12 +129,12 @@ static char **mp_find_all_config_files_limited(void *talloc_ctx,
 
             char *file = mp_path_join_bstr(ret, bstr0(dir), fn);
             if (mp_path_exists(file)) {
-                MP_VERBOSE(global, "config path: '%.*s' -> '%s'\n",
-                           BSTR_P(fn), file);
+                MP_DBG(global, "config path: '%.*s' -> '%s'\n",
+                        BSTR_P(fn), file);
                 MP_TARRAY_APPEND(NULL, ret, num_ret, file);
             } else {
-                MP_VERBOSE(global, "config path: '%.*s' -/-> '%s'\n",
-                           BSTR_P(fn), file);
+                MP_DBG(global, "config path: '%.*s' -/-> '%s'\n",
+                        BSTR_P(fn), file);
             }
         }
     }
@@ -169,8 +176,17 @@ char *mp_get_user_path(void *talloc_ctx, struct mpv_global *global,
             const char *rest0 = rest.start; // ok in this case
             if (bstr_equals0(prefix, "~")) {
                 res = mp_find_config_file(talloc_ctx, global, rest0);
+                if (!res) {
+                    void *tmp = talloc_new(NULL);
+                    const char *p = mp_get_platform_path(tmp, global, "home");
+                    res = mp_path_join_bstr(talloc_ctx, bstr0(p), rest);
+                    talloc_free(tmp);
+                }
             } else if (bstr_equals0(prefix, "")) {
-                res = mp_path_join_bstr(talloc_ctx, bstr0(getenv("HOME")), rest);
+                char *home = getenv("HOME");
+                if (!home)
+                    home = getenv("USERPROFILE");
+                res = mp_path_join_bstr(talloc_ctx, bstr0(home), rest);
             } else if (bstr_eatstart0(&prefix, "~")) {
                 void *tmp = talloc_new(NULL);
                 char type[80];
@@ -183,7 +199,7 @@ char *mp_get_user_path(void *talloc_ctx, struct mpv_global *global,
     }
     if (!res)
         res = talloc_strdup(talloc_ctx, path);
-    MP_VERBOSE(global, "user path: '%s' -> '%s'\n", path, res);
+    MP_DBG(global, "user path: '%s' -> '%s'\n", path, res);
     return res;
 }
 
@@ -239,30 +255,38 @@ char *mp_splitext(const char *path, bstr *root)
     return (char *)split + 1;
 }
 
+bool mp_path_is_absolute(struct bstr path)
+{
+    if (path.len && strchr(mp_path_separators, path.start[0]))
+        return true;
+
+#if HAVE_DOS_PATHS
+    // Note: "X:filename" is a path relative to the current working directory
+    //       of drive X, and thus is not an absolute path. It needs to be
+    //       followed by \ or /.
+    if (path.len >= 3 && path.start[1] == ':' &&
+        strchr(mp_path_separators, path.start[2]))
+        return true;
+#endif
+
+    return false;
+}
+
 char *mp_path_join_bstr(void *talloc_ctx, struct bstr p1, struct bstr p2)
 {
-    bool test;
     if (p1.len == 0)
         return bstrdup0(talloc_ctx, p2);
     if (p2.len == 0)
         return bstrdup0(talloc_ctx, p1);
 
-#if HAVE_DOS_PATHS
-    test = (p2.len >= 2 && p2.start[1] == ':')
-        || p2.start[0] == '\\' || p2.start[0] == '/';
-#else
-    test = p2.start[0] == '/';
-#endif
-    if (test)
-        return bstrdup0(talloc_ctx, p2);   // absolute path
+    if (mp_path_is_absolute(p2))
+        return bstrdup0(talloc_ctx, p2);
 
-    bool have_separator;
-    int endchar1 = p1.start[p1.len - 1];
+    bool have_separator = strchr(mp_path_separators, p1.start[p1.len - 1]);
 #if HAVE_DOS_PATHS
-    have_separator = endchar1 == '/' || endchar1 == '\\'
-                     || (p1.len == 2 && endchar1 == ':'); // "X:" only
-#else
-    have_separator = endchar1 == '/';
+    // "X:" only => path relative to "X:" current working directory.
+    if (p1.len == 2 && p1.start[1] == ':')
+        have_separator = true;
 #endif
 
     return talloc_asprintf(talloc_ctx, "%.*s%s%.*s", BSTR_P(p1),
@@ -309,12 +333,15 @@ bool mp_is_url(bstr path)
     int proto = bstr_find0(path, "://");
     if (proto < 1)
         return false;
-    // The protocol part must be alphanumeric, otherwise it's not an URL.
+    // Per RFC3986, the first character of the protocol must be alphabetic.
+    // The rest must be alphanumeric plus -, + and .
     for (int i = 0; i < proto; i++) {
         unsigned char c = path.start[i];
-        if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
-            !(c >= '0' && c <= '9') && c != '_')
+        if ((i == 0 && !mp_isalpha(c)) ||
+            (!mp_isalnum(c) && c != '.' && c != '-' && c != '+'))
+        {
             return false;
+        }
     }
     return true;
 }

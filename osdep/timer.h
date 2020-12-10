@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_TIMER_H
@@ -39,11 +39,8 @@ void mp_sleep_us(int64_t us);
 
 #define MP_START_TIME 10000000
 
-// Return the amount of time that has passed since the last call, in
-// microseconds. *t is used to calculate the time that has passed by storing
-// the current time in it. If *t is 0, the call will return 0. (So that the
-// first call will return 0, instead of the absolute current time.)
-int64_t mp_time_relative_us(int64_t *t);
+// Duration of a second in mpv time.
+#define MP_SECOND_US (1000 * 1000)
 
 // Add a time in seconds to the given time in microseconds, and return it.
 // Takes care of possible overflows. Never returns a negative or 0 time.

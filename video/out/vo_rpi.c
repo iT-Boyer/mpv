@@ -28,10 +28,14 @@
 #include <interface/mmal/util/mmal_default_components.h>
 #include <interface/mmal/vc/mmal_vc_api.h>
 
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+
 #include <libavutil/rational.h>
 
 #include "common/common.h"
 #include "common/msg.h"
+#include "opengl/common.h"
 #include "options/m_config.h"
 #include "osdep/timer.h"
 #include "vo.h"
@@ -39,8 +43,20 @@
 #include "video/mp_image.h"
 #include "sub/osd.h"
 
-#include "opengl/osd.h"
-#include "opengl/context_rpi.h"
+#include "opengl/ra_gl.h"
+#include "gpu/video.h"
+
+struct mp_egl_rpi {
+    struct mp_log *log;
+    struct GL *gl;
+    struct ra *ra;
+    EGLDisplay egl_display;
+    EGLConfig egl_config;
+    EGLContext egl_context;
+    EGLSurface egl_surface;
+    // yep, the API keeps a pointer to it
+    EGL_DISPMANX_WINDOW_T egl_window;
+};
 
 struct priv {
     DISPMANX_DISPLAY_HANDLE_T display;
@@ -55,9 +71,8 @@ struct priv {
     struct mp_osd_res osd_res;
 
     struct mp_egl_rpi egl;
-    struct gl_shader_cache *sc;
+    struct gl_video *gl_video;
     struct mpgl_osd *osd;
-    int64_t osd_change_counter;
 
     MMAL_COMPONENT_T *renderer;
     bool renderer_enabled;
@@ -89,6 +104,125 @@ struct priv {
 
 static void recreate_renderer(struct vo *vo);
 
+static void *get_proc_address(const GLubyte *name)
+{
+    void *p = eglGetProcAddress(name);
+    // EGL 1.4 (supported by the RPI firmware) does not necessarily return
+    // function pointers for core functions.
+    if (!p) {
+        void *h = dlopen("/opt/vc/lib/libbrcmGLESv2.so", RTLD_LAZY);
+        if (h) {
+            p = dlsym(h, name);
+            dlclose(h);
+        }
+    }
+    return p;
+}
+
+static EGLConfig select_fb_config_egl(struct mp_egl_rpi *p)
+{
+    EGLint attributes[] = {
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_DEPTH_SIZE, 0,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_NONE
+    };
+
+    EGLint config_count;
+    EGLConfig config;
+
+    eglChooseConfig(p->egl_display, attributes, &config, 1, &config_count);
+
+    if (!config_count) {
+        MP_FATAL(p, "Could find EGL configuration!\n");
+        return NULL;
+    }
+
+    return config;
+}
+
+static void mp_egl_rpi_destroy(struct mp_egl_rpi *p)
+{
+    if (p->egl_display) {
+        eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
+    }
+    if (p->egl_surface)
+        eglDestroySurface(p->egl_display, p->egl_surface);
+    if (p->egl_context)
+        eglDestroyContext(p->egl_display, p->egl_context);
+    p->egl_context = EGL_NO_CONTEXT;
+    eglReleaseThread();
+    p->egl_display = EGL_NO_DISPLAY;
+    talloc_free(p->gl);
+    p->gl = NULL;
+}
+
+static int mp_egl_rpi_init(struct mp_egl_rpi *p, DISPMANX_ELEMENT_HANDLE_T window,
+                    int w, int h)
+{
+    p->egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (!eglInitialize(p->egl_display, NULL, NULL)) {
+        MP_FATAL(p, "EGL failed to initialize.\n");
+        goto fail;
+    }
+
+    eglBindAPI(EGL_OPENGL_ES_API);
+
+    EGLConfig config = select_fb_config_egl(p);
+    if (!config)
+        goto fail;
+
+    p->egl_window = (EGL_DISPMANX_WINDOW_T){
+        .element = window,
+        .width = w,
+        .height = h,
+    };
+    p->egl_surface = eglCreateWindowSurface(p->egl_display, config,
+                                            &p->egl_window, NULL);
+
+    if (p->egl_surface == EGL_NO_SURFACE) {
+        MP_FATAL(p, "Could not create EGL surface!\n");
+        goto fail;
+    }
+
+    EGLint context_attributes[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    p->egl_context = eglCreateContext(p->egl_display, config,
+                                      EGL_NO_CONTEXT, context_attributes);
+
+    if (p->egl_context == EGL_NO_CONTEXT) {
+        MP_FATAL(p, "Could not create EGL context!\n");
+        goto fail;
+    }
+
+    eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface,
+                   p->egl_context);
+
+    p->gl = talloc_zero(NULL, struct GL);
+
+    const char *exts = eglQueryString(p->egl_display, EGL_EXTENSIONS);
+    mpgl_load_functions(p->gl, get_proc_address, exts, p->log);
+
+    if (!p->gl->version && !p->gl->es)
+        goto fail;
+
+    p->ra = ra_create_gl(p->gl, p->log);
+    if (!p->ra)
+        goto fail;
+
+    return 0;
+
+fail:
+    mp_egl_rpi_destroy(p);
+    return -1;
+}
+
 // Make mpi point to buffer, assuming MMAL_ENCODING_I420.
 // buffer can be NULL.
 // Return the required buffer space.
@@ -113,53 +247,27 @@ static size_t layout_buffer(struct mp_image *mpi, MMAL_BUFFER_HEADER_T *buffer,
     return size;
 }
 
-#define GLSL(x) gl_sc_add(p->sc, #x "\n");
-#define GLSLF(...) gl_sc_addf(p->sc, __VA_ARGS__)
-
 static void update_osd(struct vo *vo)
 {
     struct priv *p = vo->priv;
     if (!p->enable_osd)
         return;
 
-    mpgl_osd_generate(p->osd, p->osd_res, p->osd_pts, 0, 0);
-
-    int64_t osd_change_counter = mpgl_get_change_counter(p->osd);
-    if (p->osd_change_counter == osd_change_counter) {
+    if (!gl_video_check_osd_change(p->gl_video, &p->osd_res, p->osd_pts)) {
         p->skip_osd = true;
         return;
     }
-    p->osd_change_counter = osd_change_counter;
 
     MP_STATS(vo, "start rpi_osd");
 
-    p->egl.gl->ClearColor(0, 0, 0, 0);
-    p->egl.gl->Clear(GL_COLOR_BUFFER_BIT);
-
-    for (int n = 0; n < MAX_OSD_PARTS; n++) {
-        enum sub_bitmap_format fmt = mpgl_osd_get_part_format(p->osd, n);
-        if (!fmt)
-            continue;
-        gl_sc_uniform_sampler(p->sc, "osdtex", GL_TEXTURE_2D, 0);
-        switch (fmt) {
-        case SUBBITMAP_RGBA: {
-            GLSLF("// OSD (RGBA)\n");
-            GLSL(color = texture(osdtex, texcoord).bgra;)
-            break;
-        }
-        case SUBBITMAP_LIBASS: {
-            GLSLF("// OSD (libass)\n");
-            GLSL(color =
-                vec4(ass_color.rgb, ass_color.a * texture(osdtex, texcoord).r);)
-            break;
-        }
-        default:
-            abort();
-        }
-        gl_sc_set_vao(p->sc, mpgl_osd_get_vao(p->osd));
-        gl_sc_gen_shader_and_reset(p->sc);
-        mpgl_osd_draw_part(p->osd, p->osd_res.w, -p->osd_res.h, n);
-    }
+    struct vo_frame frame = {0};
+    struct ra_fbo target = {
+        .tex = ra_create_wrapped_fb(p->egl.ra, 0, p->osd_res.w, p->osd_res.h),
+        .flip = true,
+    };
+    gl_video_set_osd_pts(p->gl_video, p->osd_pts);
+    gl_video_render_frame(p->gl_video, &frame, target, RENDER_FRAME_DEF);
+    ra_tex_free(p->egl.ra, &target.tex);
 
     MP_STATS(vo, "stop rpi_osd");
 }
@@ -208,6 +316,9 @@ static void resize(struct vo *vo)
 
     if (mmal_port_parameter_set(input, &dr.hdr))
         MP_WARN(vo, "could not set video rectangle\n");
+
+    if (p->gl_video)
+        gl_video_resize(p->gl_video, &src, &dst, &p->osd_res);
 }
 
 static void destroy_overlays(struct vo *vo)
@@ -218,10 +329,9 @@ static void destroy_overlays(struct vo *vo)
         vc_dispmanx_element_remove(p->update, p->window);
     p->window = 0;
 
-    mpgl_osd_destroy(p->osd);
-    p->osd = NULL;
-    gl_sc_destroy(p->sc);
-    p->sc = NULL;
+    gl_video_uninit(p->gl_video);
+    p->gl_video = NULL;
+    ra_free(&p->egl.ra);
     mp_egl_rpi_destroy(&p->egl);
 
     if (p->osd_overlay)
@@ -302,9 +412,9 @@ static int create_overlays(struct vo *vo)
             MP_FATAL(vo, "EGL/GLES initialization for OSD renderer failed.\n");
             return -1;
         }
-        p->sc = gl_sc_create(p->egl.gl, vo->log),
-        p->osd = mpgl_osd_init(p->egl.gl, vo->log, vo->osd);
-        p->osd_change_counter = -1; // force initial overlay rendering
+        p->gl_video = gl_video_init(p->egl.ra, vo->log, vo->global);
+        gl_video_set_clear_color(p->gl_video, (struct m_color){.a = 0});
+        gl_video_set_osd_source(p->gl_video, vo->osd);
     }
 
     p->display_fps = 0;
@@ -324,6 +434,8 @@ static int create_overlays(struct vo *vo)
             p->display_fps = tvstate_disp.display.sdtv.frame_rate;
         }
     }
+
+    resize(vo);
 
     vo_event(vo, VO_EVENT_WIN_STATE);
 
@@ -529,7 +641,7 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     input->format->es->video.height = MP_ALIGN_UP(params->h, ALIGN_H);
     input->format->es->video.crop = (MMAL_RECT_T){0, 0, params->w, params->h};
     input->format->es->video.par = (MMAL_RATIONAL_T){params->p_w, params->p_h};
-    input->format->es->video.color_space = map_csp(params->colorspace);
+    input->format->es->video.color_space = map_csp(params->color.space);
 
     if (mmal_port_format_commit(input))
         return -1;
@@ -568,6 +680,8 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
         MP_FATAL(vo, "Failed to enable video renderer.\n");
         return -1;
     }
+
+    resize(vo);
 
     return 0;
 }
@@ -611,21 +725,12 @@ static int control(struct vo *vo, uint32_t request, void *data)
     struct priv *p = vo->priv;
 
     switch (request) {
-    case VOCTRL_FULLSCREEN:
-        vo->opts->fullscreen = !vo->opts->fullscreen;
-        if (p->renderer_enabled)
-            set_geometry(vo);
-        vo->want_redraw = true;
-        return VO_TRUE;
-    case VOCTRL_GET_PANSCAN:
-        return VO_TRUE;
     case VOCTRL_SET_PANSCAN:
         if (p->renderer_enabled)
             resize(vo);
         vo->want_redraw = true;
         return VO_TRUE;
     case VOCTRL_REDRAW_FRAME:
-        p->osd_change_counter = -1;
         update_osd(vo);
         return VO_TRUE;
     case VOCTRL_SCREENSHOT_WIN:
@@ -729,6 +834,9 @@ static void uninit(struct vo *vo)
 
     destroy_dispmanx(vo);
 
+    if (p->update)
+        vc_dispmanx_update_submit_sync(p->update);
+
     if (p->renderer)
         mmal_component_release(p->renderer);
 
@@ -781,10 +889,10 @@ fail:
 
 #define OPT_BASE_STRUCT struct priv
 static const struct m_option options[] = {
-    OPT_INT("display", display_nr, 0),
-    OPT_INT("layer", layer, 0, OPTDEF_INT(-10)),
-    OPT_FLAG("background", background, 0),
-    OPT_FLAG("osd", enable_osd, 0, OPTDEF_INT(1)),
+    {"display", OPT_INT(display_nr)},
+    {"layer", OPT_INT(layer), OPTDEF_INT(-10)},
+    {"background", OPT_FLAG(background)},
+    {"osd", OPT_FLAG(enable_osd), OPTDEF_INT(1)},
     {0},
 };
 
@@ -801,4 +909,5 @@ const struct vo_driver video_out_rpi = {
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
     .options = options,
+    .options_prefix = "rpi",
 };

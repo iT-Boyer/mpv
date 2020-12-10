@@ -22,18 +22,24 @@ struct filter_window {
     double params[2]; // User-defined custom filter parameters. Not used by
                       // all filters
     double blur; // Blur coefficient (sharpens or widens the filter)
+    double taper; // Taper coefficient (flattens the filter's center)
 };
 
 struct filter_kernel {
     struct filter_window f; // the kernel itself
     struct filter_window w; // window storage
-    bool clamp; // clamp to the range [0-1]
+    double clamp; // clamping factor, affects negative weights
+    double value_cutoff; // discard all contributions below this value (polar)
     // Constant values
     const char *window; // default window
     bool polar;         // whether or not the filter uses polar coordinates
     // The following values are set by mp_init_filter() at runtime.
     int size;           // number of coefficients (may depend on radius)
-    double inv_scale;   // scale factor (<1.0 is upscale, >1.0 downscale)
+    double filter_scale;  // Factor to convert the mathematical filter
+                          // function radius to the possibly wider
+                          // (in the case of downsampling) filter sample
+                          // radius.
+    double radius_cutoff; // the true radius at which we can cut off the filter
 };
 
 extern const struct filter_window mp_filter_windows[];
@@ -44,6 +50,7 @@ const struct filter_kernel *mp_find_filter_kernel(const char *name);
 
 bool mp_init_filter(struct filter_kernel *filter, const int *sizes,
                     double scale);
-void mp_compute_lut(struct filter_kernel *filter, int count, float *out_array);
+void mp_compute_lut(struct filter_kernel *filter, int count, int stride,
+                    float *out_array);
 
 #endif /* MPLAYER_FILTER_KERNELS_H */

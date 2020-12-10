@@ -17,7 +17,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
-#include <pthread.h>
+#include <errno.h>
 #include <assert.h>
 
 #include "config.h"
@@ -45,78 +45,136 @@
 #include "core.h"
 #include "command.h"
 
+const int num_ptracks[STREAM_TYPE_COUNT] = {
+    [STREAM_VIDEO] = 1,
+    [STREAM_AUDIO] = 1,
+    [STREAM_SUB] = 2,
+};
+
 double rel_time_to_abs(struct MPContext *mpctx, struct m_rel_time t)
 {
     double length = get_time_length(mpctx);
+    // Relative times are an offset to the start of the file.
+    double start = 0;
+    if (mpctx->demuxer && !mpctx->opts->rebase_start_time)
+        start = mpctx->demuxer->start_time;
+
     switch (t.type) {
     case REL_TIME_ABSOLUTE:
         return t.pos;
     case REL_TIME_RELATIVE:
         if (t.pos >= 0) {
-            return t.pos;
+            return start + t.pos;
         } else {
             if (length >= 0)
-                return MPMAX(length + t.pos, 0.0);
+                return start + MPMAX(length + t.pos, 0.0);
         }
         break;
     case REL_TIME_PERCENT:
         if (length >= 0)
-            return length * (t.pos / 100.0);
+            return start + length * (t.pos / 100.0);
         break;
     case REL_TIME_CHAPTER:
-        if (chapter_start_time(mpctx, t.pos) != MP_NOPTS_VALUE)
-            return chapter_start_time(mpctx, t.pos);
-        break;
+        return chapter_start_time(mpctx, t.pos); // already absolute time
     }
+
     return MP_NOPTS_VALUE;
 }
 
-double get_play_end_pts(struct MPContext *mpctx)
+static double get_play_end_pts_setting(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
-    double end = MP_NOPTS_VALUE;
-    if (opts->play_end.type) {
-        end = rel_time_to_abs(mpctx, opts->play_end);
-    } else if (opts->play_length.type) {
-        double start = rel_time_to_abs(mpctx, opts->play_start);
-        if (start == MP_NOPTS_VALUE)
-            start = 0;
-        double length = rel_time_to_abs(mpctx, opts->play_length);
-        if (length != MP_NOPTS_VALUE)
+    double end = rel_time_to_abs(mpctx, opts->play_end);
+    double length = rel_time_to_abs(mpctx, opts->play_length);
+    if (length != MP_NOPTS_VALUE) {
+        double start = get_play_start_pts(mpctx);
+        if (end == MP_NOPTS_VALUE || start + length < end)
             end = start + length;
-    }
-    if (opts->chapterrange[1] > 0) {
-        double cend = chapter_start_time(mpctx, opts->chapterrange[1]);
-        if (cend != MP_NOPTS_VALUE && (end == MP_NOPTS_VALUE || cend < end))
-            end = cend;
     }
     return end;
 }
 
-float mp_get_cache_percent(struct MPContext *mpctx)
+// Return absolute timestamp against which currently playing media should be
+// clipped. Returns MP_NOPTS_VALUE if no clipping should happen.
+double get_play_end_pts(struct MPContext *mpctx)
 {
-    struct stream_cache_info info = {0};
-    if (mpctx->demuxer)
-        demux_stream_control(mpctx->demuxer, STREAM_CTRL_GET_CACHE_INFO, &info);
-    if (info.size > 0 && info.fill >= 0)
-        return info.fill / (info.size / 100.0);
-    return -1;
+    double end = get_play_end_pts_setting(mpctx);
+    double ab[2];
+    if (mpctx->ab_loop_clip && get_ab_loop_times(mpctx, ab)) {
+        if (end == MP_NOPTS_VALUE || end > ab[1])
+            end = ab[1];
+    }
+    return end;
 }
 
-bool mp_get_cache_idle(struct MPContext *mpctx)
+// Get the absolute PTS at which playback should start.
+// Never returns MP_NOPTS_VALUE.
+double get_play_start_pts(struct MPContext *mpctx)
 {
-    struct stream_cache_info info = {0};
-    if (mpctx->demuxer)
-        demux_stream_control(mpctx->demuxer, STREAM_CTRL_GET_CACHE_INFO, &info);
-    return info.idle;
+    struct MPOpts *opts = mpctx->opts;
+    double res = rel_time_to_abs(mpctx, opts->play_start);
+    if (res == MP_NOPTS_VALUE)
+        res = get_start_time(mpctx, mpctx->play_dir);
+    return res;
+}
+
+// Get timestamps to use for AB-loop. Returns false iff any of the timestamps
+// are invalid and/or AB-loops are currently disabled, and set t[] to either
+// the user options or NOPTS on best effort basis.
+bool get_ab_loop_times(struct MPContext *mpctx, double t[2])
+{
+    struct MPOpts *opts = mpctx->opts;
+    int dir = mpctx->play_dir;
+
+    t[0] = opts->ab_loop[0];
+    t[1] = opts->ab_loop[1];
+
+    if (!opts->ab_loop_count)
+        return false;
+
+    if (t[0] == MP_NOPTS_VALUE || t[1] == MP_NOPTS_VALUE || t[0] == t[1])
+        return false;
+
+    if (t[0] * dir > t[1] * dir)
+        MPSWAP(double, t[0], t[1]);
+
+    return true;
+}
+
+double get_track_seek_offset(struct MPContext *mpctx, struct track *track)
+{
+    struct MPOpts *opts = mpctx->opts;
+    if (track->selected) {
+        if (track->type == STREAM_AUDIO)
+            return -opts->audio_delay;
+        if (track->type == STREAM_SUB)
+            return -opts->subs_rend->sub_delay;
+    }
+    return 0;
+}
+
+void issue_refresh_seek(struct MPContext *mpctx, enum seek_precision min_prec)
+{
+    // let queued seeks execute at a slightly later point
+    if (mpctx->seek.type) {
+        mp_wakeup_core(mpctx);
+        return;
+    }
+    // repeat currently ongoing seeks
+    if (mpctx->current_seek.type) {
+        mpctx->seek = mpctx->current_seek;
+        mp_wakeup_core(mpctx);
+        return;
+    }
+    queue_seek(mpctx, MPSEEK_ABSOLUTE, get_current_time(mpctx), min_prec, 0);
 }
 
 void update_vo_playback_state(struct MPContext *mpctx)
 {
-    if (mpctx->video_out) {
+    if (mpctx->video_out && mpctx->video_out->config_ok) {
         struct voctrl_playback_state oldstate = mpctx->vo_playback_state;
         struct voctrl_playback_state newstate = {
-            .taskbar_progress = mpctx->opts->vo.taskbar_progress,
+            .taskbar_progress = mpctx->opts->vo->taskbar_progress,
             .playing = mpctx->playing,
             .paused = mpctx->paused,
             .percent_pos = get_percent_pos(mpctx),
@@ -131,8 +189,8 @@ void update_vo_playback_state(struct MPContext *mpctx)
             if ((oldstate.playing && oldstate.taskbar_progress) ||
                 (newstate.playing && newstate.taskbar_progress))
             {
-                vo_control(mpctx->video_out,
-                           VOCTRL_UPDATE_PLAYBACK_STATE, &newstate);
+                vo_control_async(mpctx->video_out,
+                                 VOCTRL_UPDATE_PLAYBACK_STATE, &newstate);
             }
             mpctx->vo_playback_state = newstate;
         }
@@ -183,41 +241,58 @@ void error_on_track(struct MPContext *mpctx, struct track *track)
         if (mpctx->error_playing >= 0)
             mpctx->error_playing = MPV_ERROR_NOTHING_TO_PLAY;
     }
-    mpctx->sleeptime = 0;
+    mp_wakeup_core(mpctx);
 }
 
 int stream_dump(struct MPContext *mpctx, const char *source_filename)
 {
     struct MPOpts *opts = mpctx->opts;
-    stream_t *stream = stream_open(source_filename, mpctx->global);
+    stream_t *stream = stream_create(source_filename,
+                                     STREAM_ORIGIN_DIRECT | STREAM_READ,
+                                     mpctx->playback_abort, mpctx->global);
     if (!stream)
         return -1;
 
     int64_t size = stream_get_size(stream);
 
-    stream_set_capture_file(stream, opts->stream_dump);
+    FILE *dest = fopen(opts->stream_dump, "wb");
+    if (!dest) {
+        MP_ERR(mpctx, "Error opening dump file: %s\n", mp_strerror(errno));
+        return -1;
+    }
 
-    while (mpctx->stop_play == KEEP_PLAYING && !stream->eof) {
+    bool ok = true;
+
+    while (mpctx->stop_play == KEEP_PLAYING && ok) {
         if (!opts->quiet && ((stream->pos / (1024 * 1024)) % 2) == 1) {
             uint64_t pos = stream->pos;
             MP_MSG(mpctx, MSGL_STATUS, "Dumping %lld/%lld...",
                    (long long int)pos, (long long int)size);
         }
-        stream_fill_buffer(stream);
-        mp_process_input(mpctx);
+        uint8_t buf[4096];
+        int len = stream_read(stream, buf, sizeof(buf));
+        if (!len) {
+            ok &= stream->eof;
+            break;
+        }
+        ok &= fwrite(buf, len, 1, dest) == 1;
+        mp_wakeup_core(mpctx); // don't actually sleep
+        mp_idle(mpctx); // but process input
     }
 
+    ok &= fclose(dest) == 0;
     free_stream(stream);
-    return 0;
+    return ok ? 0 : -1;
 }
 
 void merge_playlist_files(struct playlist *pl)
 {
-    if (!pl->first)
+    if (!pl->num_entries)
         return;
     char *edl = talloc_strdup(NULL, "edl://");
-    for (struct playlist_entry *e = pl->first; e; e = e->next) {
-        if (e != pl->first)
+    for (int n = 0; n < pl->num_entries; n++) {
+        struct playlist_entry *e = pl->entries[n];
+        if (n)
             edl = talloc_strdup_append_buffer(edl, ";");
         // Escape if needed
         if (e->filename[strcspn(e->filename, "=%,;\n")] ||
@@ -233,65 +308,14 @@ void merge_playlist_files(struct playlist *pl)
     talloc_free(edl);
 }
 
-// Create a talloc'ed copy of mpctx->global. It contains a copy of the global
-// option struct. It still just references some things though, like mp_log.
-// The main purpose is letting threads access the option struct without the
-// need for additional synchronization.
-struct mpv_global *create_sub_global(struct MPContext *mpctx)
+const char *mp_status_str(enum playback_status st)
 {
-    struct mpv_global *new = talloc_ptrtype(NULL, new);
-    struct m_config *new_config = m_config_dup(new, mpctx->mconfig);
-    *new = (struct mpv_global){
-        .log = mpctx->global->log,
-        .opts = new_config->optstruct,
-        .client_api = mpctx->clients,
-    };
-    return new;
-}
-
-struct wrapper_args {
-    struct MPContext *mpctx;
-    void (*thread_fn)(void *);
-    void *thread_arg;
-    pthread_mutex_t mutex;
-    bool done;
-};
-
-static void *thread_wrapper(void *pctx)
-{
-    struct wrapper_args *args = pctx;
-    mpthread_set_name("opener");
-    args->thread_fn(args->thread_arg);
-    pthread_mutex_lock(&args->mutex);
-    args->done = true;
-    pthread_mutex_unlock(&args->mutex);
-    mp_input_wakeup(args->mpctx->input); // this interrupts mp_idle()
-    return NULL;
-}
-
-// Run the thread_fn in a new thread. Wait until the thread returns, but while
-// waiting, process input and input commands.
-int mpctx_run_reentrant(struct MPContext *mpctx, void (*thread_fn)(void *arg),
-                        void *thread_arg)
-{
-    struct wrapper_args args = {mpctx, thread_fn, thread_arg};
-    pthread_mutex_init(&args.mutex, NULL);
-    bool success = false;
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, thread_wrapper, &args))
-        goto done;
-    while (!success) {
-        mp_idle(mpctx);
-
-        if (mpctx->stop_play)
-            mp_cancel_trigger(mpctx->playback_abort);
-
-        pthread_mutex_lock(&args.mutex);
-        success |= args.done;
-        pthread_mutex_unlock(&args.mutex);
+    switch (st) {
+    case STATUS_SYNCING:    return "syncing";
+    case STATUS_READY:      return "ready";
+    case STATUS_PLAYING:    return "playing";
+    case STATUS_DRAINING:   return "draining";
+    case STATUS_EOF:        return "eof";
+    default:                return "bug";
     }
-    pthread_join(thread, NULL);
-done:
-    pthread_mutex_destroy(&args.mutex);
-    return success ? 0 : -1;
 }

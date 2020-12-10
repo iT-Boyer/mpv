@@ -1,38 +1,119 @@
 VIDEO FILTERS
 =============
 
-Video filters allow you to modify the video stream and its properties. The
-syntax is:
+Video filters allow you to modify the video stream and its properties. All of
+the information described in this section applies to audio filters as well
+(generally using the prefix ``--af`` instead of ``--vf``).
+
+The exact syntax is:
 
 ``--vf=<filter1[=parameter1:parameter2:...],filter2,...>``
-    Setup a chain of video filters.
+    Setup a chain of video filters. This consists on the filter name, and an
+    option list of parameters after ``=``. The parameters are separated by
+    ``:`` (not ``,``, as that starts a new filter entry).
+
+    Before the filter name, a label can be specified with ``@name:``, where
+    name is an arbitrary user-given name, which identifies the filter. This
+    is only needed if you want to toggle the filter at runtime.
+
+    A ``!`` before the filter name means the filter is disabled by default. It
+    will be skipped on filter creation. This is also useful for runtime filter
+    toggling.
+
+    See the ``vf`` command (and ``toggle`` sub-command) for further explanations
+    and examples.
+
+    The general filter entry syntax is:
+
+        ``["@"<label-name>":"] ["!"] <filter-name> [ "=" <filter-parameter-list> ]``
+
+    or for the special "toggle" syntax (see ``vf`` command):
+
+        ``"@"<label-name>``
+
+    and the ``filter-parameter-list``:
+
+        ``<filter-parameter> | <filter-parameter> "," <filter-parameter-list>``
+
+    and ``filter-parameter``:
+
+        ``( <param-name> "=" <param-value> ) | <param-value>``
+
+    ``param-value`` can further be quoted in ``[`` / ``]`` in case the value
+    contains characters like ``,`` or ``=``. This is used in particular with
+    the ``lavfi`` filter, which uses a very similar syntax as mpv (MPlayer
+    historically) to specify filters and their parameters.
+
+Filters can be manipulated at run time. You can use ``@`` labels as described
+above in combination with the ``vf`` command (see `COMMAND INTERFACE`_) to get
+more control over this. Initially disabled filters with ``!`` are useful for
+this as well.
 
 You can also set defaults for each filter. The defaults are applied before the
-normal filter parameters.
+normal filter parameters. This is deprecated and never worked for the
+libavfilter bridge.
 
 ``--vf-defaults=<filter1[=parameter1:parameter2:...],filter2,...>``
-    Set defaults for each filter.
+    Set defaults for each filter. (Deprecated. ``--af-defaults`` is deprecated
+    as well.)
 
 .. note::
 
-    To get a full list of available video filters, see ``--vf=help``.
+    To get a full list of available video filters, see ``--vf=help`` and
+    http://ffmpeg.org/ffmpeg-filters.html .
 
     Also, keep in mind that most actual filters are available via the ``lavfi``
     wrapper, which gives you access to most of libavfilter's filters. This
     includes all filters that have been ported from MPlayer to libavfilter.
 
+    Most builtin filters are deprecated in some ways, unless they're only available
+    in mpv (such as filters which deal with mpv specifics, or which are
+    implemented in mpv only).
+
+    If a filter is not builtin, the ``lavfi-bridge`` will be automatically
+    tried. This bridge does not support help output, and does not verify
+    parameters before the filter is actually used. Although the mpv syntax
+    is rather similar to libavfilter's, it's not the same. (Which means not
+    everything accepted by vf_lavfi's ``graph`` option will be accepted by
+    ``--vf``.)
+
+    You can also prefix the filter name with ``lavfi-`` to force the wrapper.
+    This is helpful if the filter name collides with a deprecated mpv builtin
+    filter. For example ``--vf=lavfi-scale=args`` would use libavfilter's
+    ``scale`` filter over mpv's deprecated builtin one.
+
 Video filters are managed in lists. There are a few commands to manage the
 filter list.
 
-``--vf-add=<filter1[,filter2,...]>``
-    Appends the filters given as arguments to the filter list.
+``--vf-append=filter``
+    Appends the filter given as arguments to the filter list.
 
-``--vf-pre=<filter1[,filter2,...]>``
-    Prepends the filters given as arguments to the filter list.
+``--vf-add=filter``
+    Appends the filter given as arguments to the filter list. (Passing multiple
+    filters is currently still possible, but deprecated.)
 
-``--vf-del=<index1[,index2,...]>``
-    Deletes the filters at the given indexes. Index numbers start at 0,
-    negative numbers address the end of the list (-1 is the last).
+``--vf-pre=filter``
+    Prepends the filters given as arguments to the filter list. (Passing
+    multiple filters is currently still possible, but deprecated.)
+
+``--vf-remove=filter``
+    Deletes the filter from the list. The filter can be either given the way it
+    was added (filter name and its full argument list), or by label (prefixed
+    with ``@``). Matching of filters works as follows: if either of the compared
+    filters has a label set, only the labels are compared. If none of the
+    filters have a label, the filter name, arguments, and argument order are
+    compared. (Passing multiple filters is currently still possible, but
+    deprecated.)
+
+``-vf-toggle=filter``
+    Add the given filter to the list if it was not present yet, or remove it
+    from the list if it was present. Matching of filters works as described in
+    ``--vf-remove``.
+
+``--vf-del=filter``
+    Sort of like ``--vf-remove``, but also accepts an index number. Index
+    numbers start at 0, negative numbers address the end of the list (-1 is the
+    last). Deprecated.
 
 ``--vf-clr``
     Completely empties the filter list.
@@ -43,178 +124,61 @@ With filters that support it, you can access parameters by their name.
     Prints the parameter names and parameter value ranges for a particular
     filter.
 
-``--vf=<filter=named_parameter1=value1[:named_parameter2=value2:...]>``
-    Sets a named parameter to the given value. Use on and off or yes and no to
-    set flag parameters.
-
-Available filters are:
-
-``crop[=w:h:x:y]``
-    Crops the given part of the image and discards the rest. Useful to remove
-    black bands from widescreen videos.
-
-    ``<w>,<h>``
-        Cropped width and height, defaults to original width and height.
-    ``<x>,<y>``
-        Position of the cropped picture, defaults to center.
-
-``expand[=w:h:x:y:aspect:round]``
-    Expands (not scales) video resolution to the given value and places the
-    unscaled original at coordinates x, y.
-
-    ``<w>,<h>``
-        Expanded width,height (default: original width,height). Negative
-        values for w and h are treated as offsets to the original size.
-
-        .. admonition:: Example
-
-            ``expand=0:-50:0:0``
-                Adds a 50 pixel border to the bottom of the picture.
-
-    ``<x>,<y>``
-        position of original image on the expanded image (default: center)
-
-    ``<aspect>``
-        Expands to fit an aspect instead of a resolution (default: 0).
-
-        .. admonition:: Example
-
-            ``expand=800::::4/3``
-                Expands to 800x600, unless the source is higher resolution, in
-                which case it expands to fill a 4/3 aspect.
-
-    ``<round>``
-        Rounds up to make both width and height divisible by <r> (default: 1).
-
-``flip``
-    Flips the image upside down.
-
-``mirror``
-    Mirrors the image on the Y axis.
-
-``rotate[=0|90|180|270]``
-    Rotates the image by a multiple of 90 degrees clock-wise.
-
-``scale[=w:h:param:param2:chr-drop:noup:arnd``
-    Scales the image with the software scaler (slow) and performs a YUV<->RGB
-    color space conversion (see also ``--sws``).
-
-    All parameters are optional.
-
-    ``<w>:<h>``
-        scaled width/height (default: original width/height)
-
-        :0:      scaled d_width/d_height
-        :-1:     original width/height
-        :-2:     Calculate w/h using the other dimension and the prescaled
-                 aspect ratio.
-        :-3:     Calculate w/h using the other dimension and the original
-                 aspect ratio.
-        :-(n+8): Like -n above, but rounding the dimension to the closest
-                 multiple of 16.
-
-    ``<param>[:<param2>]`` (see also ``--sws``)
-        Set some scaling parameters depending on the type of scaler selected
-        with ``--sws``::
-
-            --sws=2 (bicubic):  B (blurring) and C (ringing)
-                0.00:0.60 default
-                0.00:0.75 VirtualDub's "precise bicubic"
-                0.00:0.50 Catmull-Rom spline
-                0.33:0.33 Mitchell-Netravali spline
-                1.00:0.00 cubic B-spline
-
-            --sws=7 (Gaussian): sharpness (0 (soft) - 100 (sharp))
-
-            --sws=9 (Lanczos):  filter length (1-10)
-
-    ``<chr-drop>``
-        chroma skipping
-
-        :0: Use all available input lines for chroma (default).
-        :1: Use only every 2. input line for chroma.
-        :2: Use only every 4. input line for chroma.
-        :3: Use only every 8. input line for chroma.
-
-    ``<noup>``
-        Disallow upscaling past the original dimensions.
-
-        :0: Allow upscaling (default).
-        :1: Disallow upscaling if one dimension exceeds its original value.
-        :2: Disallow upscaling if both dimensions exceed their original values.
-
-    ``<arnd>``
-        Accurate rounding for the vertical scaler, which may be faster or
-        slower than the default rounding.
-
-        :no:  Disable accurate rounding (default).
-        :yes: Enable accurate rounding.
-
-``dsize[=w:h:aspect-method:r:aspect]``
-    Changes the intended display aspect at an arbitrary point in the
-    filter chain. Aspect can be given as a fraction (4/3) or floating point
-    number (1.33). Note that this filter does *not* do any scaling itself; it
-    just affects what later scalers (software or hardware) will do when
-    auto-scaling to the correct aspect.
-
-    ``<w>,<h>``
-        New aspect ratio given by a display width and height. Unlike older mpv
-        versions or MPlayer, this does not set the display size.
-
-        Can also be these special values:
-
-        :0:  original display width and height
-        :-1: original video width and height (default)
-        :-2: Calculate w/h using the other dimension and the original display
-             aspect ratio.
-        :-3: Calculate w/h using the other dimension and the original video
-             aspect ratio.
-
-        .. admonition:: Example
-
-            ``dsize=800:-2``
-                Specifies a display resolution of 800x600 for a 4/3 aspect
-                video, or 800x450 for a 16/9 aspect video.
-
-    ``<aspect-method>``
-        Modifies width and height according to original aspect ratios.
-
-        :-1: Ignore original aspect ratio (default).
-        :0:  Keep display aspect ratio by using ``<w>`` and ``<h>`` as maximum
-             resolution.
-        :1:  Keep display aspect ratio by using ``<w>`` and ``<h>`` as minimum
-             resolution.
-        :2:  Keep video aspect ratio by using ``<w>`` and ``<h>`` as maximum
-             resolution.
-        :3:  Keep video aspect ratio by using ``<w>`` and ``<h>`` as minimum
-             resolution.
-
-        .. admonition:: Example
-
-            ``dsize=800:600:0``
-                Specifies a display resolution of at most 800x600, or smaller,
-                in order to keep aspect.
-
-    ``<r>``
-        Rounds up to make both width and height divisible by ``<r>``
-        (default: 1).
-
-    ``<aspect>``
-        Force an aspect ratio.
+Available mpv-only filters are:
 
 ``format=fmt=<value>:colormatrix=<value>:...``
-    Restricts the color space for the next filter without doing any conversion.
-    Use together with the scale filter for a real conversion.
-
-    .. note::
-
-        For a list of available formats, see ``format=fmt=help``.
+    Applies video parameter overrides, with optional conversion. By default,
+    this overrides the video's parameters without conversion (except for the
+    ``fmt`` parameter), but can be made to perform an appropriate conversion
+    with ``convert=yes`` for parameters for which conversion is supported.
 
     ``<fmt>``
-        Format name, e.g. rgb15, bgr24, 420p, etc. (default: don't change).
-    ``<outfmt>``
-        Format name that should be substituted for the output. If they do not
-        have the same bytes per pixel and chroma subsamplimg, it will fail.
+        Image format name, e.g. rgb15, bgr24, 420p, etc. (default: don't change).
+
+        This filter always performs conversion to the given format.
+
+        .. note::
+
+            For a list of available formats, use ``--vf=format=fmt=help``.
+
+    ``<convert=yes|no>``
+        Force conversion of color parameters (default: no).
+
+        If this is disabled (the default), the only conversion that is possibly
+        performed is format conversion if ``<fmt>`` is set. All other parameters
+        (like ``<colormatrix>``) are forced without conversion. This mode is
+        typically useful when files have been incorrectly tagged.
+
+        If this is enabled, libswscale or zimg is used if any of the parameters
+        mismatch. zimg is used of the input/output image formats are supported
+        by mpv's zimg wrapper, and if ``--sws-allow-zimg=yes`` is used. Both
+        libraries may not support all kinds of conversions. This typically
+        results in silent incorrect conversion. zimg has in many cases a better
+        chance of performing the conversion correctly.
+
+        In both cases, the color parameters are set on the output stage of the
+        image format conversion (if ``fmt`` was set). The difference is that
+        with ``convert=no``, the color parameters are not passed on to the
+        converter.
+
+        If input and output video parameters are the same, conversion is always
+        skipped.
+
+        .. admonition:: Examples
+
+            ``mpv test.mkv --vf=format:colormatrix=ycgco``
+                Results in incorrect colors (if test.mkv was tagged correctly).
+
+            ``mpv test.mkv --vf=format:colormatrix=ycgco:convert=yes --sws-allow-zimg``
+                Results in true conversion to ``ycgco``, assuming the renderer
+                supports it (``--vo=gpu`` normally does). You can add ``--vo=xv``
+                to force a VO which definitely does not support it, which should
+                show incorrect colors as confirmation.
+
+                Using ``--sws-allow-zimg=no`` (or disabling zimg at build time)
+                will use libswscale, which cannot perform this conversion as
+                of this writing.
+
     ``<colormatrix>``
         Controls the YUV to RGB color space conversion when playing video. There
         are various standards. Normally, BT.601 should be used for SD video, and
@@ -222,7 +186,7 @@ Available filters are:
         results in slightly under or over saturated and shifted colors.
 
         These options are not always supported. Different video outputs provide
-        varying degrees of support. The ``opengl`` and ``vdpau`` video output
+        varying degrees of support. The ``gpu`` and ``vdpau`` video output
         drivers usually offer full support. The ``xv`` output can set the color
         space if the system video driver supports it, but not input and output
         levels. The ``scale`` video filter can configure color space and input
@@ -265,7 +229,7 @@ Available filters are:
         used to override the setting.
 
         This option only affects video output drivers that perform color
-        management, for example ``opengl`` with the ``target-prim`` or
+        management, for example ``gpu`` with the ``target-prim`` or
         ``icc-profile`` suboptions set.
 
         If this option is set to ``auto`` (which is the default), the video's
@@ -288,6 +252,8 @@ Available filters are:
         :adobe:        Adobe RGB (1998)
         :prophoto:     ProPhoto RGB (ROMM)
         :cie1931:      CIE 1931 RGB
+        :dci-p3:       DCI-P3 (Digital Cinema)
+        :v-gamut:      Panasonic V-Gamut primaries
 
     ``<gamma>``
        Gamma function the source file was encoded with. Normally this should be set
@@ -307,30 +273,57 @@ Available filters are:
        :srgb:         IEC 61966-2-4 (sRGB)
        :linear:       Linear light
        :gamma1.8:     Pure power curve (gamma 1.8)
+       :gamma2.0:     Pure power curve (gamma 2.0)
        :gamma2.2:     Pure power curve (gamma 2.2)
+       :gamma2.4:     Pure power curve (gamma 2.4)
+       :gamma2.6:     Pure power curve (gamma 2.6)
        :gamma2.8:     Pure power curve (gamma 2.8)
        :prophoto:     ProPhoto RGB (ROMM) curve
-       :st2084:       SMPTE ST2084 (HDR) curve
+       :pq:           ITU-R BT.2100 PQ (Perceptual quantizer) curve
+       :hlg:          ITU-R BT.2100 HLG (Hybrid Log-gamma) curve
+       :v-log:        Panasonic V-Log transfer curve
+       :s-log1:       Sony S-Log1 transfer curve
+       :s-log2:       Sony S-Log2 transfer curve
 
-    ``<peak>``
-        Reference peak illumination for the video file. This is mostly
-        interesting for HDR, but it can also be used tone map SDR content
-        to a darker or brighter exposure.
+    ``<sig-peak>``
+        Reference peak illumination for the video file, relative to the
+        signal's reference white level. This is mostly interesting for HDR, but
+        it can also be used tone map SDR content to simulate a different
+        exposure. Normally inferred from tags such as MaxCLL or mastering
+        metadata.
 
-        The default of 0.0 will default to the display's reference brightness
-        for SDR and the source's reference brightness for HDR.
+        The default of 0.0 will default to the source's nominal peak luminance.
+
+    ``<light>``
+        Light type of the scene. This is mostly correctly inferred based on the
+        gamma function, but it can be useful to override this when viewing raw
+        camera footage (e.g. V-Log), which is normally scene-referred instead
+        of display-referred.
+
+        Available light types are:
+
+       :auto:         Automatic selection (default)
+       :display:      Display-referred light (most content)
+       :hlg:          Scene-referred using the HLG OOTF (e.g. HLG content)
+       :709-1886:     Scene-referred using the BT709+BT1886 interaction
+       :gamma1.2:     Scene-referred using a pure power OOTF (gamma=1.2)
 
     ``<stereo-in>``
-        Set the stereo mode the video is assumed to be encoded in. Takes the
-        same values as the ``--video-stereo-mode`` option.
+        Set the stereo mode the video is assumed to be encoded in. Use
+        ``--vf format:stereo-in=help`` to list all available modes. Check with
+        the ``stereo3d`` filter documentation to see what the names mean.
 
     ``<stereo-out>``
         Set the stereo mode the video should be displayed as. Takes the
-        same values as the ``--video-stereo-mode`` option.
+        same values as the ``stereo-in`` option.
 
     ``<rotate>``
         Set the rotation the video is assumed to be encoded with in degrees.
         The special value ``-1`` uses the input format.
+
+    ``<w>``, ``<h>``
+        If not 0, perform conversion to the given size. Ignored if
+        ``convert=yes`` is not set.
 
     ``<dw>``, ``<dh>``
         Set the display size. Note that setting the display size such that
@@ -342,16 +335,17 @@ Available filters are:
         but values such as ``[16:9]`` can be passed too (``[...]`` for quoting
         to prevent the option parser from interpreting the ``:`` character).
 
+    ``<force-scaler=auto|zimg|sws>``
+        Force a specific scaler backend, if applicable. This is a debug option
+        and could go away any time.
 
-``noformat[=fmt]``
-    Restricts the color space for the next filter without doing any conversion.
-    Unlike the format filter, this will allow any color space except the one
-    you specify.
-
-    .. note:: For a list of available formats, see ``noformat=fmt=help``.
-
-    ``<fmt>``
-        Format name, e.g. rgb15, bgr24, 420p, etc. (default: 420p).
+    ``<alpha=auto|straight|premul>``
+        Set the kind of alpha the video uses. Undefined effect if the image
+        format has no alpha channel (could be ignored or cause an error,
+        depending on how mpv internals evolve). Setting this may or may not
+        cause downstream image processing to treat alpha differently, depending
+        on support. With ``convert`` and zimg used, this will convert the alpha.
+        libswscale and other FFmpeg components completely ignore this.
 
 ``lavfi=graph[:sws-flags[:o=opts]]``
     Filter video using FFmpeg's libavfilter.
@@ -367,11 +361,14 @@ Available filters are:
 
             If you want to use the full filter syntax with this option, you have
             to quote the filter graph in order to prevent mpv's syntax and the
-            filter graph syntax from clashing.
+            filter graph syntax from clashing. To prevent a quoting and escaping
+            mess, consider using ``--lavfi-complex`` if you know which video
+            track you want to use from the input file. (There is only one video
+            track for nearly all video files anyway.)
 
         .. admonition:: Examples
 
-            ``-vf lavfi=[gradfun=20:30,vflip]``
+            ``--vf=lavfi=[gradfun=20:30,vflip]``
                 ``gradfun`` filter with nonsense parameters, followed by a
                 ``vflip`` filter. (This demonstrates how libavfilter takes a
                 graph and not just a single filter.) The filter graph string is
@@ -402,88 +399,6 @@ Available filters are:
             ``'--vf=lavfi=yadif:o="threads=2,thread_type=slice"'``
                 forces a specific threading configuration.
 
-``eq[=gamma:contrast:brightness:saturation:rg:gg:bg:weight]``
-    Software equalizer that uses lookup tables (slow), allowing gamma correction
-    in addition to simple brightness and contrast adjustment. The parameters are
-    given as floating point values.
-
-    ``<0.1-10>``
-        initial gamma value (default: 1.0)
-    ``<-2-2>``
-        initial contrast, where negative values result in a negative image
-        (default: 1.0)
-    ``<-1-1>``
-        initial brightness (default: 0.0)
-    ``<0-3>``
-        initial saturation (default: 1.0)
-    ``<0.1-10>``
-        gamma value for the red component (default: 1.0)
-    ``<0.1-10>``
-        gamma value for the green component (default: 1.0)
-    ``<0.1-10>``
-        gamma value for the blue component (default: 1.0)
-    ``<0-1>``
-        The weight parameter can be used to reduce the effect of a high gamma
-        value on bright image areas, e.g. keep them from getting overamplified
-        and just plain white. A value of 0.0 turns the gamma correction all
-        the way down while 1.0 leaves it at its full strength (default: 1.0).
-
-``pullup[=jl:jr:jt:jb:sb:mp]``
-    Pulldown reversal (inverse telecine) filter, capable of handling mixed
-    hard-telecine, 24000/1001 fps progressive, and 30000/1001 fps progressive
-    content. The ``pullup`` filter makes use of future context in making its
-    decisions. It is stateless in the sense that it does not lock onto a pattern
-    to follow, but it instead looks forward to the following fields in order to
-    identify matches and rebuild progressive frames.
-
-    ``jl``, ``jr``, ``jt``, and ``jb``
-        These options set the amount of "junk" to ignore at the left, right,
-        top, and bottom of the image, respectively. Left/right are in units of
-        8 pixels, while top/bottom are in units of 2 lines. The default is 8
-        pixels on each side.
-
-    ``sb`` (strict breaks)
-        Setting this option to 1 will reduce the chances of ``pullup``
-        generating an occasional mismatched frame, but it may also cause an
-        excessive number of frames to be dropped during high motion sequences.
-        Conversely, setting it to -1 will make ``pullup`` match fields more
-        easily. This may help process video with slight blurring between the
-        fields, but may also cause interlaced frames in the output.
-
-    ``mp`` (metric plane)
-        This option may be set to ``u`` or ``v`` to use a chroma plane instead of the
-        luma plane for doing ``pullup``'s computations. This may improve accuracy
-        on very clean source material, but more likely will decrease accuracy,
-        especially if there is chroma noise (rainbow effect) or any grayscale
-        video. The main purpose of setting ``mp`` to a chroma plane is to reduce
-        CPU load and make pullup usable in realtime on slow machines.
-
-``yadif=[mode:interlaced-only]``
-    Yet another deinterlacing filter
-
-    ``<mode>``
-        :frame: Output 1 frame for each frame.
-        :field: Output 1 frame for each field (default).
-        :frame-nospatial: Like ``frame`` but skips spatial interlacing check.
-        :field-nospatial: Like ``field`` but skips spatial interlacing check.
-
-    ``<interlaced-only>``
-        :no:  Deinterlace all frames.
-        :yes: Only deinterlace frames marked as interlaced (default).
-
-    This filter is automatically inserted when using the ``d`` key (or any
-    other key that toggles the ``deinterlace`` property or when using the
-    ``--deinterlace`` switch), assuming the video output does not have native
-    deinterlacing support.
-
-    If you just want to set the default mode, put this filter and its options
-    into ``--vf-defaults`` instead, and enable deinterlacing with ``d`` or
-    ``--deinterlace``.
-
-    Also, note that the ``d`` key is stupid enough to insert a deinterlacer twice
-    when inserting yadif with ``--vf``, so using the above methods is
-    recommended.
-
 ``sub=[=bottom-margin:top-margin]``
     Moves subtitle rendering to an arbitrary point in the filter chain, or force
     subtitle rendering in the video filter as opposed to using video output OSD
@@ -502,114 +417,6 @@ Available filters are:
             subtitle colors and video under the influence of the video equalizer
             settings.
 
-``stereo3d[=in:out]``
-    Stereo3d converts between different stereoscopic image formats.
-
-    ``<in>``
-        Stereoscopic image format of input. Possible values:
-
-        ``sbsl`` or ``side_by_side_left_first``
-            side by side parallel (left eye left, right eye right)
-        ``sbsr`` or ``side_by_side_right_first``
-            side by side crosseye (right eye left, left eye right)
-        ``abl`` or ``above_below_left_first``
-            above-below (left eye above, right eye below)
-        ``abr`` or ``above_below_right_first``
-            above-below (right eye above, left eye below)
-        ``ab2l`` or ``above_below_half_height_left_first``
-            above-below with half height resolution (left eye above, right eye
-            below)
-        ``ab2r`` or ``above_below_half_height_right_first``
-            above-below with half height resolution (right eye above, left eye
-            below)
-
-    ``<out>``
-        Stereoscopic image format of output. Possible values are all the input
-        formats as well as:
-
-        ``arcg`` or ``anaglyph_red_cyan_gray``
-            anaglyph red/cyan gray (red filter on left eye, cyan filter on
-            right eye)
-        ``arch`` or ``anaglyph_red_cyan_half_color``
-            anaglyph red/cyan half colored (red filter on left eye, cyan filter
-            on right eye)
-        ``arcc`` or ``anaglyph_red_cyan_color``
-            anaglyph red/cyan color (red filter on left eye, cyan filter on
-            right eye)
-        ``arcd`` or ``anaglyph_red_cyan_dubois``
-            anaglyph red/cyan color optimized with the least-squares
-            projection of Dubois (red filter on left eye, cyan filter on right
-            eye)
-        ``agmg`` or ``anaglyph_green_magenta_gray``
-            anaglyph green/magenta gray (green filter on left eye, magenta
-            filter on right eye)
-        ``agmh`` or ``anaglyph_green_magenta_half_color``
-            anaglyph green/magenta half colored (green filter on left eye,
-            magenta filter on right eye)
-        ``agmc`` or ``anaglyph_green_magenta_color``
-            anaglyph green/magenta colored (green filter on left eye, magenta
-            filter on right eye)
-        ``aybg`` or ``anaglyph_yellow_blue_gray``
-            anaglyph yellow/blue gray (yellow filter on left eye, blue filter
-            on right eye)
-        ``aybh`` or ``anaglyph_yellow_blue_half_color``
-            anaglyph yellow/blue half colored (yellow filter on left eye, blue
-            filter on right eye)
-        ``aybc`` or ``anaglyph_yellow_blue_color``
-            anaglyph yellow/blue colored (yellow filter on left eye, blue
-            filter on right eye)
-        ``irl`` or ``interleave_rows_left_first``
-            Interleaved rows (left eye has top row, right eye starts on next
-            row)
-        ``irr`` or ``interleave_rows_right_first``
-            Interleaved rows (right eye has top row, left eye starts on next
-            row)
-        ``ml`` or ``mono_left``
-            mono output (left eye only)
-        ``mr`` or ``mono_right``
-            mono output (right eye only)
-
-``gradfun[=strength[:radius|:size=<size>]]``
-    Fix the banding artifacts that are sometimes introduced into nearly flat
-    regions by truncation to 8-bit color depth. Interpolates the gradients that
-    should go where the bands are, and dithers them.
-
-    ``<strength>``
-        Maximum amount by which the filter will change any one pixel. Also the
-        threshold for detecting nearly flat regions (default: 1.5).
-
-    ``<radius>``
-        Neighborhood to fit the gradient to. Larger radius makes for smoother
-        gradients, but also prevents the filter from modifying pixels near
-        detailed regions (default: disabled).
-
-    ``<size>``
-        size of the filter in percent of the image diagonal size. This is
-        used to calculate the final radius size (default: 1).
-
-
-``dlopen=dll[:a0[:a1[:a2[:a3]]]]``
-    Loads an external library to filter the image. The library interface
-    is the ``vf_dlopen`` interface specified using ``libmpcodecs/vf_dlopen.h``.
-
-    .. warning:: This filter is deprecated.
-
-    ``dll=<library>``
-        Specify the library to load. This may require a full file system path
-        in some cases. This argument is required.
-
-    ``a0=<string>``
-        Specify the first parameter to pass to the library.
-
-    ``a1=<string>``
-        Specify the second parameter to pass to the library.
-
-    ``a2=<string>``
-        Specify the third parameter to pass to the library.
-
-    ``a3=<string>``
-        Specify the fourth parameter to pass to the library.
-
 ``vapoursynth=file:buffered-frames:concurrent-frames``
     Loads a VapourSynth filter script. This is intended for streamed
     processing: mpv actually provides a source filter, instead of using a
@@ -619,22 +426,31 @@ Available filters are:
     of that will return errors. As such, you can't use the full power of
     VapourSynth, but you can use certain filters.
 
-    If you just want to play video generated by a VapourSynth (i.e. using
-    a native VapourSynth video source), it's better to use ``vspipe`` and a
-    FIFO to feed the video to mpv. The same applies if the filter script
-    requires random frame access (see ``buffered-frames`` parameter).
+    .. warning::
 
-    This filter is experimental. If it turns out that it works well and is
-    used, it will be ported to libavfilter. Otherwise, it will be just removed.
+        Do not use this filter, unless you have expert knowledge in VapourSynth,
+        and know how to fix bugs in the mpv VapourSynth wrapper code.
+
+    If you just want to play video generated by VapourSynth (i.e. using
+    a native VapourSynth video source), it's better to use ``vspipe`` and a
+    pipe or FIFO to feed the video to mpv. The same applies if the filter script
+    requires random frame access (see ``buffered-frames`` parameter).
 
     ``file``
         Filename of the script source. Currently, this is always a python
-        script. The variable ``video_in`` is set to the mpv video source,
-        and it is expected that the script reads video from it. (Otherwise,
-        mpv will decode no video, and the video packet queue will overflow,
-        eventually leading to audio being stopped.) The script is also
-        expected to pass through timestamps using the ``_DurationNum`` and
-        ``_DurationDen`` frame properties.
+        script (``.vpy`` in VapourSynth convention).
+
+        The variable ``video_in`` is set to the mpv video source, and it is
+        expected that the script reads video from it. (Otherwise, mpv will
+        decode no video, and the video packet queue will overflow, eventually
+        leading to only audio playing, or worse.)
+
+        The filter graph created by the script is also expected to pass through
+        timestamps using the ``_DurationNum`` and ``_DurationDen`` frame
+        properties.
+
+        See the end of the option list for a full list of script variables
+        defined by mpv.
 
         .. admonition:: Example:
 
@@ -652,20 +468,60 @@ Available filters are:
     ``buffered-frames``
         Maximum number of decoded video frames that should be buffered before
         the filter (default: 4). This specifies the maximum number of frames
-        the script can request in reverse direction.
+        the script can request in backward direction.
+
         E.g. if ``buffered-frames=5``, and the script just requested frame 15,
         it can still request frame 10, but frame 9 is not available anymore.
         If it requests frame 30, mpv will decode 15 more frames, and keep only
         frames 25-30.
 
+        The only reason why this buffer exists is to serve the random access
+        requests the VapourSynth filter can make.
+
+        The VapourSynth API has a ``getFrameAsync`` function, which takes an
+        absolute frame number. Source filters must respond to all requests. For
+        example, a source filter can request frame 2432, and then frame 3.
+        Source filters  typically implement this by pre-indexing the entire
+        file.
+
+        mpv on the other hand is stream oriented, and does not allow filters to
+        seek. (And it would not make sense to allow it, because it would ruin
+        performance.) Filters get frames sequentially in playback direction, and
+        cannot request them out of order.
+
+        To compensate for this mismatch, mpv allows the filter to access frames
+        within a certain window. ``buffered-frames`` controls the size of this
+        window. Most VapourSynth filters happen to work with this, because mpv
+        requests frames sequentially increasing from it, and most filters only
+        require frames "close" to the requested frame.
+
+        If the filter requests a frame that has a higher frame number than the
+        highest buffered frame, new frames will be decoded until the requested
+        frame number is reached. Excessive frames will be flushed out in a FIFO
+        manner (there are only at most ``buffered-frames`` in this buffer).
+
+        If the filter requests a frame that has a lower frame number than the
+        lowest buffered frame, the request cannot be satisfied, and an error
+        is returned to the filter. This kind of error is not supposed to happen
+        in a "proper" VapourSynth environment. What exactly happens depends on
+        the filters involved.
+
+        Increasing this buffer will not improve performance. Rather, it will
+        waste memory, and slow down seeks (when enough frames to fill the buffer
+        need to be decoded at once). It is only needed to prevent the error
+        described in the previous paragraph.
+
+        How many frames a filter requires depends on filter implementation
+        details, and mpv has no way of knowing. A scale filter might need only
+        1 frame, an interpolation filter may require a small number of frames,
+        and the ``Reverse`` filter will require an infinite number of frames.
+
+        If you want reliable operation to the full extend VapourSynth is
+        capable, use ``vspipe``.
+
         The actual number of buffered frames also depends on the value of the
         ``concurrent-frames`` option. Currently, both option values are
         multiplied to get the final buffer size.
-
-        (Normally, VapourSynth source filters must provide random access, but
-        mpv was made for playback, and does not provide frame-exact random
-        access. The way this video filter works is a compromise to make simple
-        filters work anyway.)
 
     ``concurrent-frames``
         Number of frames that should be requested in parallel. The
@@ -675,15 +531,25 @@ Available filters are:
         making it higher than the number of cores can actually make it
         slower.
 
+        Technically, mpv will call the VapourSynth ``getFrameAsync`` function
+        in a loop, until there are ``concurrent-frames`` frames that have not
+        been returned by the filter yet. This also assumes that the rest of the
+        mpv filter chain reads the output of the ``vapoursynth`` filter quickly
+        enough. (For example, if you pause the player, filtering will stop very
+        soon, because the filtered frames are waiting in a queue.)
+
+        Actual concurrency depends on many other factors.
+
         By default, this uses the special value ``auto``, which sets the option
         to the number of detected logical CPU cores.
 
-    The following variables are defined by mpv:
+    The following ``.vpy`` script variables are defined by mpv:
 
     ``video_in``
-        The mpv video source as vapoursynth clip. Note that this has no length
-        set, which confuses many filters. Using ``Trim`` on the clip with a
-        high dummy length can turn it into a finite clip.
+        The mpv video source as vapoursynth clip. Note that this has an
+        incorrect (very high) length set, which confuses many filters. This is
+        necessary, because the true number of frames is unknown. You can use the
+        ``Trim`` filter on the clip to reduce the length.
 
     ``video_in_dw``, ``video_in_dh``
         Display size of the video. Can be different from video size if the
@@ -693,7 +559,7 @@ Available filters are:
         FPS value as reported by file headers. This value can be wrong or
         completely broken (e.g. 0 or NaN). Even if the value is correct,
         if another filter changes the real FPS (by dropping or inserting
-        frames), the value of this variable might not be useful. Note that
+        frames), the value of this variable will not be useful. Note that
         the ``--fps`` command line option overrides this value.
 
         Useful for some filters which insist on having a FPS.
@@ -701,34 +567,10 @@ Available filters are:
     ``display_fps``
         Refresh rate of the current display. Note that this value can be 0.
 
-``vapoursynth-lazy``
-    The same as ``vapoursynth``, but doesn't load Python scripts. Instead, a
-    custom backend using Lua and the raw VapourSynth API is used. The syntax
-    is completely different, and absolutely no convenience features are
-    provided. There's no type checking either, and you can trigger crashes.
-
-    .. admonition:: Example:
-
-        ::
-
-            video_out = invoke("morpho", "Open", {clip = video_in})
-
-    The special variable ``video_in`` is the mpv video source, while the
-    special variable ``video_out`` is used to read video from. The 1st argument
-    is the plugin (queried with ``getPluginByNs``), the 2nd is the filter name,
-    and the 3rd argument is a table with the arguments. Positional arguments
-    are not supported. The types must match exactly. Since Lua is terrible and
-    can't distinguish integers and floats, integer arguments must be prefixed
-    with ``i_``, in which case the prefix is removed and the argument is cast
-    to an integer. Should the argument's name start with ``i_``, you're out of
-    luck.
-
-    Clips (VSNodeRef) are passed as light userdata, so trying to pass any
-    other userdata type will result in hard crashes.
-
 ``vavpp``
-    VA-AP-API video post processing. Works with ``--vo=vaapi`` and ``--vo=opengl``
-    only. Currently deinterlaces. This filter is automatically inserted if
+    VA-API video post processing. Requires the system to support VA-API,
+    i.e. Linux/BSD only. Works with ``--vo=vaapi`` and ``--vo=gpu`` only.
+    Currently deinterlaces. This filter is automatically inserted if
     deinterlacing is requested (either using the ``d`` key, by default mapped to
     the command ``cycle deinterlace``, or the ``--deinterlace`` option).
 
@@ -737,26 +579,39 @@ Available filters are:
 
         no
             Don't perform deinterlacing.
+        auto
+             Select the best quality deinterlacing algorithm (default). This
+             goes by the order of the options as documented, with
+             ``motion-compensated`` being considered best quality.
         first-field
-            Show only first field (going by ``--field-dominance``).
+            Show only first field.
         bob
-            bob deinterlacing (default).
+            bob deinterlacing.
         weave, motion-adaptive, motion-compensated
             Advanced deinterlacing algorithms. Whether these actually work
             depends on the GPU hardware, the GPU drivers, driver bugs, and
             mpv bugs.
 
     ``<interlaced-only>``
-        :no:  Deinterlace all frames.
-        :yes: Only deinterlace frames marked as interlaced (default).
+        :no:  Deinterlace all frames (default).
+        :yes: Only deinterlace frames marked as interlaced.
+
+    ``reversal-bug=<yes|no>``
+        :no:  Use the API as it was interpreted by older Mesa drivers. While
+              this interpretation was more obvious and inuitive, it was
+              apparently wrong, and not shared by Intel driver developers.
+        :yes: Use Intel interpretation of surface forward and backwards
+              references (default). This is what Intel drivers and newer Mesa
+              drivers expect. Matters only for the advanced deinterlacing
+              algorithms.
 
 ``vdpaupp``
-    VDPAU video post processing. Works with ``--vo=vdpau`` and ``--vo=opengl``
+    VDPAU video post processing. Works with ``--vo=vdpau`` and ``--vo=gpu``
     only. This filter is automatically inserted if deinterlacing is requested
     (either using the ``d`` key, by default mapped to the command
     ``cycle deinterlace``, or the ``--deinterlace`` option). When enabling
     deinterlacing, it is always preferred over software deinterlacer filters
-    if the ``vdpau`` VO is used, and also if ``opengl`` is used and hardware
+    if the ``vdpau`` VO is used, and also if ``gpu`` is used and hardware
     decoding was activated at least once (i.e. vdpau was loaded).
 
     ``sharpen=<-1-1>``
@@ -770,7 +625,6 @@ Available filters are:
         the mode selected with ``deint-mode``.
     ``deint-mode=<first-field|bob|temporal|temporal-spatial>``
         Select deinterlacing mode (default: temporal).
-        All modes respect ``--field-dominance``.
 
         Note that there's currently a mechanism that allows the ``vdpau`` VO to
         change the ``deint-mode`` of auto-inserted ``vdpaupp`` filters. To avoid
@@ -795,19 +649,12 @@ Available filters are:
         Try to apply inverse telecine, needs motion adaptive temporal
         deinterlacing.
     ``interlaced-only=<yes|no>``
-        If ``yes`` (default), only deinterlace frames marked as interlaced.
+        If ``yes``, only deinterlace frames marked as interlaced (default: no).
     ``hqscaling=<0-9>``
         0
             Use default VDPAU scaling (default).
         1-9
             Apply high quality VDPAU scaling (needs capable hardware).
-
-``vdpaurb``
-    VDPAU video read back. Works with ``--vo=vdpau`` and ``--vo=opengl`` only.
-    This filter will read back frames decoded by VDPAU so that other filters,
-    which are not normally compatible with VDPAU, can be used like normal.
-    This filter must be specified before ``vdpaupp`` in the filter chain if
-    ``vdpaupp`` is used.
 
 ``d3d11vpp``
     Direct3D 11 video post processing. Currently requires D3D11 hardware
@@ -816,10 +663,117 @@ Available filters are:
     ``deint=<yes|no>``
         Whether deinterlacing is enabled (default: no).
     ``interlaced-only=<yes|no>``
-        If ``yes`` (default), only deinterlace frames marked as interlaced.
+        If ``yes``, only deinterlace frames marked as interlaced (default: no).
+    ``mode=<blend|bob|adaptive|mocomp|ivctc|none>``
+        Tries to select a video processor with the given processing capability.
+        If a video processor supports multiple capabilities, it is not clear
+        which algorithm is actually selected. ``none`` always falls back. On
+        most if not all hardware, this option will probably do nothing, because
+        a video processor usually supports all modes or none.
 
-``buffer=<num>``
-    Buffer ``<num>`` frames in the filter chain. This filter is probably pretty
-    useless, except for debugging. (Note that this won't help to smooth out
-    latencies with decoding, because the filter will never output a frame if
-    the buffer isn't full, except on EOF.)
+``fingerprint=...``
+    Compute video frame fingerprints and provide them as metadata. Actually, it
+    currently barely deserved to be called ``fingerprint``, because it does not
+    compute "proper" fingerprints, only tiny downscaled images (but which can be
+    used to compute image hashes or for similarity matching).
+
+    The main purpose of this filter is to support the ``skip-logo.lua`` script.
+    If this script is dropped, or mpv ever gains a way to load user-defined
+    filters (other than VapourSynth), this filter will be removed. Due to the
+    "special" nature of this filter, it will be removed without warning.
+
+    The intended way to read from the filter is using ``vf-metadata`` (also
+    see ``clear-on-query`` filter parameter). The property will return a list
+    of key/value pairs as follows:
+
+    ::
+
+        fp0.pts = 1.2345
+        fp0.hex = 1234abcdef...bcde
+        fp1.pts = 1.4567
+        fp1.hex = abcdef1234...6789
+        ...
+        fpN.pts = ...
+        fpN.hex = ...
+        type = gray-hex-16x16
+
+    Each ``fp<N>`` entry is for a frame. The ``pts`` entry specifies the
+    timestamp of the frame (within the filter chain; in simple cases this is
+    the same as the display timestamp). The ``hex`` field is the hex encoded
+    fingerprint, whose size and meaning depend on the ``type`` filter option.
+    The ``type`` field has the same value as the option the filter was created
+    with.
+
+    This returns the frames that were filtered since the last query of the
+    property. If ``clear-on-query=no`` was set, a query doesn't reset the list
+    of frames. In both cases, a maximum of 10 frames is returned. If there are
+    more frames, the oldest frames are discarded. Frames are returned in filter
+    order.
+
+    (This doesn't return a structured list for the per-frame details because the
+    internals of the ``vf-metadata`` mechanism suck. The returned format may
+    change in the future.)
+
+    This filter uses zimg for speed and profit. However, it will fallback to
+    libswscale in a number of situations: lesser pixel formats, unaligned data
+    pointers or strides, or if zimg fails to initialize for unknown reasons. In
+    these cases, the filter will use more CPU. Also, it will output different
+    fingerprints, because libswscale cannot perform the full range expansion we
+    normally request from zimg. As a consequence, the filter may be slower and
+    not work correctly in random situations.
+
+    ``type=...``
+        What fingerprint to compute. Available types are:
+
+        :gray-hex-8x8:      grayscale, 8 bit, 8x8 size
+        :gray-hex-16x16:    grayscale, 8 bit, 16x16 size (default)
+
+        Both types simply remove all colors, downscale the image, concatenate
+        all pixel values to a byte array, and convert the array to a hex string.
+
+    ``clear-on-query=yes|no``
+        Clear the list of frame fingerprints if the ``vf-metadata`` property for
+        this filter is queried (default: yes). This requires some care by the
+        user. Some types of accesses might query the filter multiple times,
+        which leads to lost frames.
+
+    ``print=yes|no``
+        Print computed fingerprints the the terminal (default: no). This is
+        mostly for testing and such. Scripts should use ``vf-metadata`` to
+        read information from this filter instead.
+
+``gpu=...``
+    Convert video to RGB using the OpenGL renderer normally used with
+    ``--vo=gpu``. This requires that the EGL implementation supports off-screen
+    rendering on the default display. (This is the case with Mesa.)
+
+    Sub-options:
+
+    ``w=<pixels>``, ``h=<pixels>``
+        Size of the output in pixels (default: 0). If not positive, this will
+        use the size of the first filtered input frame.
+
+    .. warning::
+
+        This is highly experimental. Performance is bad, and it will not work
+        everywhere in the first place. Some features are not supported.
+
+    .. warning::
+
+        This does not do OSD rendering. If you see OSD, then it has been
+        rendered by the VO backend. (Subtitles are rendered by the ``gpu``
+        filter, if possible.)
+
+    .. warning::
+
+        If you use this with encoding mode, keep in mind that encoding mode will
+        convert the RGB filter's output back to yuv420p in software, using the
+        configured software scaler. Using ``zimg`` might improve this, but in
+        any case it might go against your goals when using this filter.
+
+    .. warning::
+
+        Do not use this with ``--vo=gpu``. It will apply filtering twice, since
+        most ``--vo=gpu`` options are unconditionally applied to the ``gpu``
+        filter. There is no mechanism in mpv to prevent this.
+

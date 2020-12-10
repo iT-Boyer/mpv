@@ -3,18 +3,18 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -40,9 +40,9 @@
 struct priv {
     bool paused;
     double last_time;
-    bool playing_final;
     float buffered;     // samples
     int buffersize;     // samples
+    bool playing;
 
     int untimed;
     float bufferlen;    // seconds
@@ -57,7 +57,8 @@ struct priv {
     // (This is not needed by the AO API, but many AOs behave this way.)
     int outburst;       // samples
 
-    char **channel_layouts;
+    struct m_channels channel_layouts;
+    int format;
 };
 
 static void drain(struct ao *ao)
@@ -75,11 +76,8 @@ static void drain(struct ao *ao)
     double now = mp_time_sec();
     if (priv->buffered > 0) {
         priv->buffered -= (now - priv->last_time) * ao->samplerate * priv->speed;
-        if (priv->buffered < 0) {
-            if (!priv->playing_final)
-                MP_ERR(ao, "buffer underrun\n");
+        if (priv->buffered < 0)
             priv->buffered = 0;
-        }
     }
     priv->last_time = now;
 }
@@ -88,18 +86,15 @@ static int init(struct ao *ao)
 {
     struct priv *priv = ao->priv;
 
+    if (priv->format)
+        ao->format = priv->format;
+
     ao->untimed = priv->untimed;
 
     struct mp_chmap_sel sel = {.tmp = ao};
-    if (priv->channel_layouts) {
-        for (int n = 0; priv->channel_layouts[n]; n++) {
-            struct mp_chmap map = {0};
-            if (!mp_chmap_from_str(&map, bstr0(priv->channel_layouts[n]))) {
-                MP_FATAL(ao, "Invalid channel map in option.\n");
-                return -1;
-            }
-            mp_chmap_sel_add_map(&sel, &map);
-        }
+    if (priv->channel_layouts.num_chmaps) {
+        for (int n = 0; n < priv->channel_layouts.num_chmaps; n++)
+            mp_chmap_sel_add_map(&sel, &priv->channel_layouts.chmaps[n]);
     } else {
         mp_chmap_sel_add_any(&sel);
     }
@@ -110,7 +105,7 @@ static int init(struct ao *ao)
 
     // A "buffer" for this many seconds of audio
     int bursts = (int)(ao->samplerate * priv->bufferlen + 1) / priv->outburst;
-    priv->buffersize = priv->outburst * bursts + priv->latency;
+    ao->device_buffer = priv->outburst * bursts + priv->latency;
 
     priv->last_time = mp_time_sec();
 
@@ -122,98 +117,84 @@ static void uninit(struct ao *ao)
 {
 }
 
-static void wait_drain(struct ao *ao)
-{
-    struct priv *priv = ao->priv;
-    drain(ao);
-    if (!priv->paused)
-        mp_sleep_us(1000000.0 * priv->buffered / ao->samplerate / priv->speed);
-}
-
 // stop playing and empty buffers (for seeking/pause)
 static void reset(struct ao *ao)
 {
     struct priv *priv = ao->priv;
     priv->buffered = 0;
-    priv->playing_final = false;
+    priv->playing = false;
 }
 
-// stop playing, keep buffers (for pause)
-static void pause(struct ao *ao)
+static void start(struct ao *ao)
 {
     struct priv *priv = ao->priv;
 
-    drain(ao);
-    priv->paused = true;
-}
-
-// resume playing, after pause()
-static void resume(struct ao *ao)
-{
-    struct priv *priv = ao->priv;
+    if (priv->paused)
+        MP_ERR(ao, "illegal state: start() while paused\n");
 
     drain(ao);
     priv->paused = false;
     priv->last_time = mp_time_sec();
+    priv->playing = true;
 }
 
-static int get_space(struct ao *ao)
+static bool set_pause(struct ao *ao, bool paused)
 {
     struct priv *priv = ao->priv;
 
-    drain(ao);
-    int samples = priv->buffersize - priv->latency - priv->buffered;
-    return samples / priv->outburst * priv->outburst;
+    if (!priv->playing)
+        MP_ERR(ao, "illegal state: set_pause() while not playing\n");
+
+    if (priv->paused != paused) {
+
+        drain(ao);
+        priv->paused = paused;
+        if (!priv->paused)
+            priv->last_time = mp_time_sec();
+    }
+
+    return true;
 }
 
-static int play(struct ao *ao, void **data, int samples, int flags)
+static bool audio_write(struct ao *ao, void **data, int samples)
 {
     struct priv *priv = ao->priv;
-    int accepted;
-
-    resume(ao);
 
     if (priv->buffered <= 0)
         priv->buffered = priv->latency; // emulate fixed latency
 
-    priv->playing_final = flags & AOPLAY_FINAL_CHUNK;
-    if (priv->playing_final) {
-        // Last audio chunk - don't round to outburst.
-        accepted = MPMIN(priv->buffersize - priv->buffered, samples);
-    } else {
-        int maxbursts = (priv->buffersize - priv->buffered) / priv->outburst;
-        int playbursts = samples / priv->outburst;
-        int bursts = playbursts > maxbursts ? maxbursts : playbursts;
-        accepted = bursts * priv->outburst;
-    }
-    priv->buffered += accepted;
-    return accepted;
+    priv->buffered += samples;
+    return true;
 }
 
-static double get_delay(struct ao *ao)
+static void get_state(struct ao *ao, struct mp_pcm_state *state)
 {
     struct priv *priv = ao->priv;
 
     drain(ao);
 
-    // Note how get_delay returns the delay in audio device time (instead of
+    state->free_samples = ao->device_buffer - priv->latency - priv->buffered;
+    state->free_samples = state->free_samples / priv->outburst * priv->outburst;
+    state->queued_samples = priv->buffered;
+
+    // Note how get_state returns the delay in audio device time (instead of
     // adjusting for speed), since most AOs seem to also do that.
-    double delay = priv->buffered;
+    state->delay = priv->buffered;
 
     // Drivers with broken EOF handling usually always report the same device-
     // level delay that is additional to the buffer time.
     if (priv->broken_eof && priv->buffered < priv->latency)
-        delay = priv->latency;
+        state->delay = priv->latency;
 
-    delay /= ao->samplerate;
+    state->delay /= ao->samplerate;
 
     if (priv->broken_delay) { // Report only multiples of outburst
         double q = priv->outburst / (double)ao->samplerate;
-        if (delay > 0)
-            delay = (int)(delay / q) * q;
+        if (state->delay > 0)
+            state->delay = (int)(state->delay / q) * q;
     }
 
-    return delay;
+    state->playing = priv->playing && priv->buffered > 0;
 }
 
 #define OPT_BASE_STRUCT struct priv
@@ -224,12 +205,10 @@ const struct ao_driver audio_out_null = {
     .init      = init,
     .uninit    = uninit,
     .reset     = reset,
-    .get_space = get_space,
-    .play      = play,
-    .get_delay = get_delay,
-    .pause     = pause,
-    .resume    = resume,
-    .drain     = wait_drain,
+    .get_state = get_state,
+    .set_pause = set_pause,
+    .write     = audio_write,
+    .start     = start,
     .priv_size = sizeof(struct priv),
     .priv_defaults = &(const struct priv) {
         .bufferlen = 0.2,
@@ -237,14 +216,16 @@ const struct ao_driver audio_out_null = {
         .speed = 1,
     },
     .options = (const struct m_option[]) {
-        OPT_FLAG("untimed", untimed, 0),
-        OPT_FLOATRANGE("buffer", bufferlen, 0, 0, 100),
-        OPT_INTRANGE("outburst", outburst, 0, 1, 100000),
-        OPT_FLOATRANGE("speed", speed, 0, 0, 10000),
-        OPT_FLOATRANGE("latency", latency_sec, 0, 0, 100),
-        OPT_FLAG("broken-eof", broken_eof, 0),
-        OPT_FLAG("broken-delay", broken_delay, 0),
-        OPT_STRINGLIST("channel-layouts", channel_layouts, 0),
+        {"untimed", OPT_FLAG(untimed)},
+        {"buffer", OPT_FLOAT(bufferlen), M_RANGE(0, 100)},
+        {"outburst", OPT_INT(outburst), M_RANGE(1, 100000)},
+        {"speed", OPT_FLOAT(speed), M_RANGE(0, 10000)},
+        {"latency", OPT_FLOAT(latency_sec), M_RANGE(0, 100)},
+        {"broken-eof", OPT_FLAG(broken_eof)},
+        {"broken-delay", OPT_FLAG(broken_delay)},
+        {"channel-layouts", OPT_CHANNELS(channel_layouts)},
+        {"format", OPT_AUDIOFORMAT(format)},
         {0}
     },
+    .options_prefix = "ao-null",
 };

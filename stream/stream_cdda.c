@@ -46,12 +46,19 @@
 
 #include "common/msg.h"
 
+#include "config.h"
+#if !HAVE_GPL
+#error GPL only
+#endif
+
 typedef struct cdda_params {
     cdrom_drive_t *cd;
     cdrom_paranoia_t *cdp;
     int sector;
     int start_sector;
     int end_sector;
+    uint8_t *data;
+    size_t data_pos;
 
     // options
     int speed;
@@ -67,26 +74,19 @@ typedef struct cdda_params {
 } cdda_priv;
 
 #define OPT_BASE_STRUCT struct cdda_params
-
-static const m_option_t cdda_params_fields[] = {
-    OPT_INTPAIR("span", span, 0),
-    OPT_INTRANGE("speed", speed, 0, 1, 100),
-    OPT_STRING("device", device, 0),
-    {0}
-};
-
 const struct m_sub_options stream_cdda_conf = {
     .opts = (const m_option_t[]) {
-        OPT_INTRANGE("speed", speed, 0, 1, 100),
-        OPT_INTRANGE("paranoia", paranoia_mode, 0, 0, 2),
-        OPT_INTRANGE("sector-size", sector_size, 0, 1, 100),
-        OPT_INTRANGE("overlap", search_overlap, 0, 0, 75),
-        OPT_INT("toc-bias", toc_bias, 0),
-        OPT_INT("toc-offset", toc_offset, 0),
-        OPT_FLAG("skip", skip, 0),
-        OPT_STRING("device", device, 0),
-        OPT_INTPAIR("span", span, 0),
-        OPT_FLAG("cdtext", cdtext, 0),
+        {"speed", OPT_INT(speed), M_RANGE(1, 100)},
+        {"paranoia", OPT_INT(paranoia_mode), M_RANGE(0, 2)},
+        {"sector-size", OPT_INT(sector_size), M_RANGE(1, 100)},
+        {"overlap", OPT_INT(search_overlap), M_RANGE(0, 75)},
+        {"toc-bias", OPT_INT(toc_bias)},
+        {"toc-offset", OPT_INT(toc_offset)},
+        {"skip", OPT_FLAG(skip)},
+        {"span-a", OPT_INT(span[0])},
+        {"span-b", OPT_INT(span[1])},
+        {"cdtext", OPT_FLAG(cdtext)},
+        {"span", OPT_REMOVED("use span-a/span-b")},
         {0}
     },
     .size = sizeof(struct cdda_params),
@@ -157,25 +157,26 @@ static void cdparanoia_callback(long int inpos, paranoia_cb_mode_t function)
 {
 }
 
-static int fill_buffer(stream_t *s, char *buffer, int max_len)
+static int fill_buffer(stream_t *s, void *buffer, int max_len)
 {
     cdda_priv *p = (cdda_priv *)s->priv;
-    int16_t *buf;
     int i;
 
-    if (max_len < CDIO_CD_FRAMESIZE_RAW)
-        return -1;
+    if (!p->data || p->data_pos >= CDIO_CD_FRAMESIZE_RAW) {
+        if ((p->sector < p->start_sector) || (p->sector > p->end_sector))
+            return 0;
 
-    if ((p->sector < p->start_sector) || (p->sector > p->end_sector)) {
-        return 0;
+        p->data_pos = 0;
+        p->data = (uint8_t *)paranoia_read(p->cdp, cdparanoia_callback);
+        if (!p->data)
+            return 0;
+
+        p->sector++;
     }
 
-    buf = paranoia_read(p->cdp, cdparanoia_callback);
-    if (!buf)
-        return 0;
-
-    p->sector++;
-    memcpy(buffer, buf, CDIO_CD_FRAMESIZE_RAW);
+    size_t copy = MPMIN(CDIO_CD_FRAMESIZE_RAW - p->data_pos, max_len);
+    memcpy(buffer, p->data + p->data_pos, copy);
+    p->data_pos += copy;
 
     for (i = 0; i < p->cd->tracks; i++) {
         if (p->cd->disc_toc[i].dwStartSector == p->sector - 1) {
@@ -184,7 +185,7 @@ static int fill_buffer(stream_t *s, char *buffer, int max_len)
         }
     }
 
-    return CDIO_CD_FRAMESIZE_RAW;
+    return copy;
 }
 
 static int seek(stream_t *s, int64_t newpos)
@@ -266,16 +267,19 @@ static int control(stream_t *stream, int cmd, void *arg)
         *(double *)arg = pos / (44100.0 * 2 * 2);
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_SIZE:
-        *(int64_t *)arg =
-            (p->end_sector + 1 - p->start_sector) * CDIO_CD_FRAMESIZE_RAW;
-        return STREAM_OK;
     }
     return STREAM_UNSUPPORTED;
 }
 
+static int64_t get_size(stream_t *st)
+{
+    cdda_priv *p = st->priv;
+    return (p->end_sector + 1 - p->start_sector) * CDIO_CD_FRAMESIZE_RAW;
+}
+
 static int open_cdda(stream_t *st)
 {
+    st->priv = mp_get_config_group(st, st->global, &stream_cdda_conf);
     cdda_priv *priv = st->priv;
     cdda_priv *p = priv;
     int mode = p->paranoia_mode;
@@ -283,12 +287,17 @@ static int open_cdda(stream_t *st)
     cdrom_drive_t *cdd = NULL;
     int last_track;
 
-    if (!p->device || !p->device[0]) {
-        talloc_free(p->device);
-        if (st->opts->cdrom_device && st->opts->cdrom_device[0])
-            p->device = talloc_strdup(NULL, st->opts->cdrom_device);
-        else
-            p->device = talloc_strdup(NULL, DEFAULT_CDROM_DEVICE);
+    char *global_device;
+    mp_read_option_raw(st->global, "cdrom-device", &m_option_type_string,
+                       &global_device);
+    talloc_steal(st, global_device);
+
+    if (st->path[0]) {
+        p->device = st->path;
+    } else if (global_device && global_device[0]) {
+        p->device = global_device;
+    } else {
+        p->device = DEFAULT_CDROM_DEVICE;
     }
 
 #if defined(__NetBSD__)
@@ -376,17 +385,16 @@ static int open_cdda(stream_t *st)
     priv->sector = priv->start_sector;
 
     st->priv = priv;
-    st->sector_size = CDIO_CD_FRAMESIZE_RAW;
 
     st->fill_buffer = fill_buffer;
     st->seek = seek;
     st->seekable = true;
     st->control = control;
+    st->get_size = get_size;
     st->close = close_cdda;
 
     st->streaming = true;
 
-    st->type = STREAMTYPE_CDDA;
     st->demuxer = "+disc";
 
     print_cdtext(st, 0);
@@ -394,22 +402,9 @@ static int open_cdda(stream_t *st)
     return STREAM_OK;
 }
 
-static void *get_defaults(stream_t *st)
-{
-    return m_sub_options_copy(st, &stream_cdda_conf, st->opts->stream_cdda_opts);
-}
-
 const stream_info_t stream_info_cdda = {
     .name = "cdda",
     .open = open_cdda,
     .protocols = (const char*const[]){"cdda", NULL },
-    .priv_size = sizeof(cdda_priv),
-    .get_defaults = get_defaults,
-    .options = cdda_params_fields,
-    .url_options = (const char*const[]){
-        "hostname=span",
-        "port=speed",
-        "filename=device",
-        NULL
-    },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

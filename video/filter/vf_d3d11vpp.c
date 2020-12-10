@@ -15,23 +15,42 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <initguid.h>
 #include <assert.h>
 #include <windows.h>
 #include <d3d11.h>
 
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+
 #include "common/common.h"
 #include "osdep/timer.h"
 #include "osdep/windows_utils.h"
-#include "vf.h"
+#include "filters/f_autoconvert.h"
+#include "filters/filter.h"
+#include "filters/filter_internal.h"
+#include "filters/user_filters.h"
 #include "refqueue.h"
 #include "video/hwdec.h"
+#include "video/mp_image.h"
 #include "video/mp_image_pool.h"
 
 // missing in MinGW
+#define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BLEND 0x1
 #define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB 0x2
+#define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_ADAPTIVE 0x4
+#define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_MOTION_COMPENSATION 0x8
+#define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_INVERSE_TELECINE 0x10
+#define D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_FRAME_RATE_CONVERSION 0x20
 
-struct vf_priv_s {
+struct opts {
+    int deint_enabled;
+    int interlaced_only;
+    int mode;
+};
+
+struct priv {
+    struct opts *opts;
+
     ID3D11Device *vo_dev;
 
     ID3D11DeviceContext *device_ctx;
@@ -43,8 +62,6 @@ struct vf_priv_s {
     D3D11_VIDEO_FRAME_FORMAT d3d_frame_format;
 
     DXGI_FORMAT out_format;
-    bool out_shared;
-    bool out_rgb;
 
     bool require_filtering;
 
@@ -54,9 +71,6 @@ struct vf_priv_s {
     struct mp_image_pool *pool;
 
     struct mp_refqueue *queue;
-
-    int deint_enabled;
-    int interlaced_only;
 };
 
 static void release_tex(void *arg)
@@ -68,8 +82,8 @@ static void release_tex(void *arg)
 
 static struct mp_image *alloc_pool(void *pctx, int fmt, int w, int h)
 {
-    struct vf_instance *vf = pctx;
-    struct vf_priv_s *p = vf->priv;
+    struct mp_filter *vf = pctx;
+    struct priv *p = vf->priv;
     HRESULT hr;
 
     ID3D11Texture2D *texture = NULL;
@@ -82,7 +96,6 @@ static struct mp_image *alloc_pool(void *pctx, int fmt, int w, int h)
         .SampleDesc = { .Count = 1 },
         .Usage = D3D11_USAGE_DEFAULT,
         .BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
-        .MiscFlags = p->out_shared ? D3D11_RESOURCE_MISC_SHARED : 0,
     };
     hr = ID3D11Device_CreateTexture2D(p->vo_dev, &texdesc, NULL, &texture);
     if (FAILED(hr))
@@ -92,39 +105,25 @@ static struct mp_image *alloc_pool(void *pctx, int fmt, int w, int h)
     if (!mpi)
         abort();
 
-    mp_image_setfmt(mpi, p->out_params.imgfmt);
+    mp_image_setfmt(mpi, IMGFMT_D3D11);
     mp_image_set_size(mpi, w, h);
     mpi->params.hw_subfmt = p->out_params.hw_subfmt;
 
-    mpi->planes[1] = (void *)texture;
-    mpi->planes[2] = (void *)(intptr_t)0;
+    mpi->planes[0] = (void *)texture;
+    mpi->planes[1] = (void *)(intptr_t)0;
 
     return mpi;
 }
 
-static void flush_frames(struct vf_instance *vf)
+static void flush_frames(struct mp_filter *vf)
 {
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = vf->priv;
     mp_refqueue_flush(p->queue);
 }
 
-static int filter_ext(struct vf_instance *vf, struct mp_image *in)
+static void destroy_video_proc(struct mp_filter *vf)
 {
-    struct vf_priv_s *p = vf->priv;
-
-    mp_refqueue_set_refs(p->queue, 0, 0);
-    mp_refqueue_set_mode(p->queue,
-        (p->deint_enabled ? MP_MODE_DEINT : 0) |
-        MP_MODE_OUTPUT_FIELDS |
-        (p->interlaced_only ? MP_MODE_INTERLACED_ONLY : 0));
-
-    mp_refqueue_add_input(p->queue, in);
-    return 0;
-}
-
-static void destroy_video_proc(struct vf_instance *vf)
-{
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = vf->priv;
 
     if (p->video_proc)
         ID3D11VideoProcessor_Release(p->video_proc);
@@ -135,9 +134,9 @@ static void destroy_video_proc(struct vf_instance *vf)
     p->vp_enum = NULL;
 }
 
-static int recreate_video_proc(struct vf_instance *vf)
+static int recreate_video_proc(struct mp_filter *vf)
 {
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = vf->priv;
     HRESULT hr;
 
     destroy_video_proc(vf);
@@ -159,6 +158,9 @@ static int recreate_video_proc(struct vf_instance *vf)
     if (FAILED(hr))
         goto fail;
 
+    MP_VERBOSE(vf, "Found %d rate conversion caps. Looking for caps=0x%x.\n",
+               (int)caps.RateConversionCapsCount, p->opts->mode);
+
     int rindex = -1;
     for (int n = 0; n < caps.RateConversionCapsCount; n++) {
         D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS rcaps;
@@ -166,19 +168,21 @@ static int recreate_video_proc(struct vf_instance *vf)
                 (p->vp_enum, n, &rcaps);
         if (FAILED(hr))
             goto fail;
-        if (rcaps.ProcessorCaps & D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB)
-        {
-            rindex = n;
-            break;
+        MP_VERBOSE(vf, "  - %d: 0x%08x\n", n, (unsigned)rcaps.ProcessorCaps);
+        if (rcaps.ProcessorCaps & p->opts->mode) {
+            MP_VERBOSE(vf, "       (matching)\n");
+            if (rindex < 0)
+                rindex = n;
         }
     }
 
     if (rindex < 0) {
-        MP_ERR(vf, "No video processor found.\n");
-        goto fail;
+        MP_WARN(vf, "No fitting video processor found, picking #0.\n");
+        rindex = 0;
     }
 
-    // Assume RateConversionIndex==0 always works fine for us.
+    // TOOD: so, how do we select which rate conversion mode the processor uses?
+
     hr = ID3D11VideoDevice_CreateVideoProcessor(p->video_dev, p->vp_enum, rindex,
                                                 &p->video_proc);
     if (FAILED(hr)) {
@@ -207,27 +211,15 @@ static int recreate_video_proc(struct vf_instance *vf)
                                                          FALSE, 0);
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE csp = {
-        .YCbCr_Matrix = p->params.colorspace != MP_CSP_BT_601,
-        .Nominal_Range = p->params.colorlevels == MP_CSP_LEVELS_TV ? 1 : 2,
+        .YCbCr_Matrix = p->params.color.space != MP_CSP_BT_601,
+        .Nominal_Range = p->params.color.levels == MP_CSP_LEVELS_TV ? 1 : 2,
     };
     ID3D11VideoContext_VideoProcessorSetStreamColorSpace(p->video_ctx,
                                                          p->video_proc,
                                                          0, &csp);
-    if (p->out_rgb) {
-        if (p->params.colorspace != MP_CSP_BT_601 &&
-            p->params.colorspace != MP_CSP_BT_709)
-        {
-            MP_WARN(vf, "Unsupported video colorspace (%s/%s). Consider "
-                    "disabling hardware decoding, or using "
-                    "--hwdec=d3d11va-copy to get correct output.\n",
-                    m_opt_choice_str(mp_csp_names, p->params.colorspace),
-                    m_opt_choice_str(mp_csp_levels_names, p->params.colorlevels));
-        }
-    } else {
-        ID3D11VideoContext_VideoProcessorSetOutputColorSpace(p->video_ctx,
-                                                             p->video_proc,
-                                                             &csp);
-    }
+    ID3D11VideoContext_VideoProcessorSetOutputColorSpace(p->video_ctx,
+                                                         p->video_proc,
+                                                         &csp);
 
     return 0;
 fail:
@@ -235,30 +227,32 @@ fail:
     return -1;
 }
 
-static int render(struct vf_instance *vf)
+static struct mp_image *render(struct mp_filter *vf)
 {
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = vf->priv;
     int res = -1;
     HRESULT hr;
     ID3D11VideoProcessorInputView *in_view = NULL;
     ID3D11VideoProcessorOutputView *out_view = NULL;
     struct mp_image *in = NULL, *out = NULL;
-    out = mp_image_pool_get(p->pool, p->out_params.imgfmt, p->params.w, p->params.h);
-    if (!out)
+    out = mp_image_pool_get(p->pool, IMGFMT_D3D11, p->params.w, p->params.h);
+    if (!out) {
+        MP_WARN(vf, "failed to allocate frame\n");
         goto cleanup;
+    }
 
-    ID3D11Texture2D *d3d_out_tex = (void *)out->planes[1];
+    ID3D11Texture2D *d3d_out_tex = (void *)out->planes[0];
 
     in = mp_refqueue_get(p->queue, 0);
     if (!in)
         goto cleanup;
-    ID3D11Texture2D *d3d_tex = (void *)in->planes[1];
-    int d3d_subindex = (intptr_t)in->planes[2];
+    ID3D11Texture2D *d3d_tex = (void *)in->planes[0];
+    int d3d_subindex = (intptr_t)in->planes[1];
 
     mp_image_copy_attributes(out, in);
 
     D3D11_VIDEO_FRAME_FORMAT d3d_frame_format;
-    if (!mp_refqueue_is_interlaced(p->queue)) {
+    if (!mp_refqueue_should_deint(p->queue)) {
         d3d_frame_format = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     } else if (mp_refqueue_top_field_first(p->queue)) {
         d3d_frame_format = D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST;
@@ -278,7 +272,7 @@ static int render(struct vf_instance *vf)
             goto cleanup;
     }
 
-    if (!mp_refqueue_is_interlaced(p->queue)) {
+    if (!mp_refqueue_should_deint(p->queue)) {
         d3d_frame_format = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     } else if (mp_refqueue_is_top_field(p->queue)) {
         d3d_frame_format = D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST;
@@ -312,8 +306,10 @@ static int render(struct vf_instance *vf)
                                                           (ID3D11Resource *)d3d_out_tex,
                                                           p->vp_enum, &outdesc,
                                                           &out_view);
-    if (FAILED(hr))
+    if (FAILED(hr)) {
+        MP_ERR(vf, "Could not create ID3D11VideoProcessorOutputView\n");
         goto cleanup;
+    }
 
     D3D11_VIDEO_PROCESSOR_STREAM stream = {
         .Enable = TRUE,
@@ -327,93 +323,60 @@ static int render(struct vf_instance *vf)
         goto cleanup;
     }
 
-    // Make sure the texture is updated correctly on the shared context.
-    // (I'm not sure if this is correct, though it won't harm.)
-    ID3D11DeviceContext_Flush(p->device_ctx);
-
     res = 0;
 cleanup:
     if (in_view)
         ID3D11VideoProcessorInputView_Release(in_view);
     if (out_view)
         ID3D11VideoProcessorOutputView_Release(out_view);
-    if (res >= 0) {
-        vf_add_output_frame(vf, out);
-    } else {
-        talloc_free(out);
-    }
-    mp_refqueue_next_field(p->queue);
-    return res;
+    if (res < 0)
+        TA_FREEP(&out);
+    return out;
 }
 
-static int filter_out(struct vf_instance *vf)
+static void vf_d3d11vpp_process(struct mp_filter *vf)
 {
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = vf->priv;
 
-    if (!mp_refqueue_has_output(p->queue))
-        return 0;
+    struct mp_image *in_fmt = mp_refqueue_execute_reinit(p->queue);
+    if (in_fmt) {
+        mp_image_pool_clear(p->pool);
 
-    // no filtering
-    if (!mp_refqueue_should_deint(p->queue) && !p->require_filtering) {
-        struct mp_image *in = mp_refqueue_get(p->queue, 0);
-        vf_add_output_frame(vf, mp_image_new_ref(in));
-        mp_refqueue_next(p->queue);
-        return 0;
-    }
+        destroy_video_proc(vf);
 
-    return render(vf);
-}
+        p->params = in_fmt->params;
+        p->out_params = p->params;
 
-static int reconfig(struct vf_instance *vf, struct mp_image_params *in,
-                    struct mp_image_params *out)
-{
-    struct vf_priv_s *p = vf->priv;
-
-    flush_frames(vf);
-    talloc_free(p->pool);
-    p->pool = NULL;
-
-    destroy_video_proc(vf);
-
-    *out = *in;
-
-    if (vf_next_query_format(vf, IMGFMT_D3D11VA) ||
-        vf_next_query_format(vf, IMGFMT_D3D11NV12))
-    {
-        out->imgfmt = vf_next_query_format(vf, IMGFMT_D3D11VA)
-                    ? IMGFMT_D3D11VA : IMGFMT_D3D11NV12;
-        out->hw_subfmt = IMGFMT_NV12;
+        p->out_params.hw_subfmt = IMGFMT_NV12;
         p->out_format = DXGI_FORMAT_NV12;
-        p->out_shared = false;
-        p->out_rgb = false;
-    } else {
-        out->imgfmt = IMGFMT_D3D11RGB;
-        out->hw_subfmt = IMGFMT_RGB0;
-        p->out_format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        p->out_shared = true;
-        p->out_rgb = true;
+
+        p->require_filtering = p->params.hw_subfmt != p->out_params.hw_subfmt;
     }
 
-    p->require_filtering = in->hw_subfmt != out->hw_subfmt;
+    if (!mp_refqueue_can_output(p->queue))
+        return;
 
-    p->params = *in;
-    p->out_params = *out;
-
-    p->pool = mp_image_pool_new(20);
-    mp_image_pool_set_allocator(p->pool, alloc_pool, vf);
-    mp_image_pool_set_lru(p->pool);
-
-    return 0;
+    if (!mp_refqueue_should_deint(p->queue) && !p->require_filtering) {
+        // no filtering
+        struct mp_image *in = mp_image_new_ref(mp_refqueue_get(p->queue, 0));
+        if (!in) {
+            mp_filter_internal_mark_failed(vf);
+            return;
+        }
+        mp_refqueue_write_out_pin(p->queue, in);
+    } else {
+        mp_refqueue_write_out_pin(p->queue, render(vf));
+    }
 }
 
-static void uninit(struct vf_instance *vf)
+static void uninit(struct mp_filter *vf)
 {
-    struct vf_priv_s *p = vf->priv;
+    struct priv *p = vf->priv;
 
     destroy_video_proc(vf);
 
     flush_frames(vf);
-    mp_refqueue_free(p->queue);
+    talloc_free(p->queue);
     talloc_free(p->pool);
 
     if (p->video_ctx)
@@ -429,64 +392,52 @@ static void uninit(struct vf_instance *vf)
         ID3D11Device_Release(p->vo_dev);
 }
 
-static int query_format(struct vf_instance *vf, unsigned int imgfmt)
+static const struct mp_filter_info vf_d3d11vpp_filter = {
+    .name = "d3d11vpp",
+    .process = vf_d3d11vpp_process,
+    .reset = flush_frames,
+    .destroy = uninit,
+    .priv_size = sizeof(struct priv),
+};
+
+static struct mp_filter *vf_d3d11vpp_create(struct mp_filter *parent,
+                                            void *options)
 {
-    if (imgfmt == IMGFMT_D3D11VA ||
-        imgfmt == IMGFMT_D3D11NV12 ||
-        imgfmt == IMGFMT_D3D11RGB)
-    {
-        return vf_next_query_format(vf, IMGFMT_D3D11VA) ||
-               vf_next_query_format(vf, IMGFMT_D3D11NV12) ||
-               vf_next_query_format(vf, IMGFMT_D3D11RGB);
+    struct mp_filter *f = mp_filter_create(parent, &vf_d3d11vpp_filter);
+    if (!f) {
+        talloc_free(options);
+        return NULL;
     }
-    return 0;
-}
 
-static bool test_conversion(int in, int out)
-{
-    return (in == IMGFMT_D3D11VA ||
-            in == IMGFMT_D3D11NV12 ||
-            in == IMGFMT_D3D11RGB) &&
-           (out == IMGFMT_D3D11VA ||
-            out == IMGFMT_D3D11NV12 ||
-            out == IMGFMT_D3D11RGB);
-}
+    mp_filter_add_pin(f, MP_PIN_IN, "in");
+    mp_filter_add_pin(f, MP_PIN_OUT, "out");
 
-static int control(struct vf_instance *vf, int request, void* data)
-{
-    struct vf_priv_s *p = vf->priv;
-    switch (request){
-    case VFCTRL_GET_DEINTERLACE:
-        *(int*)data = !!p->deint_enabled;
-        return true;
-    case VFCTRL_SET_DEINTERLACE:
-        p->deint_enabled = !!*(int*)data;
-        return true;
-    case VFCTRL_SEEK_RESET:
-        flush_frames(vf);
-        return true;
-    default:
-        return CONTROL_UNKNOWN;
+    struct priv *p = f->priv;
+    p->opts = talloc_steal(p, options);
+
+    // Special path for vf_d3d11_create_outconv(): disable all processing except
+    // possibly surface format conversions.
+    if (!p->opts) {
+        static const struct opts opts = {0};
+        p->opts = (struct opts *)&opts;
     }
-}
 
-static int vf_open(vf_instance_t *vf)
-{
-    struct vf_priv_s *p = vf->priv;
+    p->queue = mp_refqueue_alloc(f);
 
-    vf->reconfig = reconfig;
-    vf->filter_ext = filter_ext;
-    vf->filter_out = filter_out;
-    vf->query_format = query_format;
-    vf->uninit = uninit;
-    vf->control = control;
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    if (!info || !info->hwdec_devs)
+        goto fail;
 
-    p->queue = mp_refqueue_alloc();
+    hwdec_devices_request_all(info->hwdec_devs);
 
-    p->vo_dev = hwdec_devices_load(vf->hwdec_devs, HWDEC_D3D11VA);
-    if (!p->vo_dev)
-        return 0;
+    struct mp_hwdec_ctx *hwctx =
+        hwdec_devices_get_by_lavc(info->hwdec_devs, AV_HWDEVICE_TYPE_D3D11VA);
+    if (!hwctx || !hwctx->av_device_ref)
+        goto fail;
+    AVHWDeviceContext *avhwctx = (void *)hwctx->av_device_ref->data;
+    AVD3D11VADeviceContext *d3dctx = avhwctx->hwctx;
 
+    p->vo_dev = d3dctx->device;
     ID3D11Device_AddRef(p->vo_dev);
 
     HRESULT hr;
@@ -504,29 +455,50 @@ static int vf_open(vf_instance_t *vf)
     if (FAILED(hr))
         goto fail;
 
-    return 1;
+    p->pool = mp_image_pool_new(f);
+    mp_image_pool_set_allocator(p->pool, alloc_pool, f);
+    mp_image_pool_set_lru(p->pool);
+
+    mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, 0);
+
+    mp_refqueue_set_refs(p->queue, 0, 0);
+    mp_refqueue_set_mode(p->queue,
+        (p->opts->deint_enabled ? MP_MODE_DEINT : 0) |
+        MP_MODE_OUTPUT_FIELDS |
+        (p->opts->interlaced_only ? MP_MODE_INTERLACED_ONLY : 0));
+
+    return f;
 
 fail:
-    uninit(vf);
-    return 0;
+    talloc_free(f);
+    return NULL;
 }
 
-#define OPT_BASE_STRUCT struct vf_priv_s
+#define OPT_BASE_STRUCT struct opts
 static const m_option_t vf_opts_fields[] = {
-    OPT_FLAG("deint", deint_enabled, 0),
-    OPT_FLAG("interlaced-only", interlaced_only, 0),
+    {"deint", OPT_FLAG(deint_enabled)},
+    {"interlaced-only", OPT_FLAG(interlaced_only)},
+    {"mode", OPT_CHOICE(mode,
+        {"blend", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BLEND},
+        {"bob", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB},
+        {"adaptive", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_ADAPTIVE},
+        {"mocomp", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_MOTION_COMPENSATION},
+        {"ivctc", D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_INVERSE_TELECINE},
+        {"none", 0})},
     {0}
 };
 
-const vf_info_t vf_info_d3d11vpp = {
-    .description = "D3D11 Video Post-Process Filter",
-    .name = "d3d11vpp",
-    .test_conversion = test_conversion,
-    .open = vf_open,
-    .priv_size = sizeof(struct vf_priv_s),
-    .priv_defaults = &(const struct vf_priv_s) {
-        .deint_enabled = 1,
-        .interlaced_only = 1,
+const struct mp_user_filter_entry vf_d3d11vpp = {
+    .desc = {
+        .description = "D3D11 Video Post-Process Filter",
+        .name = "d3d11vpp",
+        .priv_size = sizeof(OPT_BASE_STRUCT),
+        .priv_defaults = &(const OPT_BASE_STRUCT) {
+            .deint_enabled = 1,
+            .interlaced_only = 0,
+            .mode = D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB,
+        },
+        .options = vf_opts_fields,
     },
-    .options = vf_opts_fields,
+    .create = vf_d3d11vpp_create,
 };

@@ -16,7 +16,7 @@ The version number is the same as used for MPV_CLIENT_API_VERSION (see
 ``client.h`` how to convert between major/minor version numbers and the flat
 32 bit integer).
 
-Also, read the section ``Compatibility`` in ``client.h``.
+Also, read the section ``Compatibility`` in ``client.h``, and compatibility.rst.
 
 Options, commands, properties
 =============================
@@ -32,7 +32,142 @@ API changes
 
 ::
 
- --- mpv 0.17.1 ---
+ --- mpv 0.33.0 ---
+ 1.109  - add MPV_RENDER_API_TYPE_SW and related (software rendering API)
+        - inactivate the opengl_cb API (always fails to initialize now)
+          The opengl_cb API was deprecated over 2 years ago. Use the render API
+          instead.
+ 1.108  - Deprecate MPV_EVENT_IDLE
+        - add mpv_event_start_file
+        - add the following fields to mpv_event_end_file: playlist_entry_id,
+          playlist_insert_id, playlist_insert_num_entries
+        - add mpv_event_to_node()
+        - add mpv_client_id()
+ 1.107  - Remove the deprecated qthelper.hpp. This was obviously not part of the
+          libmpv API, only an "additionally" provided helper, thus this is not
+          considered an API change. If you are maintaining a project that relies
+          on this header, you can simply download this file and adjust the
+          include statement to use it instead:
+
+            https://raw.githubusercontent.com/mpv-player/mpv/v0.32.0/libmpv/qthelper.hpp
+
+          It is a good idea to write better wrappers for your use, though.
+ --- mpv 0.31.0 ---
+ 1.107  - Deprecate MPV_EVENT_TICK
+
+ --- mpv 0.30.0 ---
+ 1.106  - Add cancel_fn to mpv_stream_cb_info
+ 1.105  - Fix deadlock problems with MPV_RENDER_PARAM_ADVANCED_CONTROL and if
+          the "vd-lavc-dr" option is enabled (which it is by default).
+          There were no actual API changes.
+          API users on older API versions and mpv releases should set
+          "vd-lavc-dr" to "no" to avoid these issues.
+          API users must still adhere to the tricky rules documented in render.h
+          to avoid other deadlocks.
+ 1.104  - Deprecate struct mpv_opengl_drm_params. Replaced by mpv_opengl_drm_params_v2
+        - Deprecate MPV_RENDER_PARAM_DRM_DISPLAY. Replaced by MPV_RENDER_PARAM_DRM_DISPLAY_V2.
+ 1.103  - redo handling of async commands
+        - add mpv_event_command and make it possible to return values from
+          commands issued with mpv_command_async() or mpv_command_node_async()
+        - add mpv_abort_async_command()
+ 1.102  - rename struct mpv_opengl_drm_osd_size to mpv_opengl_drm_draw_surface_size
+        - rename MPV_RENDER_PARAM_DRM_OSD_SIZE to MPV_RENDER_PARAM_DRM_DRAW_SURFACE_SIZE
+
+ --- mpv 0.29.0 ---
+ 1.101  - add MPV_RENDER_PARAM_ADVANCED_CONTROL and related API
+        - add MPV_RENDER_PARAM_NEXT_FRAME_INFO and related symbols
+        - add MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME
+        - add MPV_RENDER_PARAM_SKIP_RENDERING
+        - add mpv_render_context_get_info()
+ 1.100  - bump API number to avoid confusion with mpv release versions
+        - actually apply the GL_MP_MPGetNativeDisplay change for the new render
+          API. This also means compatibility for anything but x11 and wayland
+          through the old opengl-cb GL_MP_MPGetNativeDisplay method is now
+          unsupported.
+        - deprecate mpv_get_wakeup_pipe(). It's complex, but easy to replace
+          using normal API (just set a wakeup callback to a function which
+          writes to a pipe).
+        - add a 1st class hook API, which replaces the hacky mpv_command()
+          based one. The old API is deprecated and will be removed soon. The
+          old API was never meant to be stable, while the new API is.
+ 1.29   - the behavior of mpv_terminate_destroy() and mpv_detach_destroy()
+          changes subtly (see documentation in the header file). In particular,
+          mpv_detach_destroy() will not leave the player running in all
+          situations anymore (it gets closer to refcounting).
+        - rename mpv_detach_destroy() to mpv_destroy() (the old function will
+          remain valid as deprecated alias)
+        - add mpv_create_weak_client(), which makes use of above changes
+        - MPV_EVENT_SHUTDOWN is now returned exactly once if a mpv_handle
+          should terminate, instead of spamming the event queue with this event
+ 1.28   - deprecate the render opengl_cb API, and replace it with render.h
+          and render_gl.h. The goal is allowing support for APIs other than
+          OpenGL. The old API is emulated with the new API.
+          Likewise, the "opengl-cb" VO is renamed to "libmpv".
+          mpv_get_sub_api() is deprecated along the opengl_cb API.
+          The new API is relatively similar, but not the same. The rough
+          equivalents are:
+            mpv_opengl_cb_init_gl => mpv_render_context_create
+            mpv_opengl_cb_set_update_callback => mpv_render_context_set_update_callback
+            mpv_opengl_cb_draw => mpv_render_context_render
+            mpv_opengl_cb_report_flip => mpv_render_context_report_swap
+            mpv_opengl_cb_uninit_gl => mpv_render_context_free
+          The VO opengl-cb is also renamed to "libmpv".
+          Also, the GL_MP_MPGetNativeDisplay pseudo extension is not used by the
+          render API anymore, and the old opengl-cb API only handles the "x11"
+          and "wl" names anymore. Support for everything else has been removed.
+          The new render API uses proper API parameters, e.g. for X11 you pass
+          MPV_RENDER_PARAM_X11_DISPLAY directly.
+        - deprecate the qthelper.hpp header file. This provided some C++ helper
+          utility functions for Qt with use of libmpv. There is no reason to
+          keep this in the mpv git repository, nor to make it part of the libmpv
+          API. If you're using this header, you can safely copy it into your
+          project - it uses only libmpv public API. Alternatively, it could be
+          maintained in a separate repository by interested parties.
+ 1.27   - make opengl-cb the default VO. This causes a subtle behavior change
+          if the API user called mpv_opengl_cb_init_gl(), but does not set
+          the "vo" option. Before, it would still have used another VO (like
+          on the CLI, e.g. vo=gpu). Now it'll behave as if vo=opengl-cb was
+          used.
+ --- mpv 0.28.0 ---
+ 1.26   - remove glMPGetNativeDisplay("drm") support
+        - add mpv_opengl_cb_window_pos and mpv_opengl_cb_drm_params and
+          support via glMPGetNativeDisplay() for using it
+        - make --stop-playback-on-init-failure=no the default in libmpv (just
+          like in mpv CLI)
+ --- mpv 0.27.0 ---
+ 1.25   - remove setting "no-" options via mpv_set_option*(). (See corresponding
+          deprecation in 0.23.0.)
+ --- mpv 0.25.0 ---
+ 1.24   - add a MPV_ENABLE_DEPRECATED preprocessor symbol, which can be defined
+          by the user to exclude deprecated API symbols from the C headers
+ --- mpv 0.23.0 ---
+ 1.24   - the deprecated mpv_suspend() and mpv_resume() APIs now do nothing.
+ --- mpv 0.22.0 ---
+ 1.23   - deprecate setting "no-" options via mpv_set_option*(). For example,
+          instead of "no-video=" you should set "video=no".
+        - do not override the SIGPIPE signal handler anymore. This was done as
+          workaround for the FFmpeg TLS code, which has been fixed long ago.
+        - deprecate mpv_suspend() and mpv_resume(). They will be stubbed out
+          in mpv 0.23.0.
+        - make mpv_set_property() work to some degree before mpv_initialize().
+          It can now be used instead of mpv_set_option().
+        - semi-deprecate mpv_set_option()/mpv_set_option_string(). You should
+          use mpv_set_property() instead. There are some deprecated properties
+          which conflict with some options (see client.h remarks on
+          mpv_set_option()), for which mpv_set_option() might still be required.
+          In future mpv releases, the conflicting deprecated options/properties
+          will be removed, and mpv_set_option() will internally translate API
+          calls to mpv_set_property().
+        - qthelper.hpp: deprecate get_property_variant, set_property_variant,
+          set_option_variant, command_variant, and replace them with
+          get_property, set_property, command.
+ --- mpv 0.19.0 ---
+ 1.22   - add stream_cb API for custom protocols
+ --- mpv 0.18.1 ---
+ ----   - remove "status" log level from mpv_request_log_messages() docs. This
+          is 100% equivalent to "v". The behavior is still the same, thus no
+          actual API change.
+ --- mpv 0.18.0 ---
  1.21   - mpv_set_property() changes behavior with MPV_FORMAT_NODE. Before this
           change it rejected mpv_nodes with format==MPV_FORMAT_STRING if the
           property was not a string or did not have special mechanisms in place

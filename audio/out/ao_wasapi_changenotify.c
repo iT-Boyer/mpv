@@ -17,7 +17,6 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <initguid.h>
 #include <wchar.h>
 
 #include "ao_wasapi.h"
@@ -68,7 +67,7 @@ static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceStateChanged(
         case DEVICE_STATE_DISABLED:
         case DEVICE_STATE_NOTPRESENT:
         case DEVICE_STATE_UNPLUGGED:
-            MP_VERBOSE(ao, "OnDeviceStateChanged triggered on device %S: "
+            MP_VERBOSE(ao, "OnDeviceStateChanged triggered on device %ls: "
                        "requesting ao reload\n", pwstrDeviceId);
             ao_request_reload(ao);
             break;
@@ -95,7 +94,7 @@ static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceAdded(
     return S_OK;
 }
 
-// maybe MPV can go over to the prefered device once it is plugged in?
+// maybe MPV can go over to the preferred device once it is plugged in?
 static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceRemoved(
     IMMNotificationClient *This,
     LPCWSTR pwstrDeviceId)
@@ -107,7 +106,7 @@ static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceRemoved(
         MP_VERBOSE(ao, "OnDeviceRemoved triggered: sending hotplug event\n");
         ao_hotplug_event(ao);
     } else if (pwstrDeviceId && !wcscmp(pwstrDeviceId, change->monitored)) {
-        MP_VERBOSE(ao, "OnDeviceRemoved triggered for device %S: "
+        MP_VERBOSE(ao, "OnDeviceRemoved triggered for device %ls: "
                    "requesting ao reload\n", pwstrDeviceId);
         ao_request_reload(ao);
     }
@@ -167,7 +166,7 @@ static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnPropertyValueChanged(
     if (!change->is_hotplug && pwstrDeviceId &&
         !wcscmp(pwstrDeviceId, change->monitored))
     {
-        MP_VERBOSE(ao, "OnPropertyValueChanged triggered on device %S\n",
+        MP_VERBOSE(ao, "OnPropertyValueChanged triggered on device %ls\n",
                    pwstrDeviceId);
         if (IsEqualPropertyKey(PKEY_AudioEngine_DeviceFormat, key)) {
             MP_VERBOSE(change->ao,
@@ -203,14 +202,6 @@ HRESULT wasapi_change_init(struct ao *ao, bool is_hotplug)
                                   (void **)&change->pEnumerator);
     EXIT_ON_ERROR(hr);
 
-    // COM voodoo to emulate c++ class
-    change->client.lpVtbl = &sIMMNotificationClientVtbl;
-
-    // register the change notification client
-    hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(
-        change->pEnumerator, (IMMNotificationClient *)change);
-    EXIT_ON_ERROR(hr);
-
     // so the callbacks can access the ao
     change->ao = ao;
 
@@ -222,8 +213,16 @@ HRESULT wasapi_change_init(struct ao *ao, bool is_hotplug)
     } else {
         // Get the device string to compare with the pwstrDeviceId
         change->monitored = state->deviceID;
-        MP_VERBOSE(ao, "Monitoring changes in device %S\n", change->monitored);
+        MP_VERBOSE(ao, "Monitoring changes in device %ls\n", change->monitored);
     }
+
+    // COM voodoo to emulate c++ class
+    change->client.lpVtbl = &sIMMNotificationClientVtbl;
+
+    // register the change notification client
+    hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(
+        change->pEnumerator, (IMMNotificationClient *)change);
+    EXIT_ON_ERROR(hr);
 
     return hr;
 exit_label:
@@ -243,5 +242,5 @@ void wasapi_change_uninit(struct ao *ao)
             change->pEnumerator, (IMMNotificationClient *)change);
     }
 
-    SAFE_RELEASE(change->pEnumerator, IMMDeviceEnumerator_Release(change->pEnumerator));
+    SAFE_RELEASE(change->pEnumerator);
 }

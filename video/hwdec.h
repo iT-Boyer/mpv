@@ -1,58 +1,22 @@
 #ifndef MP_HWDEC_H_
 #define MP_HWDEC_H_
 
+#include <libavutil/buffer.h>
+
 #include "options/m_option.h"
 
 struct mp_image_pool;
 
-// keep in sync with --hwdec option (see mp_hwdec_names)
-enum hwdec_type {
-    HWDEC_NONE = 0,
-    HWDEC_AUTO,
-    HWDEC_AUTO_COPY,
-    HWDEC_VDPAU,
-    HWDEC_VIDEOTOOLBOX,
-    HWDEC_VAAPI,
-    HWDEC_VAAPI_COPY,
-    HWDEC_DXVA2,
-    HWDEC_DXVA2_COPY,
-    HWDEC_D3D11VA,
-    HWDEC_D3D11VA_COPY,
-    HWDEC_RPI,
-    HWDEC_MEDIACODEC,
-};
-
-#define HWDEC_IS_AUTO(x) ((x) == HWDEC_AUTO || (x) == HWDEC_AUTO_COPY)
-
-// hwdec_type names (options.c)
-extern const struct m_opt_choice_alternatives mp_hwdec_names[];
-
 struct mp_hwdec_ctx {
-    enum hwdec_type type; // (never HWDEC_NONE or HWDEC_IS_AUTO)
     const char *driver_name; // NULL if unknown/not loaded
 
-    // This is never NULL. Its meaning depends on the .type field:
-    //  HWDEC_VDPAU:            struct mp_vaapi_ctx*
-    //  HWDEC_VIDEOTOOLBOX:     struct mp_vt_ctx*
-    //  HWDEC_VAAPI:            struct mp_vaapi_ctx*
-    //  HWDEC_D3D11VA:          ID3D11Device*
-    //  HWDEC_DXVA2:            IDirect3DDevice9*
-    //  HWDEC_DXVA2_COPY:       IDirect3DDevice9*
-    void *ctx;
+    // libavutil-wrapped context, if available.
+    struct AVBufferRef *av_device_ref; // AVHWDeviceContext*
 
-    // Optional.
-    // Allocates a software image from the pool, downloads the hw image from
-    // mpi, and returns it.
-    // pool can be NULL (then just use straight allocation).
-    // Return NULL on error or if mpi has the wrong format.
-    struct mp_image *(*download_image)(struct mp_hwdec_ctx *ctx,
-                                       struct mp_image *mpi,
-                                       struct mp_image_pool *swpool);
-};
-
-struct mp_vt_ctx {
-    void *priv;
-    uint32_t (*get_vt_fmt)(struct mp_vt_ctx *ctx);
+    // List of IMGFMT_s, terminated with 0. NULL if N/A.
+    const int *supported_formats;
+    // HW format for which above hw_subfmts are valid.
+    int hw_imgfmt;
 };
 
 // Used to communicate hardware decoder device handles from VO to video decoder.
@@ -65,35 +29,70 @@ void hwdec_devices_destroy(struct mp_hwdec_devices *devs);
 // available. Logically, the returned pointer remains valid until VO
 // uninitialization is started (all users of it must be uninitialized before).
 // hwdec_devices_request() may be used before this to lazily load devices.
-struct mp_hwdec_ctx *hwdec_devices_get(struct mp_hwdec_devices *devs,
-                                       enum hwdec_type type);
+// Contains a wrapped AVHWDeviceContext.
+// Beware that this creates a _new_ reference.
+struct AVBufferRef *hwdec_devices_get_lavc(struct mp_hwdec_devices *devs,
+                                           int av_hwdevice_type);
+
+struct mp_hwdec_ctx *hwdec_devices_get_by_lavc(struct mp_hwdec_devices *devs,
+                                               int av_hwdevice_type);
 
 // For code which still strictly assumes there is 1 (or none) device.
 struct mp_hwdec_ctx *hwdec_devices_get_first(struct mp_hwdec_devices *devs);
+
+// Return the n-th device. NULL if none.
+struct mp_hwdec_ctx *hwdec_devices_get_n(struct mp_hwdec_devices *devs, int n);
 
 // Add this to the list of internal devices. Adding the same pointer twice must
 // be avoided.
 void hwdec_devices_add(struct mp_hwdec_devices *devs, struct mp_hwdec_ctx *ctx);
 
 // Remove this from the list of internal devices. Idempotent/ignores entries
-// not added yet.
+// not added yet. This is not thread-safe.
 void hwdec_devices_remove(struct mp_hwdec_devices *devs, struct mp_hwdec_ctx *ctx);
 
 // Can be used to enable lazy loading of an API with hwdec_devices_request().
 // If used at all, this must be set/unset during initialization/uninitialization,
 // as concurrent use with hwdec_devices_request() is a race condition.
 void hwdec_devices_set_loader(struct mp_hwdec_devices *devs,
-    void (*load_api)(void *ctx, enum hwdec_type type), void *load_api_ctx);
+    void (*load_api)(void *ctx), void *load_api_ctx);
 
-// Cause VO to lazily load the requested device, and will block until this is
-// done (even if not available).
-void hwdec_devices_request(struct mp_hwdec_devices *devs, enum hwdec_type type);
+// Cause VO to lazily load all devices, and will block until this is done (even
+// if not available).
+void hwdec_devices_request_all(struct mp_hwdec_devices *devs);
 
-// Convenience function:
-// - return NULL if devs==NULL
-// - call hwdec_devices_request(devs, type)
-// - call hwdec_devices_get(devs, type)
-// - then return the mp_hwdec_ctx.ctx field
-void *hwdec_devices_load(struct mp_hwdec_devices *devs, enum hwdec_type type);
+// Return "," concatenated list (for introspection/debugging). Use talloc_free().
+char *hwdec_devices_get_names(struct mp_hwdec_devices *devs);
+
+struct mp_image;
+struct mpv_global;
+
+struct hwcontext_create_dev_params {
+    bool probing;   // if true, don't log errors if unavailable
+};
+
+// Per AV_HWDEVICE_TYPE_* functions, queryable via hwdec_get_hwcontext_fns().
+// All entries are strictly optional.
+struct hwcontext_fns {
+    int av_hwdevice_type;
+    // Fill in special format-specific requirements.
+    void (*refine_hwframes)(struct AVBufferRef *hw_frames_ctx);
+    // Returns a AVHWDeviceContext*. Used for copy hwdecs.
+    struct AVBufferRef *(*create_dev)(struct mpv_global *global,
+                                      struct mp_log *log,
+                                      struct hwcontext_create_dev_params *params);
+    // Return whether this is using some sort of sub-optimal emulation layer.
+    bool (*is_emulated)(struct AVBufferRef *hw_device_ctx);
+};
+
+// The parameter is of type enum AVHWDeviceType (as in int to avoid extensive
+// recursive includes). May return NULL for unknown device types.
+const struct hwcontext_fns *hwdec_get_hwcontext_fns(int av_hwdevice_type);
+
+extern const struct hwcontext_fns hwcontext_fns_cuda;
+extern const struct hwcontext_fns hwcontext_fns_d3d11;
+extern const struct hwcontext_fns hwcontext_fns_dxva2;
+extern const struct hwcontext_fns hwcontext_fns_vaapi;
+extern const struct hwcontext_fns hwcontext_fns_vdpau;
 
 #endif

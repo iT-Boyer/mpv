@@ -43,6 +43,8 @@ struct priv {
     double base_dts;    // packet DTS that maps to base_time
     double last_dts;    // DTS of previously demuxed packet
     bool seek_reinit;   // needs reinit after seek
+
+    bool is_dvd, is_cdda;
 };
 
 // If the timestamp difference between subsequent packets is this big, assume
@@ -57,15 +59,15 @@ static void reselect_streams(demuxer_t *demuxer)
     for (int n = 0; n < MPMIN(num_slave, p->num_streams); n++) {
         if (p->streams[n]) {
             demuxer_select_track(p->slave, demux_get_stream(p->slave, n),
-                demux_stream_is_selected(p->streams[n]));
+                MP_NOPTS_VALUE, demux_stream_is_selected(p->streams[n]));
         }
     }
 }
 
-static void get_disc_lang(struct stream *stream, struct sh_stream *sh)
+static void get_disc_lang(struct stream *stream, struct sh_stream *sh, bool dvd)
 {
     struct stream_lang_req req = {.type = sh->type, .id = sh->demuxer_id};
-    if (stream->uncached_type == STREAMTYPE_DVD && sh->type == STREAM_SUB)
+    if (dvd && sh->type == STREAM_SUB)
         req.id = req.id & 0x1F; // mpeg ID to index
     stream_control(stream, STREAM_CTRL_GET_LANG, &req);
     if (req.name[0])
@@ -76,7 +78,7 @@ static void add_dvd_streams(demuxer_t *demuxer)
 {
     struct priv *p = demuxer->priv;
     struct stream *stream = demuxer->stream;
-    if (stream->uncached_type != STREAMTYPE_DVD)
+    if (!p->is_dvd)
         return;
     struct stream_dvd_info_req info;
     if (stream_control(stream, STREAM_CTRL_GET_DVD_INFO, &info) > 0) {
@@ -84,7 +86,7 @@ static void add_dvd_streams(demuxer_t *demuxer)
             struct sh_stream *sh = demux_alloc_sh_stream(STREAM_SUB);
             sh->demuxer_id = n + 0x20;
             sh->codec->codec = "dvd_subtitle";
-            get_disc_lang(stream, sh);
+            get_disc_lang(stream, sh, true);
             // p->streams _must_ match with p->slave->streams, so we can't add
             // it yet - it has to be done when the real stream appears, which
             // could be right on start, or any time later.
@@ -152,7 +154,7 @@ static void add_streams(demuxer_t *demuxer)
                 sh->codec->par_h = f.p_h;
             }
         }
-        get_disc_lang(demuxer->stream, sh);
+        get_disc_lang(demuxer->stream, sh, p->is_dvd);
         demux_add_sh_stream(demuxer, sh);
     }
     reselect_streams(demuxer);
@@ -162,7 +164,7 @@ static void d_seek(demuxer_t *demuxer, double seek_pts, int flags)
 {
     struct priv *p = demuxer->priv;
 
-    if (demuxer->stream->uncached_type == STREAMTYPE_CDDA) {
+    if (p->is_cdda) {
         demux_seek(p->slave, seek_pts, flags);
         return;
     }
@@ -175,9 +177,15 @@ static void d_seek(demuxer_t *demuxer, double seek_pts, int flags)
 
     MP_VERBOSE(demuxer, "seek to: %f\n", seek_pts);
 
+    // Supposed to induce a seek reset. Does it even work? I don't know.
+    // It will log some bogus error messages, since the demuxer will try a
+    // low level seek, which will obviously not work. But it will probably
+    // clear its internal buffers.
+    demux_seek(p->slave, 0, SEEK_FACTOR | SEEK_FORCE);
+    stream_drop_buffers(demuxer->stream);
+
     double seek_arg[] = {seek_pts, flags};
     stream_control(demuxer->stream, STREAM_CTRL_SEEK_TO_TIME, seek_arg);
-    demux_control(p->slave, DEMUXER_CTRL_RESYNC, NULL);
 
     p->seek_reinit = true;
 }
@@ -197,15 +205,15 @@ static void reset_pts(demuxer_t *demuxer)
     p->seek_reinit = false;
 }
 
-static int d_fill_buffer(demuxer_t *demuxer)
+static bool d_read_packet(struct demuxer *demuxer, struct demux_packet **out_pkt)
 {
     struct priv *p = demuxer->priv;
 
     struct demux_packet *pkt = demux_read_any_packet(p->slave);
     if (!pkt)
-        return 0;
+        return false;
 
-    demux_update(p->slave);
+    demux_update(p->slave, MP_NOPTS_VALUE);
 
     if (p->seek_reinit)
         reset_pts(demuxer);
@@ -213,18 +221,20 @@ static int d_fill_buffer(demuxer_t *demuxer)
     add_streams(demuxer);
     if (pkt->stream >= p->num_streams) { // out of memory?
         talloc_free(pkt);
-        return 0;
+        return true;
     }
 
     struct sh_stream *sh = p->streams[pkt->stream];
     if (!demux_stream_is_selected(sh)) {
         talloc_free(pkt);
-        return 1;
+        return true;
     }
 
-    if (demuxer->stream->uncached_type == STREAMTYPE_CDDA) {
-        demux_add_packet(sh, pkt);
-        return 1;
+    pkt->stream = sh->index;
+
+    if (p->is_cdda) {
+        *out_pkt = pkt;
+        return true;
     }
 
     MP_TRACE(demuxer, "ipts: %d %f %f\n", sh->type, pkt->pts, pkt->dts);
@@ -259,7 +269,7 @@ static int d_fill_buffer(demuxer_t *demuxer)
 
     MP_TRACE(demuxer, "opts: %d %f %f\n", sh->type, pkt->pts, pkt->dts);
 
-    demux_add_packet(sh, pkt);
+    *out_pkt = pkt;
     return 1;
 }
 
@@ -283,9 +293,24 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
     if (check != DEMUX_CHECK_FORCE)
         return -1;
 
-    struct demuxer_params params = {.force_format = "+lavf"};
+    struct demuxer_params params = {
+        .force_format = "+lavf",
+        .external_stream = demuxer->stream,
+        .stream_flags = demuxer->stream_origin,
+    };
 
-    if (demuxer->stream->uncached_type == STREAMTYPE_CDDA)
+    struct stream *cur = demuxer->stream;
+    const char *sname = "";
+    if (cur->info)
+        sname = cur->info->name;
+
+    p->is_cdda = strcmp(sname, "cdda") == 0;
+    p->is_dvd = strcmp(sname, "dvd") == 0 ||
+                strcmp(sname, "ifo") == 0 ||
+                strcmp(sname, "dvdnav") == 0 ||
+                strcmp(sname, "ifo_dvdnav") == 0;
+
+    if (p->is_cdda)
         params.force_format = "+rawaudio";
 
     char *t = NULL;
@@ -297,30 +322,23 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
 
     // Initialize the playback time. We need to read _some_ data to get the
     // correct stream-layer time (at least with libdvdnav).
-    stream_peek(demuxer->stream, 1);
+    stream_read_peek(demuxer->stream, &(char){0}, 1);
     reset_pts(demuxer);
 
-    p->slave = demux_open(demuxer->stream, &params, demuxer->global);
+    p->slave = demux_open_url("-", &params, demuxer->cancel, demuxer->global);
     if (!p->slave)
         return -1;
 
-    // So that we don't miss initial packets of delayed subtitle streams.
-    demux_set_stream_autoselect(p->slave, true);
-
-    // With cache enabled, the stream can be seekable. This causes demux_lavf.c
-    // (actually libavformat/mpegts.c) to seek sometimes when reading a packet.
-    // It does this to seek back a bit in case the current file position points
-    // into the middle of a packet.
-    if (demuxer->stream->uncached_type != STREAMTYPE_CDDA) {
-        demuxer->stream->seekable = false;
-
-        // Can be seekable even if the stream isn't.
-        demuxer->seekable = true;
-    }
+    // Can be seekable even if the stream isn't.
+    demuxer->seekable = true;
 
     add_dvd_streams(demuxer);
     add_streams(demuxer);
     add_stream_chapters(demuxer);
+
+    double len;
+    if (stream_control(demuxer->stream, STREAM_CTRL_GET_TIME_LENGTH, &len) >= 1)
+        demuxer->duration = len;
 
     return 0;
 }
@@ -328,37 +346,15 @@ static int d_open(demuxer_t *demuxer, enum demux_check check)
 static void d_close(demuxer_t *demuxer)
 {
     struct priv *p = demuxer->priv;
-    free_demuxer(p->slave);
-}
-
-static int d_control(demuxer_t *demuxer, int cmd, void *arg)
-{
-    struct priv *p = demuxer->priv;
-
-    switch (cmd) {
-    case DEMUXER_CTRL_GET_TIME_LENGTH: {
-        double len;
-        if (stream_control(demuxer->stream, STREAM_CTRL_GET_TIME_LENGTH, &len) < 1)
-            break;
-        *(double *)arg = len;
-        return DEMUXER_CTRL_OK;
-    }
-    case DEMUXER_CTRL_RESYNC:
-        demux_flush(p->slave);
-        break; // relay to slave demuxer
-    case DEMUXER_CTRL_SWITCHED_TRACKS:
-        reselect_streams(demuxer);
-        return DEMUXER_CTRL_OK;
-    }
-    return demux_control(p->slave, cmd, arg);
+    demux_free(p->slave);
 }
 
 const demuxer_desc_t demuxer_desc_disc = {
     .name = "disc",
     .desc = "CD/DVD/BD wrapper",
-    .fill_buffer = d_fill_buffer,
+    .read_packet = d_read_packet,
     .open = d_open,
     .close = d_close,
     .seek = d_seek,
-    .control = d_control,
+    .switched_tracks = reselect_streams,
 };

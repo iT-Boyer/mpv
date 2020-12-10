@@ -17,7 +17,6 @@
 
 #include <windows.h>
 #include <shlobj.h>
-#include <initguid.h>
 #include <knownfolders.h>
 #include <pthread.h>
 
@@ -91,7 +90,7 @@ const char *mp_get_platform_path_win(void *talloc_ctx, const char *type)
     } else {
         if (strcmp(type, "home") == 0)
             return mp_get_win_app_dir(talloc_ctx);
-        if (strcmp(type, "old_home") == 0)
+        if (strcmp(type, "exe_dir") == 0)
             return mp_get_win_exe_dir(talloc_ctx);
         // Not really true, but serves as a way to return a lowest-priority dir.
         if (strcmp(type, "global") == 0)

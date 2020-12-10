@@ -28,7 +28,6 @@
 #include "vo.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
-#include "video/filter/vf.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -37,11 +36,9 @@
 
 #include "x11_common.h"
 
-#if HAVE_SHM
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <X11/extensions/XShm.h>
-#endif
 
 #include "sub/osd.h"
 #include "sub/draw_bmp.h"
@@ -60,6 +57,7 @@ struct priv {
     struct mp_image *original_image;
 
     XImage *myximage[2];
+    struct mp_image mp_ximages[2];
     int depth;
     GC gc;
 
@@ -68,8 +66,6 @@ struct priv {
 
     struct mp_rect src;
     struct mp_rect dst;
-    int src_w, src_h;
-    int dst_w, dst_h;
     struct mp_osd_res osd;
 
     struct mp_sws_context *sws;
@@ -78,11 +74,9 @@ struct priv {
 
     int current_buf;
 
-#if HAVE_SHM
     int Shmem_Flag;
     XShmSegmentInfo Shminfo[2];
     int Shm_Warned_Slow;
-#endif
 };
 
 static bool resize(struct vo *vo);
@@ -90,7 +84,6 @@ static bool resize(struct vo *vo);
 static bool getMyXImage(struct priv *p, int foo)
 {
     struct vo *vo = p->vo;
-#if HAVE_SHM && HAVE_XEXT
     if (vo->x11->display_is_local && XShmQueryExtension(vo->x11->display)) {
         p->Shmem_Flag = 1;
         vo->x11->ShmCompletionEvent = XShmGetEventBase(vo->x11->display)
@@ -135,67 +128,42 @@ static bool getMyXImage(struct priv *p, int foo)
     } else {
 shmemerror:
         p->Shmem_Flag = 0;
-#endif
-    MP_VERBOSE(vo, "Not using SHM.\n");
-    p->myximage[foo] =
-        XCreateImage(vo->x11->display, p->vinfo.visual, p->depth, ZPixmap,
-                     0, NULL, p->image_width, p->image_height, 8, 0);
-    if (!p->myximage[foo]) {
-        MP_WARN(vo, "could not allocate image");
-        return false;
+
+        MP_VERBOSE(vo, "Not using SHM.\n");
+        p->myximage[foo] =
+            XCreateImage(vo->x11->display, p->vinfo.visual, p->depth, ZPixmap,
+                         0, NULL, p->image_width, p->image_height, 8, 0);
+        if (!p->myximage[foo]) {
+            MP_WARN(vo, "could not allocate image");
+            return false;
+        }
+        p->myximage[foo]->data =
+            calloc(1, p->myximage[foo]->bytes_per_line * p->image_height + 32);
     }
-    p->myximage[foo]->data =
-        calloc(1, p->myximage[foo]->bytes_per_line * p->image_height + 32);
-#if HAVE_SHM && HAVE_XEXT
-}
-#endif
     return true;
 }
 
 static void freeMyXImage(struct priv *p, int foo)
 {
-#if HAVE_SHM && HAVE_XEXT
     struct vo *vo = p->vo;
     if (p->Shmem_Flag) {
         XShmDetach(vo->x11->display, &p->Shminfo[foo]);
         XDestroyImage(p->myximage[foo]);
         shmdt(p->Shminfo[foo].shmaddr);
-    } else
-#endif
-    {
+    } else {
         if (p->myximage[foo])
             XDestroyImage(p->myximage[foo]);
     }
     p->myximage[foo] = NULL;
 }
 
-const struct fmt_entry {
-    uint32_t mpfmt;
-    int depth;
-    int byte_order;
-    unsigned red_mask;
-    unsigned green_mask;
-    unsigned blue_mask;
-} mp_to_x_fmt[] = {
-    {IMGFMT_0RGB,   32, MSBFirst,     0x00FF0000, 0x0000FF00, 0x000000FF},
-    {IMGFMT_0RGB,   32, LSBFirst,     0x0000FF00, 0x00FF0000, 0xFF000000},
-    {IMGFMT_0BGR,   32, MSBFirst,     0x000000FF, 0x0000FF00, 0x00FF0000},
-    {IMGFMT_0BGR,   32, LSBFirst,     0xFF000000, 0x00FF0000, 0x0000FF00},
-    {IMGFMT_RGB0,   32, MSBFirst,     0xFF000000, 0x00FF0000, 0x0000FF00},
-    {IMGFMT_RGB0,   32, LSBFirst,     0x000000FF, 0x0000FF00, 0x00FF0000},
-    {IMGFMT_BGR0,   32, MSBFirst,     0x0000FF00, 0x00FF0000, 0xFF000000},
-    {IMGFMT_BGR0,   32, LSBFirst,     0x00FF0000, 0x0000FF00, 0x000000FF},
-    {IMGFMT_RGB565, 16, LSBFirst,     0x0000F800, 0x000007E0, 0x0000001F},
-    {0}
-};
+#define MAKE_MASK(comp) (((1ul << (comp).size) - 1) << (comp).offset)
 
 static int reconfig(struct vo *vo, struct mp_image_params *fmt)
 {
     struct priv *p = vo->priv;
 
     mp_image_unrefp(&p->original_image);
-
-    p->sws->src = *fmt;
 
     vo_x11_config_vo_window(vo);
 
@@ -208,67 +176,94 @@ static int reconfig(struct vo *vo, struct mp_image_params *fmt)
 static bool resize(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    struct vo_x11_state *x11 = vo->x11;
 
-    for (int i = 0; i < 2; i++)
-        freeMyXImage(p, i);
+    // Attempt to align. We don't know the size in bytes yet (????), so just
+    // assume worst case (1 byte per pixel).
+    int nw = MPMAX(1, MP_ALIGN_UP(vo->dwidth, MP_IMAGE_BYTE_ALIGN));
+    int nh = MPMAX(1, vo->dheight);
+
+    if (nw > p->image_width || nh > p->image_height) {
+        for (int i = 0; i < 2; i++)
+            freeMyXImage(p, i);
+
+        p->image_width = nw;
+        p->image_height = nh;
+
+        for (int i = 0; i < 2; i++) {
+            if (!getMyXImage(p, i)) {
+                p->image_width = 0;
+                p->image_height = 0;
+                return false;
+            }
+        }
+    }
+
+    int mpfmt = 0;
+    for (int fmt = IMGFMT_START; fmt < IMGFMT_END; fmt++) {
+        struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(fmt);
+        if ((desc.flags & MP_IMGFLAG_HAS_COMPS) && desc.num_planes == 1 &&
+            (desc.flags & MP_IMGFLAG_COLOR_MASK) == MP_IMGFLAG_COLOR_RGB &&
+            (desc.flags & MP_IMGFLAG_TYPE_MASK) == MP_IMGFLAG_TYPE_UINT &&
+            (desc.flags & MP_IMGFLAG_NE) && !(desc.flags & MP_IMGFLAG_ALPHA) &&
+            desc.bpp[0] <= 8 * sizeof(unsigned long) &&
+            p->myximage[0]->bits_per_pixel == desc.bpp[0] &&
+            p->myximage[0]->byte_order == MP_SELECT_LE_BE(LSBFirst, MSBFirst))
+        {
+            // desc.comps[] uses little endian bit offsets, so "swap" the
+            // offsets here.
+            if (MP_SELECT_LE_BE(0, 1)) {
+                // Except for formats that use byte swapping; for these, the
+                // offsets are in native endian. There is no way to distinguish
+                // which one a given format is (could even be both), and using
+                // mp_find_other_endian() is just a guess.
+                if (!mp_find_other_endian(fmt)) {
+                    for (int c = 0; c < 3; c++) {
+                        desc.comps[c].offset =
+                            desc.bpp[0] - desc.comps[c].size -desc.comps[c].offset;
+                    }
+                }
+            }
+            if (p->myximage[0]->red_mask == MAKE_MASK(desc.comps[0]) &&
+                p->myximage[0]->green_mask == MAKE_MASK(desc.comps[1]) &&
+                p->myximage[0]->blue_mask == MAKE_MASK(desc.comps[2]))
+            {
+                mpfmt = fmt;
+                break;
+            }
+        }
+    }
+
+    if (!mpfmt) {
+        MP_ERR(vo, "X server image format not supported, use another VO.\n");
+        return false;
+    }
+    MP_VERBOSE(vo, "Using mp format: %s\n", mp_imgfmt_to_name(mpfmt));
+
+    for (int i = 0; i < 2; i++) {
+        struct mp_image *img = &p->mp_ximages[i];
+        *img = (struct mp_image){0};
+        mp_image_setfmt(img, mpfmt);
+        mp_image_set_size(img, p->image_width, p->image_height);
+        img->planes[0] = p->myximage[i]->data;
+        img->stride[0] = p->myximage[i]->bytes_per_line;
+
+        mp_image_params_guess_csp(&img->params);
+    }
 
     vo_get_src_dst_rects(vo, &p->src, &p->dst, &p->osd);
 
-    p->src_w = p->src.x1 - p->src.x0;
-    p->src_h = p->src.y1 - p->src.y0;
-    p->dst_w = p->dst.x1 - p->dst.x0;
-    p->dst_h = p->dst.y1 - p->dst.y0;
+    if (vo->params) {
+        p->sws->src = *vo->params;
+        p->sws->src.w = mp_rect_w(p->src);
+        p->sws->src.h = mp_rect_h(p->src);
 
-    // p->osd contains the parameters assuming OSD rendering in window
-    // coordinates, but OSD can only be rendered in the intersection
-    // between window and video rectangle (i.e. not into panscan borders).
-    p->osd.w = p->dst_w;
-    p->osd.h = p->dst_h;
-    p->osd.mt = MPMIN(0, p->osd.mt);
-    p->osd.mb = MPMIN(0, p->osd.mb);
-    p->osd.mr = MPMIN(0, p->osd.mr);
-    p->osd.ml = MPMIN(0, p->osd.ml);
+        p->sws->dst = p->mp_ximages[0].params;
+        p->sws->dst.w = mp_rect_w(p->dst);
+        p->sws->dst.h = mp_rect_h(p->dst);
 
-    mp_input_set_mouse_transform(vo->input_ctx, &p->dst, NULL);
-
-    p->image_width = (p->dst_w + 7) & (~7);
-    p->image_height = p->dst_h;
-
-    for (int i = 0; i < 2; i++) {
-        if (!getMyXImage(p, i))
-            return -1;
+        if (mp_sws_reinit(p->sws) < 0)
+            return false;
     }
-
-    const struct fmt_entry *fmte = mp_to_x_fmt;
-    while (fmte->mpfmt) {
-        if (fmte->depth == p->myximage[0]->bits_per_pixel &&
-            fmte->byte_order == p->myximage[0]->byte_order &&
-            fmte->red_mask == p->myximage[0]->red_mask &&
-            fmte->green_mask == p->myximage[0]->green_mask &&
-            fmte->blue_mask == p->myximage[0]->blue_mask)
-            break;
-        fmte++;
-    }
-    if (!fmte->mpfmt) {
-        MP_ERR(vo, "X server image format not supported, use another VO.\n");
-        return -1;
-    }
-
-    mp_sws_set_from_cmdline(p->sws, vo->opts->sws_opts);
-    p->sws->dst = (struct mp_image_params) {
-        .imgfmt = fmte->mpfmt,
-        .w = p->dst_w,
-        .h = p->dst_h,
-        .p_w = 1,
-        .p_h = 1,
-    };
-    mp_image_params_guess_csp(&p->sws->dst);
-
-    if (mp_sws_reinit(p->sws) < 0)
-        return false;
-
-    XFillRectangle(x11->display, x11->window, p->gc, 0, 0, vo->dwidth, vo->dheight);
 
     vo->want_redraw = true;
     return true;
@@ -280,35 +275,18 @@ static void Display_Image(struct priv *p, XImage *myximage)
 
     XImage *x_image = p->myximage[p->current_buf];
 
-#if HAVE_SHM && HAVE_XEXT
     if (p->Shmem_Flag) {
         XShmPutImage(vo->x11->display, vo->x11->window, p->gc, x_image,
-                     0, 0, p->dst.x0, p->dst.y0, p->dst_w, p->dst_h,
-                     True);
+                     0, 0, 0, 0, vo->dwidth, vo->dheight, True);
         vo->x11->ShmCompletionWaitCount++;
-    } else
-#endif
-    {
+    } else {
         XPutImage(vo->x11->display, vo->x11->window, p->gc, x_image,
-                  0, 0, p->dst.x0, p->dst.y0, p->dst_w, p->dst_h);
+                  0, 0, 0, 0, vo->dwidth, vo->dheight);
     }
-}
-
-static struct mp_image get_x_buffer(struct priv *p, int buf_index)
-{
-    struct mp_image img = {0};
-    mp_image_set_params(&img, &p->sws->dst);
-
-    img.planes[0] = p->myximage[buf_index]->data;
-    img.stride[0] =
-        p->image_width * ((p->myximage[buf_index]->bits_per_pixel + 7) / 8);
-
-    return img;
 }
 
 static void wait_for_completion(struct vo *vo, int max_outstanding)
 {
-#if HAVE_SHM && HAVE_XEXT
     struct priv *ctx = vo->priv;
     struct vo_x11_state *x11 = vo->x11;
     if (ctx->Shmem_Flag) {
@@ -322,7 +300,6 @@ static void wait_for_completion(struct vo *vo, int max_outstanding)
             vo_x11_check_events(vo);
         }
     }
-#endif
 }
 
 static void flip_page(struct vo *vo)
@@ -339,21 +316,26 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
 
     wait_for_completion(vo, 1);
 
-    struct mp_image img = get_x_buffer(p, p->current_buf);
+    struct mp_image *img = &p->mp_ximages[p->current_buf];
 
     if (mpi) {
+        mp_image_clear_rc_inv(img, p->dst);
+
         struct mp_image src = *mpi;
         struct mp_rect src_rc = p->src;
         src_rc.x0 = MP_ALIGN_DOWN(src_rc.x0, src.fmt.align_x);
         src_rc.y0 = MP_ALIGN_DOWN(src_rc.y0, src.fmt.align_y);
         mp_image_crop_rc(&src, src_rc);
 
-        mp_sws_scale(p->sws, &img, &src);
+        struct mp_image dst = *img;
+        mp_image_crop_rc(&dst, p->dst);
+
+        mp_sws_scale(p->sws, &dst, &src);
     } else {
-        mp_image_clear(&img, 0, 0, img.w, img.h);
+        mp_image_clear(img, 0, 0, img->w, img->h);
     }
 
-    osd_draw_on_image(vo->osd, p->osd, mpi ? mpi->pts : 0, 0, &img);
+    osd_draw_on_image(vo->osd, p->osd, mpi ? mpi->pts : 0, 0, img);
 
     if (mpi != p->original_image) {
         talloc_free(p->original_image);
@@ -363,7 +345,8 @@ static void draw_image(struct vo *vo, mp_image_t *mpi)
 
 static int query_format(struct vo *vo, int format)
 {
-    if (sws_isSupportedInput(imgfmt2pixfmt(format)))
+    struct priv *p = vo->priv;
+    if (mp_sws_supports_formats(p->sws, IMGFMT_RGB0, format))
         return 1;
     return 0;
 }
@@ -388,6 +371,8 @@ static int preinit(struct vo *vo)
     struct priv *p = vo->priv;
     p->vo = vo;
     p->sws = mp_sws_alloc(vo);
+    p->sws->log = vo->log;
+    mp_sws_enable_cmdline_opts(p->sws, vo->global);
 
     if (!vo_x11_init(vo))
         goto error;
@@ -407,8 +392,8 @@ static int preinit(struct vo *vo)
         goto error;
 
     p->gc = XCreateGC(x11->display, x11->window, 0, NULL);
-    MP_WARN(vo, "Warning: this legacy VO has bad performance. Consider fixing"
-                "your graphic drivers, or not forcing the x11 VO.\n");
+    MP_WARN(vo, "Warning: this legacy VO has bad performance. Consider fixing "
+                "your graphics drivers, or not forcing the x11 VO.\n");
     return 0;
 
 error:
@@ -420,8 +405,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
 {
     struct priv *p = vo->priv;
     switch (request) {
-    case VOCTRL_GET_PANSCAN:
-        return VO_TRUE;
     case VOCTRL_SET_PANSCAN:
         if (vo->config_ok)
             resize(vo);
@@ -440,7 +423,7 @@ static int control(struct vo *vo, uint32_t request, void *data)
 }
 
 const struct vo_driver video_out_x11 = {
-    .description = "X11 (slow, old crap)",
+    .description = "X11 (software scaling)",
     .name = "x11",
     .priv_size = sizeof(struct priv),
     .preinit = preinit,
@@ -449,5 +432,7 @@ const struct vo_driver video_out_x11 = {
     .control = control,
     .draw_image = draw_image,
     .flip_page = flip_page,
+    .wakeup = vo_x11_wakeup,
+    .wait_events = vo_x11_wait_events,
     .uninit = uninit,
 };

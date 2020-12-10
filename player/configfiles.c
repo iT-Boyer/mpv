@@ -1,26 +1,28 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include <libavutil/md5.h>
 
@@ -54,6 +56,7 @@ static void load_all_cfgfiles(struct MPContext *mpctx, char *section,
     talloc_free(cf);
 }
 
+// This name is used in builtin.conf to force encoding defaults (like ao/vo).
 #define SECT_ENCODE "encoding"
 
 void mp_parse_cfgfiles(struct MPContext *mpctx)
@@ -62,7 +65,16 @@ void mp_parse_cfgfiles(struct MPContext *mpctx)
 
     mp_mk_config_dir(mpctx->global, "");
 
-    m_config_t *conf = mpctx->mconfig;
+    char *p1 = mp_get_user_path(NULL, mpctx->global, "~~home/");
+    char *p2 = mp_get_user_path(NULL, mpctx->global, "~~old_home/");
+    if (strcmp(p1, p2) != 0 && mp_path_exists(p2)) {
+        MP_WARN(mpctx, "Warning, two config dirs found:\n   %s (main)\n"
+                "   %s (bogus)\nYou should merge or delete the second one.\n",
+                p1, p2);
+    }
+    talloc_free(p1);
+    talloc_free(p2);
+
     char *section = NULL;
     bool encoding = opts->encode_opts &&
         opts->encode_opts->file && opts->encode_opts->file[0];
@@ -70,22 +82,23 @@ void mp_parse_cfgfiles(struct MPContext *mpctx)
     // So we "divert" normal options into a separate section, and the diverted
     // section is never used - unless maybe it's explicitly referenced from an
     // encoding profile.
-    if (encoding) {
+    if (encoding)
         section = "playback-default";
-        load_all_cfgfiles(mpctx, SECT_ENCODE, "encoding-profiles.conf");
-    }
+
+    load_all_cfgfiles(mpctx, NULL, "encoding-profiles.conf");
 
     load_all_cfgfiles(mpctx, section, "mpv.conf|config");
 
     if (encoding)
-        m_config_set_profile(conf, SECT_ENCODE, 0);
+        m_config_set_profile(mpctx->mconfig, SECT_ENCODE, 0);
 }
 
-static int try_load_config(struct MPContext *mpctx, const char *file, int flags)
+static int try_load_config(struct MPContext *mpctx, const char *file, int flags,
+                           int msgl)
 {
     if (!mp_path_exists(file))
         return 0;
-    MP_INFO(mpctx, "Loading config '%s'\n", file);
+    MP_MSG(mpctx, msgl, "Loading config '%s'\n", file);
     m_config_parse_config_file(mpctx->mconfig, file, NULL, flags);
     return 1;
 }
@@ -112,14 +125,14 @@ static void mp_load_per_file_config(struct MPContext *mpctx)
 
         bstr dir = mp_dirname(cfg);
         char *dircfg = mp_path_join_bstr(NULL, dir, bstr0("mpv.conf"));
-        try_load_config(mpctx, dircfg, FILE_LOCAL_FLAGS);
+        try_load_config(mpctx, dircfg, FILE_LOCAL_FLAGS, MSGL_INFO);
         talloc_free(dircfg);
 
-        if (try_load_config(mpctx, cfg, FILE_LOCAL_FLAGS))
+        if (try_load_config(mpctx, cfg, FILE_LOCAL_FLAGS, MSGL_INFO))
             return;
 
         if ((confpath = mp_find_config_file(NULL, mpctx->global, name))) {
-            try_load_config(mpctx, confpath, FILE_LOCAL_FLAGS);
+            try_load_config(mpctx, confpath, FILE_LOCAL_FLAGS, MSGL_INFO);
 
             talloc_free(confpath);
         }
@@ -143,22 +156,41 @@ static void mp_auto_load_profile(struct MPContext *mpctx, char *category,
 
 void mp_load_auto_profiles(struct MPContext *mpctx)
 {
-    struct MPOpts *opts = mpctx->opts;
-
     mp_auto_load_profile(mpctx, "protocol",
                          mp_split_proto(bstr0(mpctx->filename), NULL));
     mp_auto_load_profile(mpctx, "extension",
                          bstr0(mp_splitext(mpctx->filename, NULL)));
 
     mp_load_per_file_config(mpctx);
-
-    if (opts->vo.video_driver_list)
-        mp_auto_load_profile(mpctx, "vo", bstr0(opts->vo.video_driver_list[0].name));
-    if (opts->audio_driver_list)
-        mp_auto_load_profile(mpctx, "ao", bstr0(opts->audio_driver_list[0].name));
 }
 
 #define MP_WATCH_LATER_CONF "watch_later"
+
+static bool check_mtime(const char *f1, const char *f2)
+{
+    struct stat st1, st2;
+    if (stat(f1, &st1) != 0 || stat(f2, &st2) != 0)
+        return false;
+    return st1.st_mtime == st2.st_mtime;
+}
+
+static bool copy_mtime(const char *f1, const char *f2)
+{
+    struct stat st1, st2;
+
+    if (stat(f1, &st1) != 0 || stat(f2, &st2) != 0)
+        return false;
+
+    struct utimbuf ut = {
+        .actime = st2.st_atime,  // we want to pass this through intact
+        .modtime = st1.st_mtime,
+    };
+
+    if (utime(f2, &ut) != 0)
+        return false;
+
+    return true;
+}
 
 static char *mp_get_playback_resume_config_filename(struct MPContext *mpctx,
                                                     const char *fname)
@@ -178,16 +210,19 @@ static char *mp_get_playback_resume_config_filename(struct MPContext *mpctx,
             realpath = mp_path_join(tmp, cwd, fname);
         }
     }
-    if (bstr_startswith0(bfname, "dvd://") && opts->dvd_device)
-        realpath = talloc_asprintf(tmp, "%s - %s", realpath, opts->dvd_device);
-    if ((bstr_startswith0(bfname, "br://") || bstr_startswith0(bfname, "bd://") ||
-         bstr_startswith0(bfname, "bluray://")) && opts->bluray_device)
-        realpath = talloc_asprintf(tmp, "%s - %s", realpath, opts->bluray_device);
     uint8_t md5[16];
     av_md5_sum(md5, realpath, strlen(realpath));
     char *conf = talloc_strdup(tmp, "");
     for (int i = 0; i < 16; i++)
         conf = talloc_asprintf_append(conf, "%02X", md5[i]);
+
+    if (!mpctx->cached_watch_later_configdir) {
+        char *wl_dir = mpctx->opts->watch_later_directory;
+        if (wl_dir && wl_dir[0]) {
+            mpctx->cached_watch_later_configdir =
+                mp_get_user_path(mpctx, mpctx->global, wl_dir);
+        }
+    }
 
     if (!mpctx->cached_watch_later_configdir) {
         mpctx->cached_watch_later_configdir =
@@ -203,43 +238,42 @@ exit:
 }
 
 static const char *const backup_properties[] = {
-    "options/osd-level",
+    "osd-level",
     //"loop",
-    "options/speed",
+    "speed",
     "options/edition",
-    "options/pause",
-    "volume-restore-data",
-    "options/audio-delay",
+    "pause",
+    "volume",
+    "mute",
+    "audio-delay",
     //"balance",
-    "options/fullscreen",
-    "options/colormatrix",
-    "options/colormatrix-input-range",
-    "options/colormatrix-output-range",
-    "options/ontop",
-    "options/border",
-    "options/gamma",
-    "options/brightness",
-    "options/contrast",
-    "options/saturation",
-    "options/hue",
+    "fullscreen",
+    "ontop",
+    "border",
+    "gamma",
+    "brightness",
+    "contrast",
+    "saturation",
+    "hue",
     "options/deinterlace",
-    "options/vf",
-    "options/af",
-    "options/panscan",
+    "vf",
+    "af",
+    "panscan",
     "options/aid",
     "options/vid",
     "options/sid",
-    "options/sub-delay",
-    "options/sub-pos",
-    "options/sub-visibility",
-    "options/sub-scale",
-    "options/sub-use-margins",
-    "options/ass-force-margins",
-    "options/ass-vsfilter-aspect-compat",
-    "options/ass-style-override",
-    "options/ab-loop-a",
-    "options/ab-loop-b",
-    "options/video-aspect",
+    "sub-delay",
+    "sub-speed",
+    "sub-pos",
+    "sub-visibility",
+    "sub-scale",
+    "sub-use-margins",
+    "sub-ass-force-margins",
+    "sub-ass-vsfilter-aspect-compat",
+    "sub-style-override",
+    "ab-loop-a",
+    "ab-loop-b",
+    "options/video-aspect-override",
     0
 };
 
@@ -293,6 +327,11 @@ static void write_redirect(struct MPContext *mpctx, char *path)
             write_filename(mpctx, file, path);
             fclose(file);
         }
+
+        if (mpctx->opts->position_check_mtime &&
+            !mp_is_url(bstr0(path)) && !copy_mtime(path, conffile))
+            MP_WARN(mpctx, "Can't copy mtime from %s to %s\n", path, conffile);
+
         talloc_free(conffile);
     }
 }
@@ -305,16 +344,12 @@ void mp_write_watch_later_conf(struct MPContext *mpctx)
         goto exit;
 
     struct demuxer *demux = mpctx->demuxer;
-    if (demux && (!demux->seekable || demux->partially_seekable)) {
-        MP_INFO(mpctx, "Not seekable - not saving state.\n");
-        goto exit;
-    }
-
-    mp_mk_config_dir(mpctx->global, MP_WATCH_LATER_CONF);
 
     conffile = mp_get_playback_resume_config_filename(mpctx, cur->filename);
     if (!conffile)
         goto exit;
+
+    mp_mk_config_dir(mpctx->global, mpctx->cached_watch_later_configdir);
 
     MP_INFO(mpctx, "Saving state.\n");
 
@@ -325,8 +360,14 @@ void mp_write_watch_later_conf(struct MPContext *mpctx)
     write_filename(mpctx, file, cur->filename);
 
     double pos = get_current_time(mpctx);
-    if (pos != MP_NOPTS_VALUE)
+
+    if ((demux && (!demux->seekable || demux->partially_seekable)) ||
+        pos == MP_NOPTS_VALUE)
+    {
+        MP_INFO(mpctx, "Not seekable, or time unknown - not saving position.\n");
+    } else {
         fprintf(file, "start=%f\n", pos);
+    }
     for (int i = 0; backup_properties[i]; i++) {
         const char *pname = backup_properties[i];
         char *val = NULL;
@@ -348,6 +389,14 @@ void mp_write_watch_later_conf(struct MPContext *mpctx)
         talloc_free(val);
     }
     fclose(file);
+
+    if (mpctx->opts->position_check_mtime &&
+        !mp_is_url(bstr0(cur->filename)) &&
+        !copy_mtime(cur->filename, conffile))
+    {
+        MP_WARN(mpctx, "Can't copy mtime from %s to %s\n", cur->filename,
+                conffile);
+    }
 
     // This allows us to recursively resume directories etc., whose entries are
     // expanded the first time it's "played". For example, if "/a/b/c.mkv" is
@@ -384,17 +433,41 @@ exit:
     talloc_free(conffile);
 }
 
+void mp_delete_watch_later_conf(struct MPContext *mpctx, const char *file)
+{
+    if (!file) {
+        struct playlist_entry *cur = mpctx->playing;
+        if (!cur)
+            return;
+        file = cur->filename;
+        if (!file)
+            return;
+    }
+
+    char *fname = mp_get_playback_resume_config_filename(mpctx, file);
+    if (fname)
+        unlink(fname);
+    talloc_free(fname);
+}
+
 void mp_load_playback_resume(struct MPContext *mpctx, const char *file)
 {
     if (!mpctx->opts->position_resume)
         return;
     char *fname = mp_get_playback_resume_config_filename(mpctx, file);
     if (fname && mp_path_exists(fname)) {
+        if (mpctx->opts->position_check_mtime &&
+            !mp_is_url(bstr0(file)) && !check_mtime(file, fname))
+        {
+            talloc_free(fname);
+            return;
+        }
+
         // Never apply the saved start position to following files
         m_config_backup_opt(mpctx->mconfig, "start");
         MP_INFO(mpctx, "Resuming playback. This behavior can "
                "be disabled with --no-resume-playback.\n");
-        try_load_config(mpctx, fname, M_SETOPT_PRESERVE_CMDLINE);
+        try_load_config(mpctx, fname, M_SETOPT_PRESERVE_CMDLINE, MSGL_V);
         unlink(fname);
     }
     talloc_free(fname);
@@ -410,7 +483,8 @@ struct playlist_entry *mp_check_playlist_resume(struct MPContext *mpctx,
 {
     if (!mpctx->opts->position_resume)
         return NULL;
-    for (struct playlist_entry *e = playlist->first; e; e = e->next) {
+    for (int n = 0; n < playlist->num_entries; n++) {
+        struct playlist_entry *e = playlist->entries[n];
         char *conf = mp_get_playback_resume_config_filename(mpctx, e->filename);
         bool exists = conf && mp_path_exists(conf);
         talloc_free(conf);

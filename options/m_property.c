@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /// \file
@@ -36,8 +36,34 @@
 #include "common/msg.h"
 #include "common/common.h"
 
-static struct m_property *m_property_list_find(const struct m_property *list,
-                                                     const char *name)
+static int m_property_multiply(struct mp_log *log,
+                               const struct m_property *prop_list,
+                               const char *property, double f, void *ctx)
+{
+    union m_option_value val = {0};
+    struct m_option opt = {0};
+    int r;
+
+    r = m_property_do(log, prop_list, property, M_PROPERTY_GET_CONSTRICTED_TYPE,
+                      &opt, ctx);
+    if (r != M_PROPERTY_OK)
+        return r;
+    assert(opt.type);
+
+    if (!opt.type->multiply)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+
+    r = m_property_do(log, prop_list, property, M_PROPERTY_GET, &val, ctx);
+    if (r != M_PROPERTY_OK)
+        return r;
+    opt.type->multiply(&opt, &val, f);
+    r = m_property_do(log, prop_list, property, M_PROPERTY_SET, &val, ctx);
+    m_option_free(&opt, &val);
+    return r;
+}
+
+struct m_property *m_property_list_find(const struct m_property *list,
+                                        const char *name)
 {
     for (int n = 0; list && list[n].name; n++) {
         if (strcmp(list[n].name, name) == 0)
@@ -107,6 +133,9 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
         struct mpv_node node = { .format = MPV_FORMAT_STRING, .u.string = arg };
         return m_property_do(log, prop_list, name, M_PROPERTY_SET_NODE, &node, ctx);
     }
+    case M_PROPERTY_MULTIPLY: {
+        return m_property_multiply(log, prop_list, name, *(double *)arg, ctx);
+    }
     case M_PROPERTY_SWITCH: {
         if (!log)
             return M_PROPERTY_ERROR;
@@ -115,6 +144,11 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
             M_PROPERTY_NOT_IMPLEMENTED)
             return r;
         // Fallback to m_option
+        r = m_property_do(log, prop_list, name, M_PROPERTY_GET_CONSTRICTED_TYPE,
+                          &opt, ctx);
+        if (r <= 0)
+            return r;
+        assert(opt.type);
         if (!opt.type->add)
             return M_PROPERTY_NOT_IMPLEMENTED;
         if ((r = do_action(prop_list, name, M_PROPERTY_GET, &val, ctx)) <= 0)
@@ -124,16 +158,15 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
         m_option_free(&opt, &val);
         return r;
     }
+    case M_PROPERTY_GET_CONSTRICTED_TYPE: {
+        r = do_action(prop_list, name, action, arg, ctx);
+        if (r >= 0 || r == M_PROPERTY_UNAVAILABLE)
+            return r;
+        if ((r = do_action(prop_list, name, M_PROPERTY_GET_TYPE, arg, ctx)) >= 0)
+            return r;
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    }
     case M_PROPERTY_SET: {
-        if (!log)
-            return M_PROPERTY_ERROR;
-        m_option_copy(&opt, &val, arg);
-        r = opt.type->clamp ? opt.type->clamp(&opt, arg) : 0;
-        m_option_free(&opt, &val);
-        if (r != 0) {
-            mp_err(log, "Property '%s': invalid value.\n", name);
-            return M_PROPERTY_ERROR;
-        }
         return do_action(prop_list, name, M_PROPERTY_SET, arg, ctx);
     }
     case M_PROPERTY_GET_NODE: {

@@ -16,228 +16,303 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <wayland-egl.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+
 #include "video/out/wayland_common.h"
 #include "context.h"
+#include "egl_helpers.h"
+#include "utils.h"
 
-static void egl_resize(struct vo_wayland_state *wl)
+// Generated from presentation-time.xml
+#include "generated/wayland/presentation-time.h"
+
+#define EGL_PLATFORM_WAYLAND_EXT 0x31D8
+
+struct priv {
+    GL gl;
+    EGLDisplay egl_display;
+    EGLContext egl_context;
+    EGLSurface egl_surface;
+    EGLConfig  egl_config;
+    struct wl_egl_window *egl_window;
+};
+
+static const struct wp_presentation_feedback_listener feedback_listener;
+
+static void feedback_sync_output(void *data, struct wp_presentation_feedback *fback,
+                               struct wl_output *output)
 {
-    int32_t x = wl->window.sh_x;
-    int32_t y = wl->window.sh_y;
-    int32_t width = wl->window.sh_width;
-    int32_t height = wl->window.sh_height;
-    int32_t scale = 1;
-
-    if (!wl->egl_context.egl_window)
-        return;
-
-    if (wl->display.current_output)
-        scale = wl->display.current_output->scale;
-
-    // get the real size of the window
-    // this improves moving the window while resizing it
-    wl_egl_window_get_attached_size(wl->egl_context.egl_window,
-                                    &wl->window.width,
-                                    &wl->window.height);
-
-    MP_VERBOSE(wl, "resizing %dx%d -> %dx%d\n", wl->window.width,
-                                                wl->window.height,
-                                                width,
-                                                height);
-
-    if (x != 0)
-        x = wl->window.width - width;
-
-    if (y != 0)
-        y = wl->window.height - height;
-
-    wl_surface_set_buffer_scale(wl->window.video_surface, scale);
-    wl_egl_window_resize(wl->egl_context.egl_window, scale*width, scale*height, x, y);
-
-    wl->window.width = width;
-    wl->window.height = height;
-
-    /* set size for mplayer */
-    wl->vo->dwidth  = scale*wl->window.width;
-    wl->vo->dheight = scale*wl->window.height;
-
-    wl->vo->want_redraw = true;
-    wl->window.events = 0;
 }
 
-static int egl_create_context(struct vo_wayland_state *wl,
-                              MPGLContext *ctx,
-                              bool enable_alpha)
+static void feedback_presented(void *data, struct wp_presentation_feedback *fback,
+                              uint32_t tv_sec_hi, uint32_t tv_sec_lo,
+                              uint32_t tv_nsec, uint32_t refresh_nsec,
+                              uint32_t seq_hi, uint32_t seq_lo,
+                              uint32_t flags)
 {
-    EGLint major, minor, n;
+    struct vo_wayland_state *wl = data;
+    vo_wayland_sync_shift(wl);
 
-    GL *gl = ctx->gl;
-    const char *eglstr = "";
+    if (fback)
+        wp_presentation_feedback_destroy(fback);
 
-    if (!(wl->egl_context.egl.dpy = eglGetDisplay(wl->display.display)))
-        return -1;
+    // Very similar to oml_sync_control, in this case we assume that every
+    // time the compositor receives feedback, a buffer swap has been already
+    // been performed.
+    //
+    // Notes:
+    //  - tv_sec_lo + tv_sec_hi is the equivalent of oml's ust
+    //  - seq_lo + seq_hi is the equivalent of oml's msc
+    //  - these values are updated everytime the compositor receives feedback.
 
-    EGLint config_attribs[] = {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RED_SIZE, 1,
-        EGL_GREEN_SIZE, 1,
-        EGL_BLUE_SIZE, 1,
-        EGL_ALPHA_SIZE, enable_alpha,
-        EGL_DEPTH_SIZE, 1,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-        EGL_NONE
-    };
+    int index = last_available_sync(wl);
+    if (index < 0) {
+        queue_new_sync(wl);
+        index = 0;
+    }
+    int64_t sec = (uint64_t) tv_sec_lo + ((uint64_t) tv_sec_hi << 32);
+    wl->sync[index].ust = sec * 1000000LL + (uint64_t) tv_nsec / 1000;
+    wl->sync[index].msc = (uint64_t) seq_lo + ((uint64_t) seq_hi << 32);
+    wl->sync[index].filled = true;
+}
 
-    /* major and minor here returns the supported EGL version (e.g.: 1.4) */
-    if (eglInitialize(wl->egl_context.egl.dpy, &major, &minor) != EGL_TRUE)
-        return -1;
+static void feedback_discarded(void *data, struct wp_presentation_feedback *fback)
+{
+}
 
-    MP_VERBOSE(wl, "EGL version %d.%d\n", major, minor);
+static const struct wp_presentation_feedback_listener feedback_listener = {
+    feedback_sync_output,
+    feedback_presented,
+    feedback_discarded,
+};
 
-    EGLint context_attribs[] = {
-        // aka EGL_CONTEXT_MAJOR_VERSION_KHR
-        EGL_CONTEXT_CLIENT_VERSION, 3,
-        EGL_NONE
-    };
+static const struct wl_callback_listener frame_listener;
 
-    if (eglBindAPI(EGL_OPENGL_API) != EGL_TRUE)
-        return -1;
+static void frame_callback(void *data, struct wl_callback *callback, uint32_t time)
+{
+    struct vo_wayland_state *wl = data;
 
-    eglChooseConfig(wl->egl_context.egl.dpy, config_attribs,
-                    &wl->egl_context.egl.conf, 1, &n);
+    if (callback)
+        wl_callback_destroy(callback);
 
-    wl->egl_context.egl.ctx = eglCreateContext(wl->egl_context.egl.dpy,
-                                               wl->egl_context.egl.conf,
-                                               EGL_NO_CONTEXT,
-                                               context_attribs);
-    if (!wl->egl_context.egl.ctx) {
-        /* fallback to any GL version */
-        MP_WARN(wl, "can't create context for requested OpenGL version: "
-                    "fall back to any version available\n");
-        context_attribs[0] = EGL_NONE;
-        wl->egl_context.egl.ctx = eglCreateContext(wl->egl_context.egl.dpy,
-                                                   wl->egl_context.egl.conf,
-                                                   EGL_NO_CONTEXT,
-                                                   context_attribs);
+    wl->frame_callback = wl_surface_frame(wl->surface);
+    wl_callback_add_listener(wl->frame_callback, &frame_listener, wl);
 
-        if (!wl->egl_context.egl.ctx)
-            return -1;
+    if (wl->presentation) {
+        wl->feedback = wp_presentation_feedback(wl->presentation, wl->surface);
+        wp_presentation_feedback_add_listener(wl->feedback, &feedback_listener, wl);
     }
 
-    eglMakeCurrent(wl->egl_context.egl.dpy, NULL, NULL, wl->egl_context.egl.ctx);
-
-    eglstr = eglQueryString(wl->egl_context.egl.dpy, EGL_EXTENSIONS);
-
-    mpgl_load_functions(gl, (void*(*)(const GLubyte*))eglGetProcAddress, eglstr,
-                        wl->log);
-
-    ctx->native_display_type = "wl";
-    ctx->native_display = wl->display.display;
-
-    return 0;
+    wl->frame_wait = false;
 }
 
-static void egl_create_window(struct vo_wayland_state *wl)
+static const struct wl_callback_listener frame_listener = {
+    frame_callback,
+};
+
+static void resize(struct ra_ctx *ctx)
 {
-    wl->egl_context.egl_window = wl_egl_window_create(wl->window.video_surface,
-                                                      wl->window.width,
-                                                      wl->window.height);
+    struct priv *p = ctx->priv;
+    struct vo_wayland_state *wl = ctx->vo->wl;
 
-    wl->egl_context.egl_surface = eglCreateWindowSurface(wl->egl_context.egl.dpy,
-                                                         wl->egl_context.egl.conf,
-                                                         wl->egl_context.egl_window,
-                                                         NULL);
+    MP_VERBOSE(wl, "Handling resize on the egl side\n");
 
-    eglMakeCurrent(wl->egl_context.egl.dpy,
-                   wl->egl_context.egl_surface,
-                   wl->egl_context.egl_surface,
-                   wl->egl_context.egl.ctx);
+    const int32_t width = wl->scaling * mp_rect_w(wl->geometry);
+    const int32_t height = wl->scaling * mp_rect_h(wl->geometry);
 
-    wl_display_dispatch_pending(wl->display.display);
+    vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    wl_surface_set_buffer_scale(wl->surface, wl->scaling);
 
-    /**
-     * <http://lists.freedesktop.org/archives/wayland-devel/2013-November/012019.html>
-     *
-     * The main change is that if the swap interval is 0 then Mesa won't install a
-     * frame callback so that eglSwapBuffers can be executed as often as necessary.
-     * Instead it will do a sync request after the swap buffers. It will block for
-     * sync complete event in get_back_bo instead of the frame callback. The
-     * compositor is likely to send a release event while processing the new buffer
-     * attach and this makes sure we will receive that before deciding whether to
-     * allocate a new buffer.
-     */
+    if (p->egl_window)
+        wl_egl_window_resize(p->egl_window, width, height, 0, 0);
 
-    eglSwapInterval(wl->egl_context.egl.dpy, 0);
+    wl->vo->dwidth  = width;
+    wl->vo->dheight = height;
 }
 
-static int waylandgl_reconfig(struct MPGLContext *ctx)
+static bool wayland_egl_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 {
-    struct vo_wayland_state * wl = ctx->vo->wayland;
+    struct ra_ctx *ctx = sw->ctx;
+    struct vo_wayland_state *wl = ctx->vo->wl;
 
-    if (!vo_wayland_config(ctx->vo))
-        return -1;
+    bool render = !wl->hidden || wl->opts->disable_vsync;
 
-    if (!wl->egl_context.egl_window)
-        egl_create_window(wl);
+    if (wl->frame_wait && wl->presentation)
+        vo_wayland_sync_clear(wl);
 
-    return 0;
+    if (render)
+        wl->frame_wait = true;
+
+    return render ? ra_gl_ctx_start_frame(sw, out_fbo) : false;
 }
 
-static void waylandgl_uninit(MPGLContext *ctx)
+static void wayland_egl_swap_buffers(struct ra_swapchain *sw)
 {
-    struct vo_wayland_state *wl = ctx->vo->wayland;
+    struct ra_ctx *ctx = sw->ctx;
+    struct priv *p = ctx->priv;
+    struct vo_wayland_state *wl = ctx->vo->wl;
 
-    if (wl->egl_context.egl.ctx) {
+    eglSwapBuffers(p->egl_display, p->egl_surface);
+
+    if (!wl->opts->disable_vsync)
+        vo_wayland_wait_frame(wl);
+
+    if (wl->presentation)
+        wayland_sync_swap(wl);
+}
+
+static const struct ra_swapchain_fns wayland_egl_swapchain = {
+    .start_frame   = wayland_egl_start_frame,
+    .swap_buffers  = wayland_egl_swap_buffers,
+};
+
+static void wayland_egl_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    if (wl->presentation) {
+        info->vsync_duration = wl->vsync_duration;
+        info->skipped_vsyncs = wl->last_skipped_vsyncs;
+        info->last_queue_display_time = wl->last_queue_display_time;
+    }
+}
+
+static bool egl_create_context(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv = talloc_zero(ctx, struct priv);
+    struct vo_wayland_state *wl = ctx->vo->wl;
+
+    if (!(p->egl_display = mpegl_get_display(EGL_PLATFORM_WAYLAND_EXT,
+                                             "EGL_EXT_platform_wayland",
+                                             wl->display)))
+        return false;
+
+    if (eglInitialize(p->egl_display, NULL, NULL) != EGL_TRUE)
+        return false;
+
+    if (!mpegl_create_context(ctx, p->egl_display, &p->egl_context,
+                              &p->egl_config))
+        return false;
+
+    eglMakeCurrent(p->egl_display, NULL, NULL, p->egl_context);
+
+    mpegl_load_functions(&p->gl, wl->log);
+
+    struct ra_gl_ctx_params params = {
+        .external_swapchain = &wayland_egl_swapchain,
+        .get_vsync          = &wayland_egl_get_vsync,
+    };
+
+    if (!ra_gl_ctx_init(ctx, &p->gl, params))
+        return false;
+
+    ra_add_native_resource(ctx->ra, "wl", wl->display);
+
+    wl->frame_callback = wl_surface_frame(wl->surface);
+    wl_callback_add_listener(wl->frame_callback, &frame_listener, wl);
+
+    return true;
+}
+
+static void egl_create_window(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    struct vo_wayland_state *wl = ctx->vo->wl;
+
+    p->egl_window = wl_egl_window_create(wl->surface, mp_rect_w(wl->geometry),
+                                         mp_rect_h(wl->geometry));
+
+    p->egl_surface = eglCreateWindowSurface(p->egl_display, p->egl_config,
+                                            p->egl_window, NULL);
+
+    eglMakeCurrent(p->egl_display, p->egl_surface, p->egl_surface, p->egl_context);
+
+    eglSwapInterval(p->egl_display, 0);
+}
+
+static bool wayland_egl_reconfig(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+
+    if (!vo_wayland_reconfig(ctx->vo))
+        return false;
+
+    if (!p->egl_window)
+        egl_create_window(ctx);
+
+    return true;
+}
+
+static void wayland_egl_uninit(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+
+    ra_gl_ctx_uninit(ctx);
+
+    if (p->egl_context) {
         eglReleaseThread();
-        if (wl->egl_context.egl_window)
-            wl_egl_window_destroy(wl->egl_context.egl_window);
-        eglDestroySurface(wl->egl_context.egl.dpy, wl->egl_context.egl_surface);
-        eglMakeCurrent(wl->egl_context.egl.dpy, NULL, NULL, EGL_NO_CONTEXT);
-        eglDestroyContext(wl->egl_context.egl.dpy, wl->egl_context.egl.ctx);
+        if (p->egl_window)
+            wl_egl_window_destroy(p->egl_window);
+        eglDestroySurface(p->egl_display, p->egl_surface);
+        eglMakeCurrent(p->egl_display, NULL, NULL, EGL_NO_CONTEXT);
+        eglDestroyContext(p->egl_display, p->egl_context);
+        p->egl_context = NULL;
     }
-    eglTerminate(wl->egl_context.egl.dpy);
-    wl->egl_context.egl.ctx = NULL;
+    eglTerminate(p->egl_display);
 
     vo_wayland_uninit(ctx->vo);
 }
 
-static void waylandgl_swap_buffers(MPGLContext *ctx)
-{
-    struct vo_wayland_state *wl = ctx->vo->wayland;
-
-    if (!wl->frame.callback)
-        vo_wayland_request_frame(ctx->vo, NULL, NULL);
-
-    if (!vo_wayland_wait_frame(ctx->vo))
-        MP_DBG(wl, "discarding frame callback\n");
-
-    eglSwapBuffers(wl->egl_context.egl.dpy, wl->egl_context.egl_surface);
-}
-
-static int waylandgl_control(MPGLContext *ctx, int *events, int request,
+static int wayland_egl_control(struct ra_ctx *ctx, int *events, int request,
                              void *data)
 {
-    struct vo_wayland_state *wl = ctx->vo->wayland;
+    struct vo_wayland_state *wl = ctx->vo->wl;
     int r = vo_wayland_control(ctx->vo, events, request, data);
 
-    if (*events & VO_EVENT_RESIZE)
-        egl_resize(wl);
+    if (*events & VO_EVENT_RESIZE) {
+        resize(ctx);
+        ra_gl_ctx_resize(ctx->swapchain, wl->vo->dwidth, wl->vo->dheight, 0);
+    }
 
     return r;
 }
 
-static int waylandgl_init(struct MPGLContext *ctx, int flags)
+static void wayland_egl_wakeup(struct ra_ctx *ctx)
 {
-    if (!vo_wayland_init(ctx->vo))
-        return -1;
-
-    return egl_create_context(ctx->vo->wayland, ctx, !!(flags & VOFLAG_ALPHA));
+    vo_wayland_wakeup(ctx->vo);
 }
 
-const struct mpgl_driver mpgl_driver_wayland = {
-    .name           = "wayland",
-    .init           = waylandgl_init,
-    .reconfig       = waylandgl_reconfig,
-    .swap_buffers   = waylandgl_swap_buffers,
-    .control        = waylandgl_control,
-    .uninit         = waylandgl_uninit,
+static void wayland_egl_wait_events(struct ra_ctx *ctx, int64_t until_time_us)
+{
+    vo_wayland_wait_events(ctx->vo, until_time_us);
+}
+
+static void wayland_egl_update_render_opts(struct ra_ctx *ctx)
+{
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    wl_surface_commit(wl->surface);
+}
+
+static bool wayland_egl_init(struct ra_ctx *ctx)
+{
+    if (!vo_wayland_init(ctx->vo)) {
+        vo_wayland_uninit(ctx->vo);
+        return false;
+    }
+
+    return egl_create_context(ctx);
+}
+
+const struct ra_ctx_fns ra_ctx_wayland_egl = {
+    .type               = "opengl",
+    .name               = "wayland",
+    .reconfig           = wayland_egl_reconfig,
+    .control            = wayland_egl_control,
+    .wakeup             = wayland_egl_wakeup,
+    .wait_events        = wayland_egl_wait_events,
+    .update_render_opts = wayland_egl_update_render_opts,
+    .init               = wayland_egl_init,
+    .uninit             = wayland_egl_uninit,
 };

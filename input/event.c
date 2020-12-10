@@ -31,7 +31,7 @@ void mp_event_drop_files(struct input_ctx *ictx, int num_files, char **files,
         for (int i = 0; i < num_files; i++) {
             const char *cmd[] = {
                 "osd-auto",
-                "sub_add",
+                "sub-add",
                 files[i],
                 NULL
             };
@@ -64,7 +64,7 @@ int mp_event_drop_mime_data(struct input_ctx *ictx, const char *mime_type,
         while (data.len) {
             bstr line = bstr_getline(data, &data);
             line = bstr_strip_linebreaks(line);
-            if (bstr_startswith0(line, "#"))
+            if (bstr_startswith0(line, "#") || !line.start[0])
                 continue;
             char *s = bstrto0(tmp, line);
             MP_TARRAY_APPEND(tmp, files, num_files, s);

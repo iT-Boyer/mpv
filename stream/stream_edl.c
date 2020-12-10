@@ -5,7 +5,6 @@
 
 static int s_open (struct stream *stream)
 {
-    stream->type = STREAMTYPE_EDL;
     stream->demuxer = "edl";
 
     return STREAM_OK;

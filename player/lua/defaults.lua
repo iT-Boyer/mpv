@@ -42,8 +42,13 @@ function mp.input_disable_section(section)
     mp.commandv("disable-section", section)
 end
 
--- For dispatching script_binding. This is sent as:
---      script_message_to $script_name $binding_name $keystate
+function mp.get_mouse_pos()
+    local m = mp.get_property_native("mouse-pos")
+    return m.x, m.y
+end
+
+-- For dispatching script-binding. This is sent as:
+--      script-message-to $script_name $binding_name $keystate
 -- The array is indexed by $binding_name, and has functions like this as value:
 --      fn($binding_name, $keystate)
 local dispatch_key_bindings = {}
@@ -54,10 +59,10 @@ local function reserve_binding()
     return "__keybinding" .. tostring(message_id)
 end
 
-local function dispatch_key_binding(name, state)
+local function dispatch_key_binding(name, state, key_name, key_text)
     local fn = dispatch_key_bindings[name]
     if fn then
-        fn(name, state)
+        fn(name, state, key_name, key_text)
     end
 end
 
@@ -131,8 +136,15 @@ end
 -- "Newer" and more convenient API
 
 local key_bindings = {}
+local key_binding_counter = 0
+local key_bindings_dirty = false
 
-local function update_key_bindings()
+function mp.flush_keybindings()
+    if not key_bindings_dirty then
+        return
+    end
+    key_bindings_dirty = false
+
     for i = 1, 2 do
         local section, flags
         local def = i == 1
@@ -143,11 +155,18 @@ local function update_key_bindings()
             section = "input_forced_" .. mp.script_name
             flags = "force"
         end
-        local cfg = ""
+        local bindings = {}
         for k, v in pairs(key_bindings) do
             if v.bind and v.forced ~= def then
-                cfg = cfg .. v.bind .. "\n"
+                bindings[#bindings + 1] = v
             end
+        end
+        table.sort(bindings, function(a, b)
+            return a.priority < b.priority
+        end)
+        local cfg = ""
+        for _, v in ipairs(bindings) do
+            cfg = cfg .. v.bind .. "\n"
         end
         mp.input_define_section(section, cfg, flags)
         -- TODO: remove the section if the script is stopped
@@ -156,9 +175,13 @@ local function update_key_bindings()
 end
 
 local function add_binding(attrs, key, name, fn, rp)
-    rp = rp or ""
-    if (type(name) ~= "string") and (not fn) then
+    if (type(name) ~= "string") and (name ~= nil) then
+        rp = fn
         fn = name
+        name = nil
+    end
+    rp = rp or ""
+    if name == nil then
         name = reserve_binding()
     end
     local repeatable = rp == "repeatable" or rp["repeatable"]
@@ -176,10 +199,15 @@ local function add_binding(attrs, key, name, fn, rp)
             ["r"] = "repeat",
             ["p"] = "press",
         }
-        key_cb = function(name, state)
+        key_cb = function(name, state, key_name, key_text)
+            if key_text == "" then
+                key_text = nil
+            end
             fn({
                 event = key_states[state:sub(1, 1)] or "unknown",
-                is_mouse = state:sub(2, 2) == "m"
+                is_mouse = state:sub(2, 2) == "m",
+                key_name = key_name,
+                key_text = key_text,
             })
         end
         msg_cb = function()
@@ -208,8 +236,11 @@ local function add_binding(attrs, key, name, fn, rp)
         attrs.bind = key .. " script-binding " .. mp.script_name .. "/" .. name
     end
     attrs.name = name
+    -- new bindings override old ones (but do not overwrite them)
+    key_binding_counter = key_binding_counter + 1
+    attrs.priority = key_binding_counter
     key_bindings[name] = attrs
-    update_key_bindings()
+    key_bindings_dirty = true
     dispatch_key_bindings[name] = key_cb
     mp.register_script_message(name, msg_cb)
 end
@@ -225,7 +256,7 @@ end
 function mp.remove_key_binding(name)
     key_bindings[name] = nil
     dispatch_key_bindings[name] = nil
-    update_key_bindings()
+    key_bindings_dirty = true
     mp.unregister_script_message(name)
 end
 
@@ -355,6 +386,7 @@ function mp.unobserve_property(cb)
     for prop_id, prop_cb in pairs(properties) do
         if cb == prop_cb then
             properties[prop_id] = nil
+            mp.raw_unobserve_property(prop_id)
         end
     end
 end
@@ -412,7 +444,24 @@ mp.register_event("shutdown", function() mp.keep_running = false end)
 mp.register_event("client-message", message_dispatch)
 mp.register_event("property-change", property_change)
 
--- sent by "script_binding"
+-- called before the event loop goes back to sleep
+local idle_handlers = {}
+
+function mp.register_idle(cb)
+    idle_handlers[#idle_handlers + 1] = cb
+end
+
+function mp.unregister_idle(cb)
+    local new = {}
+    for _, handler in ipairs(idle_handlers) do
+        if handler ~= cb then
+            new[#new + 1] = handler
+        end
+    end
+    idle_handlers = new
+end
+
+-- sent by "script-binding"
 mp.register_script_message("key-binding", dispatch_key_binding)
 
 mp.msg = {
@@ -423,12 +472,22 @@ mp.msg = {
     info = function(...) return mp.log("info", ...) end,
     verbose = function(...) return mp.log("v", ...) end,
     debug = function(...) return mp.log("debug", ...) end,
+    trace = function(...) return mp.log("trace", ...) end,
 }
 
 _G.print = mp.msg.info
 
 package.loaded["mp"] = mp
 package.loaded["mp.msg"] = mp.msg
+
+function mp.wait_event(t)
+    local r = mp.raw_wait_event(t)
+    if r and r.file_error and not r.error then
+        -- compat; deprecated
+        r.error = r.file_error
+    end
+    return r
+end
 
 _G.mp_event_loop = function()
     mp.dispatch_events(true)
@@ -445,39 +504,40 @@ end
 
 mp.use_suspend = false
 
+local suspend_warned = false
+
 function mp.dispatch_events(allow_wait)
     local more_events = true
     if mp.use_suspend then
-        mp.suspend()
+        if not suspend_warned then
+            mp.msg.error("mp.use_suspend is now ignored.")
+            suspend_warned = true
+        end
     end
     while mp.keep_running do
-        local wait = process_timers()
-        if wait == nil then
-            wait = 1e20 -- infinity for all practical purposes
-        end
-        if more_events or wait < 0 then
-            wait = 0
-        end
-        -- Resume playloop - important especially if an error happened while
-        -- suspended, and the error was handled, but no resume was done.
-        if wait > 0 then
+        local wait = 0
+        if not more_events then
+            wait = process_timers() or 1e20 -- infinity for all practical purposes
+            for _, handler in ipairs(idle_handlers) do
+                handler()
+            end
+            -- Resume playloop - important especially if an error happened while
+            -- suspended, and the error was handled, but no resume was done.
             mp.resume_all()
             if allow_wait ~= true then
                 return
             end
         end
         local e = mp.wait_event(wait)
-        -- Empty the event queue while suspended; otherwise, each
-        -- event will keep us waiting until the core suspends again.
-        if mp.use_suspend then
-            mp.suspend()
-        end
-        more_events = (e.event ~= "none")
-        if more_events then
+        more_events = false
+        if e.event ~= "none" then
             call_event_handlers(e)
+            more_events = true
         end
     end
 end
+
+mp.register_idle(mp.flush_keybindings)
 
 -- additional helpers
 
@@ -491,24 +551,142 @@ function mp.osd_message(text, duration)
 end
 
 local hook_table = {}
-local hook_registered = false
 
-local function hook_run(id, cont)
-    local fn = hook_table[tonumber(id)]
-    if fn then
-        fn()
+local hook_mt = {}
+hook_mt.__index = hook_mt
+
+function hook_mt.cont(t)
+    if t._id == nil then
+        mp.msg.error("hook already continued")
+    else
+        mp.raw_hook_continue(t._id)
+        t._id = nil
     end
-    mp.commandv("hook-ack", cont)
 end
 
-function mp.add_hook(name, pri, cb)
-    if not hook_registered then
-        mp.register_script_message("hook_run", hook_run)
-        hook_registered = true
+function hook_mt.defer(t)
+    t._defer = true
+end
+
+mp.register_event("hook", function(ev)
+    local fn = hook_table[tonumber(ev.id)]
+    local hookobj = {
+        _id = ev.hook_id,
+        _defer = false,
+    }
+    setmetatable(hookobj, hook_mt)
+    if fn then
+        fn(hookobj)
     end
+    if (not hookobj._defer) and hookobj._id ~= nil then
+        hookobj:cont()
+    end
+end)
+
+function mp.add_hook(name, pri, cb)
     local id = #hook_table + 1
     hook_table[id] = cb
-    mp.commandv("hook-add", name, id, pri)
+    -- The C API suggests using 0 for a neutral priority, but lua.rst suggests
+    -- 50 (?), so whatever.
+    mp.raw_hook_add(id, name, pri - 50)
+end
+
+local async_call_table = {}
+local async_next_id = 1
+
+function mp.command_native_async(node, cb)
+    local id = async_next_id
+    async_next_id = async_next_id + 1
+    local res, err = mp.raw_command_native_async(id, node)
+    if not res then
+        cb(false, nil, err)
+        return res, err
+    end
+    local t = {cb = cb, id = id}
+    async_call_table[id] = t
+    return t
+end
+
+mp.register_event("command-reply", function(ev)
+    local id = tonumber(ev.id)
+    local t = async_call_table[id]
+    local cb = t.cb
+    t.id = nil
+    async_call_table[id] = nil
+    if ev.error then
+        cb(false, nil, ev.error)
+    else
+        cb(true, ev.result, nil)
+    end
+end)
+
+function mp.abort_async_command(t)
+    if t.id ~= nil then
+        mp.raw_abort_async_command(t.id)
+    end
+end
+
+local overlay_mt = {}
+overlay_mt.__index = overlay_mt
+local overlay_new_id = 0
+
+function mp.create_osd_overlay(format)
+    overlay_new_id = overlay_new_id + 1
+    local overlay = {
+        format = format,
+        id = overlay_new_id,
+        data = "",
+        res_x = 0,
+        res_y = 720,
+    }
+    setmetatable(overlay, overlay_mt)
+    return overlay
+end
+
+function overlay_mt.update(ov)
+    local cmd = {}
+    for k, v in pairs(ov) do
+        cmd[k] = v
+    end
+    cmd.name = "osd-overlay"
+    cmd.res_x = math.floor(cmd.res_x)
+    cmd.res_y = math.floor(cmd.res_y)
+    return mp.command_native(cmd)
+end
+
+function overlay_mt.remove(ov)
+    mp.command_native {
+        name = "osd-overlay",
+        id = ov.id,
+        format = "none",
+        data = "",
+    }
+end
+
+-- legacy API
+function mp.set_osd_ass(res_x, res_y, data)
+    if not mp._legacy_overlay then
+        mp._legacy_overlay = mp.create_osd_overlay("ass-events")
+    end
+    if mp._legacy_overlay.res_x ~= res_x or
+       mp._legacy_overlay.res_y ~= res_y or
+       mp._legacy_overlay.data ~= data
+    then
+        mp._legacy_overlay.res_x = res_x
+        mp._legacy_overlay.res_y = res_y
+        mp._legacy_overlay.data = data
+        mp._legacy_overlay:update()
+    end
+end
+
+function mp.get_osd_size()
+    local prop = mp.get_property_native("osd-dimensions")
+    return prop.w, prop.h, prop.aspect
+end
+
+function mp.get_osd_margins()
+    local prop = mp.get_property_native("osd-dimensions")
+    return prop.ml, prop.mt, prop.mr, prop.mb
 end
 
 local mp_utils = package.loaded["mp.utils"]
@@ -567,6 +745,67 @@ end
 
 function mp_utils.getcwd()
     return mp.get_property("working-directory")
+end
+
+function mp_utils.format_bytes_humanized(b)
+    local d = {"Bytes", "KiB", "MiB", "GiB", "TiB", "PiB"}
+    local i = 1
+    while b >= 1024 do
+        b = b / 1024
+        i = i + 1
+    end
+    return string.format("%0.2f %s", b, d[i] and d[i] or "*1024^" .. (i-1))
+end
+
+function mp_utils.subprocess(t)
+    local cmd = {}
+    cmd.name = "subprocess"
+    cmd.capture_stdout = true
+    for k, v in pairs(t) do
+        if k == "cancellable" then
+            k = "playback_only"
+        elseif k == "max_size" then
+            k = "capture_size"
+        end
+        cmd[k] = v
+    end
+    local res, err = mp.command_native(cmd)
+    if res == nil then
+        -- an error usually happens only if parsing failed (or no args passed)
+        res = {error_string = err, status = -1}
+    end
+    if res.error_string ~= "" then
+        res.error = res.error_string
+    end
+    return res
+end
+
+function mp_utils.subprocess_detached(t)
+    mp.commandv("run", unpack(t.args))
+end
+
+function mp_utils.shared_script_property_set(name, value)
+    if value ~= nil then
+        -- no such thing as change-list with mpv_node, so build a string value
+        mp.commandv("change-list", "shared-script-properties", "append",
+                    name .. "=" .. value)
+    else
+        mp.commandv("change-list", "shared-script-properties", "remove", name)
+    end
+end
+
+function mp_utils.shared_script_property_get(name)
+    local map = mp.get_property_native("shared-script-properties")
+    return map and map[name]
+end
+
+-- cb(name, value) on change and on init
+function mp_utils.shared_script_property_observe(name, cb)
+    -- it's _very_ wasteful to observe the mpv core "super" property for every
+    -- shared sub-property, but then again you shouldn't use this
+    mp.observe_property("shared-script-properties", "native", function(_, val)
+        cb(name, val and val[name])
+    end)
 end
 
 return {}

@@ -18,8 +18,9 @@
 #include <pthread.h>
 #include <errno.h>
 #include <unistd.h>
-
+#include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -35,6 +36,7 @@
 #include "common/msg.h"
 #include "input/input.h"
 #include "libmpv/client.h"
+#include "options/m_config.h"
 #include "options/options.h"
 #include "options/path.h"
 #include "player/client.h"
@@ -56,9 +58,10 @@ struct client_arg {
     struct mp_log *log;
     struct mpv_handle *client;
 
-    char *client_name;
+    const char *client_name;
     int client_fd;
     bool close_client_fd;
+    bool quit_on_close;
 
     bool writable;
 };
@@ -72,16 +75,13 @@ static int ipc_write_str(struct client_arg *client, const char *buf)
             if (rc == 0)
                 return -1;
 
-            if (errno == EBADF) {
+            if (errno == EBADF || errno == ENOTSOCK) {
                 client->writable = false;
                 return 0;
             }
 
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN)
                 continue;
-
-            if (errno == EAGAIN)
-                return 0;
 
             return rc;
         }
@@ -96,6 +96,11 @@ static int ipc_write_str(struct client_arg *client, const char *buf)
 static void *client_thread(void *p)
 {
     pthread_detach(pthread_self());
+
+    // We don't use MSG_NOSIGNAL because the moldy fruit OS doesn't support it.
+    struct sigaction sa = { .sa_handler = SIG_IGN, .sa_flags = SA_RESTART };
+    sigfillset(&sa.sa_mask);
+    sigaction(SIGPIPE, &sa, NULL);
 
     int rc;
 
@@ -118,23 +123,18 @@ static void *client_thread(void *p)
     };
 
     fcntl(arg->client_fd, F_SETFL, fcntl(arg->client_fd, F_GETFL, 0) | O_NONBLOCK);
-    mpv_suspend(arg->client);
 
     while (1) {
         rc = poll(fds, 2, 0);
-        if (rc == 0) {
-            mpv_resume(arg->client);
+        if (rc == 0)
             rc = poll(fds, 2, -1);
-            mpv_suspend(arg->client);
-        }
         if (rc < 0) {
             MP_ERR(arg, "Poll error\n");
             continue;
         }
 
         if (fds[0].revents & POLLIN) {
-            char discard[100];
-            (void)read(pipe_fd, discard, sizeof(discard));
+            mp_flush_wakeup_pipe(pipe_fd);
 
             while (1) {
                 mpv_event *event = mpv_wait_event(arg->client, 0);
@@ -163,7 +163,7 @@ static void *client_thread(void *p)
             }
         }
 
-        if (fds[1].revents & (POLLIN | POLLHUP)) {
+        if (fds[1].revents & (POLLIN | POLLHUP | POLLNVAL)) {
             while (1) {
                 char buf[128];
                 bstr append = { buf, 0 };
@@ -211,79 +211,88 @@ done:
     talloc_free(client_msg.start);
     if (arg->close_client_fd)
         close(arg->client_fd);
-    mpv_detach_destroy(arg->client);
+    struct mpv_handle *h = arg->client;
+    bool quit = arg->quit_on_close;
     talloc_free(arg);
+    if (quit) {
+        mpv_terminate_destroy(h);
+    } else {
+        mpv_destroy(h);
+    }
     return NULL;
 }
 
-static void ipc_start_client(struct mp_ipc_ctx *ctx, struct client_arg *client)
+static bool ipc_start_client(struct mp_ipc_ctx *ctx, struct client_arg *client,
+                             bool free_on_init_fail)
 {
-    client->client = mp_new_client(ctx->client_api, client->client_name),
-    client->log    = mp_client_get_log(client->client);
+    if (!client->client)
+        client->client = mp_new_client(ctx->client_api, client->client_name);
+    if (!client->client)
+        goto err;
+
+    client->log = mp_client_get_log(client->client);
 
     pthread_t client_thr;
-    if (pthread_create(&client_thr, NULL, client_thread, client)) {
-        mpv_detach_destroy(client->client);
+    if (pthread_create(&client_thr, NULL, client_thread, client))
+        goto err;
+
+    return true;
+
+err:
+    if (free_on_init_fail) {
+        if (client->client)
+            mpv_destroy(client->client);
+
         if (client->close_client_fd)
             close(client->client_fd);
-        talloc_free(client);
     }
+
+    talloc_free(client);
+    return false;
 }
 
 static void ipc_start_client_json(struct mp_ipc_ctx *ctx, int id, int fd)
 {
     struct client_arg *client = talloc_ptrtype(NULL, client);
     *client = (struct client_arg){
-        .client_name = talloc_asprintf(client, "ipc-%d", id),
-        .client_fd   = fd,
-        .close_client_fd = true,
-
+        .client_name =
+            id >= 0 ? talloc_asprintf(client, "ipc-%d", id) : "ipc",
+        .client_fd = fd,
+        .close_client_fd = id >= 0,
+        .quit_on_close = id < 0,
         .writable = true,
     };
 
-    ipc_start_client(ctx, client);
+    ipc_start_client(ctx, client, true);
 }
 
-static void ipc_start_client_text(struct mp_ipc_ctx *ctx, const char *path)
+bool mp_ipc_start_anon_client(struct mp_ipc_ctx *ctx, struct mpv_handle *h,
+                              int out_fd[2])
 {
-    int mode = O_RDONLY;
-    int client_fd = -1;
-    bool close_client_fd = true;
-    bool writable = false;
-
-    if (strcmp(path, "/dev/stdin") == 0) { // for symmetry with Linux
-        client_fd = STDIN_FILENO;
-        close_client_fd = false;
-    } else if (strncmp(path, "fd://", 5) == 0) {
-        char *end = NULL;
-        client_fd = strtol(path + 5, &end, 0);
-        if (!end || end == path + 5 || end[0]) {
-            MP_ERR(ctx, "Invalid FD: %s\n", path);
-            return;
-        }
-        close_client_fd = false;
-        writable = true; // maybe
-    } else {
-        // Use RDWR for FIFOs to ensure they stay open over multiple accesses.
-        struct stat st;
-        if (stat(path, &st) == 0 && S_ISFIFO(st.st_mode))
-            mode = O_RDWR;
-        client_fd = open(path, mode);
-    }
-    if (client_fd < 0) {
-        MP_ERR(ctx, "Could not open '%s'\n", path);
-        return;
-    }
+    int pair[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair))
+        return false;
+    mp_set_cloexec(pair[0]);
+    mp_set_cloexec(pair[1]);
 
     struct client_arg *client = talloc_ptrtype(NULL, client);
     *client = (struct client_arg){
-        .client_name = "input-file",
-        .client_fd   = client_fd,
-        .close_client_fd = close_client_fd,
-        .writable = writable,
+        .client = h,
+        .client_name = mpv_client_name(h),
+        .client_fd   = pair[1],
+        .close_client_fd = true,
+        .writable = true,
     };
 
-    ipc_start_client(ctx, client);
+    if (!ipc_start_client(ctx, client, false)) {
+        close(pair[0]);
+        close(pair[1]);
+        return false;
+    }
+
+    out_fd[0] = pair[0];
+    out_fd[1] = -1;
+    return true;
 }
 
 static void *ipc_thread(void *p)
@@ -305,9 +314,7 @@ static void *ipc_thread(void *p)
         goto done;
     }
 
-#if HAVE_FCHMOD
     fchmod(ipc_fd, 0600);
-#endif
 
     size_t path_len = strlen(arg->path);
     if (path_len >= sizeof(ipc_un.sun_path) - 1) {
@@ -316,7 +323,7 @@ static void *ipc_thread(void *p)
     }
 
     ipc_un.sun_family = AF_UNIX,
-    strncpy(ipc_un.sun_path, arg->path, sizeof(ipc_un.sun_path));
+    strncpy(ipc_un.sun_path, arg->path, sizeof(ipc_un.sun_path) - 1);
 
     unlink(ipc_un.sun_path);
 
@@ -337,6 +344,8 @@ static void *ipc_thread(void *p)
         MP_ERR(arg, "Could not listen on IPC socket\n");
         goto done;
     }
+
+    MP_VERBOSE(arg, "Listening to IPC socket.\n");
 
     int client_num = 0;
 
@@ -376,7 +385,7 @@ done:
 struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
                                struct mpv_global *global)
 {
-    struct MPOpts *opts = global->opts;
+    struct MPOpts *opts = mp_get_config_group(NULL, global, &mp_opt_root);
 
     struct mp_ipc_ctx *arg = talloc_ptrtype(NULL, arg);
     *arg = (struct mp_ipc_ctx){
@@ -385,12 +394,25 @@ struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
         .path       = mp_get_user_path(arg, global, opts->ipc_path),
         .death_pipe = {-1, -1},
     };
-    char *input_file = mp_get_user_path(arg, global, opts->input_file);
 
-    if (input_file && *input_file)
-        ipc_start_client_text(arg, input_file);
+    if (opts->ipc_client && opts->ipc_client[0]) {
+        int fd = -1;
+        if (strncmp(opts->ipc_client, "fd://", 5) == 0) {
+            char *end;
+            unsigned long l = strtoul(opts->ipc_client + 5, &end, 0);
+            if (!end[0] && l <= INT_MAX)
+                fd = l;
+        }
+        if (fd < 0) {
+            MP_ERR(arg, "Invalid IPC client argument: '%s'\n", opts->ipc_client);
+        } else {
+            ipc_start_client_json(arg, -1, fd);
+        }
+    }
 
-    if (!opts->ipc_path || !*opts->ipc_path)
+    talloc_free(opts);
+
+    if (!arg->path || !arg->path[0])
         goto out;
 
     if (mp_make_wakeup_pipe(arg->death_pipe) < 0)
@@ -402,8 +424,10 @@ struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
     return arg;
 
 out:
-    close(arg->death_pipe[0]);
-    close(arg->death_pipe[1]);
+    if (arg->death_pipe[0] >= 0) {
+        close(arg->death_pipe[0]);
+        close(arg->death_pipe[1]);
+    }
     talloc_free(arg);
     return NULL;
 }

@@ -3,18 +3,18 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 /*
@@ -35,14 +35,14 @@
 #include <libbluray/overlay.h>
 #include <libbluray/keys.h>
 #include <libbluray/bluray-version.h>
+#include <libbluray/log_control.h>
 #include <libavutil/common.h>
 
 #include "config.h"
 #include "mpv_talloc.h"
 #include "common/common.h"
 #include "common/msg.h"
-#include "options/m_option.h"
-#include "options/options.h"
+#include "options/m_config.h"
 #include "options/path.h"
 #include "stream.h"
 #include "osdep/timer.h"
@@ -54,6 +54,7 @@
 
 #define BLURAY_DEFAULT_ANGLE      0
 #define BLURAY_DEFAULT_CHAPTER    0
+#define BLURAY_PLAYLIST_TITLE    -3
 #define BLURAY_DEFAULT_TITLE     -2
 #define BLURAY_MENU_TITLE        -1
 
@@ -81,34 +82,10 @@ struct bluray_priv_s {
     int current_playlist;
 
     int cfg_title;
+    int cfg_playlist;
     char *cfg_device;
 
     bool use_nav;
-};
-
-static const struct bluray_priv_s bluray_stream_priv_dflts = {
-    .cfg_title = BLURAY_DEFAULT_TITLE,
-};
-
-static const struct bluray_priv_s bdnav_stream_priv_dflts = {
-    .cfg_title = BLURAY_DEFAULT_TITLE,
-    .use_nav = true,
-};
-
-#define OPT_BASE_STRUCT struct bluray_priv_s
-static const m_option_t bluray_stream_opts_fields[] = {
-    OPT_CHOICE_OR_INT("title", cfg_title, 0, 0, 99999,
-                      ({"longest", BLURAY_DEFAULT_TITLE})),
-    OPT_STRING("device", cfg_device, 0),
-    {0}
-};
-
-static const m_option_t bdnav_stream_opts_fields[] = {
-    OPT_CHOICE_OR_INT("title", cfg_title, 0, 0, 99999,
-                      ({"menu", BLURAY_MENU_TITLE},
-                       {"first", BLURAY_DEFAULT_TITLE})),
-    OPT_STRING("device", cfg_device, 0),
-    {0}
 };
 
 static void destruct(struct bluray_priv_s *priv)
@@ -116,6 +93,11 @@ static void destruct(struct bluray_priv_s *priv)
     if (priv->title_info)
         bd_free_title_info(priv->title_info);
     bd_close(priv->bd);
+}
+
+inline static int play_playlist(struct bluray_priv_s *priv, int playlist)
+{
+    return bd_select_playlist(priv->bd, playlist);
 }
 
 inline static int play_title(struct bluray_priv_s *priv, int title)
@@ -179,7 +161,7 @@ static void handle_event(stream_t *s, const BD_EVENT *ev)
     }
 }
 
-static int bluray_stream_fill_buffer(stream_t *s, char *buf, int len)
+static int bluray_stream_fill_buffer(stream_t *s, void *buf, int len)
 {
     struct bluray_priv_s *b = s->priv;
     BD_EVENT event;
@@ -301,9 +283,6 @@ static int bluray_stream_control(stream_t *s, int cmd, void *arg)
         *(char**)arg = talloc_strdup(NULL, meta->di_name);
         return STREAM_OK;
     }
-    case STREAM_CTRL_GET_SIZE:
-        *(int64_t *)arg = bd_get_title_size(b->bd);
-        return STREAM_OK;
     default:
         break;
     }
@@ -367,37 +346,48 @@ static bool check_disc_info(stream_t *s)
 static void select_initial_title(stream_t *s, int title_guess) {
     struct bluray_priv_s *b = s->priv;
 
-    int title = -1;
-    if (b->cfg_title != BLURAY_DEFAULT_TITLE )
-        title = b->cfg_title;
-    else
-        title = title_guess;
-    if (title < 0)
-        return;
-
-    if (play_title(b, title))
-        b->current_title = title;
-    else {
-        MP_WARN(s, "Couldn't start title '%d'.\n", title);
+    if (b->cfg_title == BLURAY_PLAYLIST_TITLE) {
+        if (!play_playlist(b, b->cfg_playlist))
+            MP_WARN(s, "Couldn't start playlist '%05d'.\n", b->cfg_playlist);
         b->current_title = bd_get_current_title(b->bd);
+    } else {
+        int title = -1;
+        if (b->cfg_title != BLURAY_DEFAULT_TITLE )
+            title = b->cfg_title;
+        else
+            title = title_guess;
+        if (title < 0)
+            return;
+
+        if (play_title(b, title))
+            b->current_title = title;
+        else {
+            MP_WARN(s, "Couldn't start title '%d'.\n", title);
+            b->current_title = bd_get_current_title(b->bd);
+        }
     }
 }
 
-static int bluray_stream_open(stream_t *s)
+static int bluray_stream_open_internal(stream_t *s)
 {
     struct bluray_priv_s *b = s->priv;
 
-    const char *device = NULL;
+    char *device = NULL;
     /* find the requested device */
-    if (b->cfg_device && b->cfg_device[0])
+    if (b->cfg_device && b->cfg_device[0]) {
         device = b->cfg_device;
-    else if (s->opts->bluray_device && s->opts->bluray_device[0])
-        device = s->opts->bluray_device;
+    } else {
+        mp_read_option_raw(s->global, "bluray-device", &m_option_type_string,
+                           &device);
+    }
 
-    if (!device) {
+    if (!device || !device[0]) {
         MP_ERR(s, "No Blu-ray device/location was specified ...\n");
         return STREAM_UNSUPPORTED;
     }
+
+    if (!mp_msg_test(s->log, MSGL_DEBUG))
+        bd_set_debug_mask(0);
 
     /* open device */
     BLURAY *bd = bd_open(device, NULL);
@@ -425,12 +415,19 @@ static int bluray_stream_open(stream_t *s)
             return STREAM_UNSUPPORTED;
         }
 
+        MP_INFO(s, "List of available titles:\n");
+
         /* parse titles information */
         uint64_t max_duration = 0;
         for (int i = 0; i < b->num_titles; i++) {
             BLURAY_TITLE_INFO *ti = bd_get_title_info(bd, i, 0);
             if (!ti)
                 continue;
+
+            char *time = mp_format_time(ti->duration / 90000, false);
+            MP_INFO(s, "idx: %3d duration: %s (playlist: %05d.mpls)\n",
+                       i, time, ti->playlist);
+            talloc_free(time);
 
             /* try to guess which title may contain the main movie */
             if (ti->duration > max_duration) {
@@ -454,8 +451,6 @@ static int bluray_stream_open(stream_t *s)
     s->fill_buffer = bluray_stream_fill_buffer;
     s->close       = bluray_stream_close;
     s->control     = bluray_stream_control;
-    s->type        = STREAMTYPE_BLURAY;
-    s->sector_size = BLURAY_SECTOR_SIZE;
     s->priv        = b;
     s->demuxer     = "+disc";
 
@@ -464,32 +459,67 @@ static int bluray_stream_open(stream_t *s)
     return STREAM_OK;
 }
 
+const stream_info_t stream_info_bdnav;
+
+static int bluray_stream_open(stream_t *s)
+{
+    struct bluray_priv_s *b = talloc_zero(s, struct bluray_priv_s);
+    s->priv = b;
+
+    b->use_nav = s->info == &stream_info_bdnav;
+
+    bstr title, bdevice, rest = { .len = 0 };
+    bstr_split_tok(bstr0(s->path), "/", &title, &bdevice);
+
+    b->cfg_title = BLURAY_DEFAULT_TITLE;
+
+    if (bstr_equals0(title, "longest") || bstr_equals0(title, "first")) {
+        b->cfg_title = BLURAY_DEFAULT_TITLE;
+    } else if (bstr_equals0(title, "menu")) {
+        b->cfg_title = BLURAY_MENU_TITLE;
+    } else if (bstr_equals0(title, "mpls")) {
+        bstr_split_tok(bdevice, "/", &title, &bdevice);
+        long long pl = bstrtoll(title, &rest, 10);
+        if (rest.len) {
+            MP_ERR(s, "number expected: '%.*s'\n", BSTR_P(rest));
+            return STREAM_ERROR;
+        } else if (pl < 0 || 99999 < pl) {
+            MP_ERR(s, "invalid playlist: '%.*s', must be in the range 0-99999\n",
+                            BSTR_P(title));
+            return STREAM_ERROR;
+        }
+        b->cfg_playlist = pl;
+        b->cfg_title    = BLURAY_PLAYLIST_TITLE;
+    } else if (title.len) {
+        long long t = bstrtoll(title, &rest, 10);
+        if (rest.len) {
+            MP_ERR(s, "number expected: '%.*s'\n", BSTR_P(rest));
+            return STREAM_ERROR;
+        } else if (t < 0 || 99999 < t) {
+            MP_ERR(s, "invalid title: '%.*s', must be in the range 0-99999\n",
+                            BSTR_P(title));
+            return STREAM_ERROR;
+        }
+        b->cfg_title = t;
+    }
+
+    b->cfg_device = bstrto0(b, bdevice);
+
+    return bluray_stream_open_internal(s);
+}
+
 const stream_info_t stream_info_bluray = {
     .name = "bd",
     .open = bluray_stream_open,
     .protocols = (const char*const[]){ "bd", "br", "bluray", NULL },
-    .priv_defaults = &bluray_stream_priv_dflts,
-    .priv_size = sizeof(struct bluray_priv_s),
-    .options = bluray_stream_opts_fields,
-    .url_options = (const char*const[]){
-        "hostname=title",
-        "filename=device",
-        NULL
-    },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
 const stream_info_t stream_info_bdnav = {
     .name = "bdnav",
     .open = bluray_stream_open,
     .protocols = (const char*const[]){ "bdnav", "brnav", "bluraynav", NULL },
-    .priv_defaults = &bdnav_stream_priv_dflts,
-    .priv_size = sizeof(struct bluray_priv_s),
-    .options = bdnav_stream_opts_fields,
-    .url_options = (const char*const[]){
-        "hostname=title",
-        "filename=device",
-        NULL
-    },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };
 
 static bool check_bdmv(const char *path)
@@ -501,19 +531,16 @@ static bool check_bdmv(const char *path)
     if (!temp)
         return false;
 
-    bool r = false;
+    char data[50] = {0};
 
-    const char *sig1 = "MOBJ020";
-    const char *sig2 = "MOBJ0100";
-    char data[50];
-
-    if (fread(data, 50, 1, temp) == 1) {
-        r = memcmp(data, sig1, strlen(sig1)) == 0 ||
-            memcmp(data, sig2, strlen(sig2)) == 0;
-    }
-
+    fread(data, 50, 1, temp);
     fclose(temp);
-    return r;
+
+    bstr bdata = {data, 50};
+
+    return bstr_startswith0(bdata, "MOBJ0100") || // AVCHD
+           bstr_startswith0(bdata, "MOBJ0200") || // Blu-ray
+           bstr_startswith0(bdata, "MOBJ0300");   // UHD BD
 }
 
 // Destructively remove the current trailing path component.
@@ -536,7 +563,12 @@ static int bdmv_dir_stream_open(stream_t *stream)
 {
     struct bluray_priv_s *priv = talloc_ptrtype(stream, priv);
     stream->priv = priv;
-    *priv = bluray_stream_priv_dflts;
+    *priv = (struct bluray_priv_s){
+        .cfg_title = BLURAY_DEFAULT_TITLE,
+    };
+
+    if (!stream->access_references)
+        goto unsupported;
 
     char *path = mp_file_get_path(priv, bstr0(stream->url));
     if (!path)
@@ -563,7 +595,7 @@ static int bdmv_dir_stream_open(stream_t *stream)
         goto unsupported;
 
     MP_INFO(stream, "BDMV detected. Redirecting to bluray://\n");
-    return bluray_stream_open(stream);
+    return bluray_stream_open_internal(stream);
 
 unsupported:
     talloc_free(priv);
@@ -575,4 +607,5 @@ const stream_info_t stream_info_bdmv_dir = {
     .name = "bdmv/bluray",
     .open = bdmv_dir_stream_open,
     .protocols = (const char*const[]){ "file", "", NULL },
+    .stream_origin = STREAM_ORIGIN_UNSAFE,
 };

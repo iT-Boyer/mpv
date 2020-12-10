@@ -18,8 +18,9 @@
 #ifndef MP_CODECS_H
 #define MP_CODECS_H
 
+struct mp_log;
+
 struct mp_decoder_entry {
-    const char *family;         // decoder module (e.g. ad_lavc => "lavc")
     const char *codec;          // name of the codec (e.g. "mp3")
     const char *decoder;        // decoder name (e.g. "mp3float")
     const char *desc;           // human readable description
@@ -30,17 +31,13 @@ struct mp_decoder_list {
     int num_entries;
 };
 
-void mp_add_decoder(struct mp_decoder_list *list, const char *family,
-                    const char *codec, const char *decoder, const char *desc);
+void mp_add_decoder(struct mp_decoder_list *list, const char *codec,
+                    const char *decoder, const char *desc);
 
-struct mp_decoder_list *mp_select_decoders(struct mp_decoder_list *all,
+struct mp_decoder_list *mp_select_decoders(struct mp_log *log,
+                                           struct mp_decoder_list *all,
                                            const char *codec,
                                            const char *selection);
-
-struct mp_decoder_list *mp_select_decoder_list(struct mp_decoder_list *all,
-                                               const char *codec,
-                                               const char *family,
-                                               const char *selection);
 
 void mp_append_decoders(struct mp_decoder_list *list, struct mp_decoder_list *a);
 

@@ -29,7 +29,7 @@
 #include <endpointvolume.h>
 
 #include "common/msg.h"
-#include "osdep/atomics.h"
+#include "osdep/atomic.h"
 #include "osdep/windows_utils.h"
 #include "internal.h"
 #include "ao.h"
@@ -45,11 +45,6 @@ typedef struct change_notify {
 HRESULT wasapi_change_init(struct ao* ao, bool is_hotplug);
 void wasapi_change_uninit(struct ao* ao);
 
-#define EXIT_ON_ERROR(hres)  \
-              do { if (FAILED(hres)) { goto exit_label; } } while(0)
-#define SAFE_RELEASE(unk, release) \
-              do { if ((unk) != NULL) { release; (unk) = NULL; } } while(0)
-
 enum wasapi_thread_state {
     WASAPI_THREAD_FEED = 0,
     WASAPI_THREAD_RESUME,
@@ -60,8 +55,8 @@ enum wasapi_thread_state {
 typedef struct wasapi_state {
     struct mp_log *log;
 
+    bool init_ok;            // status of init phase
     // Thread handles
-    HRESULT init_ret;        // status of init phase
     HANDLE hInitDone;        // set when init is complete in audio thread
     HANDLE hAudioThread;     // the audio thread itself
     HANDLE hWake;            // thread wakeup event
@@ -92,13 +87,12 @@ typedef struct wasapi_state {
 
     // ao options
     int opt_exclusive;
-    int opt_list;
-    char *opt_device;
 
     // format info
     WAVEFORMATEXTENSIBLE format;
     AUDCLNT_SHAREMODE share_mode; // AUDCLNT_SHAREMODE_EXCLUSIVE / SHARED
     UINT32 bufferFrameCount;      // number of frames in buffer
+    struct ao_convert_fmt convert_format;
 
     change_notify change;
 } wasapi_state;
@@ -110,11 +104,12 @@ void wasapi_list_devs(struct ao *ao, struct ao_device_list *list);
 bstr wasapi_get_specified_device_string(struct ao *ao);
 LPWSTR wasapi_find_deviceID(struct ao *ao);
 
-void wasapi_dispatch(struct ao *ao);
-HRESULT wasapi_thread_init(struct ao *ao);
+bool wasapi_thread_init(struct ao *ao);
 void wasapi_thread_uninit(struct ao *ao);
 
-void wasapi_receive_proxies(wasapi_state *state);
-void wasapi_release_proxies(wasapi_state *state);
+#define EXIT_ON_ERROR(hres)  \
+              do { if (FAILED(hres)) { goto exit_label; } } while(0)
+#define SAFE_DESTROY(unk, release) \
+              do { if ((unk) != NULL) { release; (unk) = NULL; } } while(0)
 
 #endif

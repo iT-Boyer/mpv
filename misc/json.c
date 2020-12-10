@@ -22,9 +22,14 @@
  * doesn't verify what's passed to strtod(), and also prefers parsing numbers
  * as integers with stroll() if possible).
  *
- * Does not support extensions like unquoted string literals.
+ * It has some non-standard extensions which shouldn't conflict with JSON:
+ *  - a list or object item can have a trailing ","
+ *  - object syntax accepts "=" in addition of ":"
+ *  - object keys can be unquoted, if they start with a character in [A-Za-z_]
+ *    and contain only characters in [A-Za-z0-9_]
+ *  - byte escapes with "\xAB" are allowed (with AB being a 2 digit hex number)
  *
- * Also see: http://tools.ietf.org/html/rfc4627
+ * Also see: http://tools.ietf.org/html/rfc8259
  *
  * JSON writer:
  *
@@ -34,9 +39,6 @@
  * to deal with somehow: either by using byte-strings for JSON, or by running
  * a "fixup" pass on the input data. The latter could for example change
  * invalid UTF-8 sequences to replacement characters.
- *
- * Currently, will insert \u literals for characters 0-31, '"', '\', and write
- * everything else literally.
  */
 
 #include <stdlib.h>
@@ -48,6 +50,7 @@
 
 #include "common/common.h"
 #include "misc/bstr.h"
+#include "misc/ctype.h"
 
 #include "json.h"
 
@@ -73,6 +76,24 @@ static void eat_ws(char **src)
 void json_skip_whitespace(char **src)
 {
     eat_ws(src);
+}
+
+static int read_id(void *ta_parent, struct mpv_node *dst, char **src)
+{
+    char *start = *src;
+    if (!mp_isalpha(**src) && **src != '_')
+        return -1;
+    while (mp_isalnum(**src) || **src == '_')
+        *src += 1;
+    if (**src == ' ') {
+        **src = '\0'; // we're allowed to mutate it => can avoid the strndup
+        *src += 1;
+    } else {
+        start = talloc_strndup(ta_parent, start, *src - start);
+    }
+    dst->format = MPV_FORMAT_STRING;
+    dst->u.string = start;
+    return 0;
 }
 
 static int read_str(void *ta_parent, struct mpv_node *dst, char **src)
@@ -125,12 +146,18 @@ static int read_sub(void *ta_parent, struct mpv_node *dst, char **src,
         if (list->num > 0 && !eat_c(src, ','))
             return -1; // missing ','
         eat_ws(src);
+        // non-standard extension: allow a trailing ","
+        if (eat_c(src, term))
+            break;
         if (is_obj) {
             struct mpv_node keynode;
-            if (read_str(list, &keynode, src) < 0)
+            // non-standard extension: allow unquoted strings as keys
+            if (read_id(list, &keynode, src) < 0 &&
+                read_str(list, &keynode, src) < 0)
                 return -1; // key is not a string
             eat_ws(src);
-            if (!eat_c(src, ':'))
+            // non-standard extension: allow "=" instead of ":"
+            if (!eat_c(src, ':') && !eat_c(src, '='))
                 return -1; // ':' missing
             eat_ws(src);
             MP_TARRAY_GROW(list, list->keys, list->num);
@@ -218,24 +245,49 @@ int json_parse(void *ta_parent, struct mpv_node *dst, char **src, int max_depth)
 
 #define APPEND(b, s) bstr_xappend(NULL, (b), bstr0(s))
 
+static const char special_escape[] = {
+    ['\b'] = 'b',
+    ['\f'] = 'f',
+    ['\n'] = 'n',
+    ['\r'] = 'r',
+    ['\t'] = 't',
+};
+
 static void write_json_str(bstr *b, unsigned char *str)
 {
     APPEND(b, "\"");
     while (1) {
         unsigned char *cur = str;
-        while (cur[0] && cur[0] >= 32 && cur[0] != '"' && cur[0] != '\\')
+        while (cur[0] >= 32 && cur[0] != '"' && cur[0] != '\\')
             cur++;
         if (!cur[0])
             break;
         bstr_xappend(NULL, b, (bstr){str, cur - str});
-        bstr_xappend_asprintf(NULL, b, "\\u%04x", (unsigned char)cur[0]);
+        if (cur[0] == '\"') {
+            bstr_xappend(NULL, b, (bstr){"\\\"", 2});
+        } else if (cur[0] == '\\') {
+            bstr_xappend(NULL, b, (bstr){"\\\\", 2});
+        } else if (cur[0] < sizeof(special_escape) && special_escape[cur[0]]) {
+            bstr_xappend_asprintf(NULL, b, "\\%c", special_escape[cur[0]]);
+        } else {
+            bstr_xappend_asprintf(NULL, b, "\\u%04x", (unsigned char)cur[0]);
+        }
         str = cur + 1;
     }
     APPEND(b, str);
     APPEND(b, "\"");
 }
 
-static int json_append(bstr *b, const struct mpv_node *src)
+static void add_indent(bstr *b, int indent)
+{
+    if (indent < 0)
+        return;
+    bstr_xappend(NULL, b, bstr0("\n"));
+    for (int n = 0; n < indent; n++)
+        bstr_xappend(NULL, b, bstr0(" "));
+}
+
+static int json_append(bstr *b, const struct mpv_node *src, int indent)
 {
     switch (src->format) {
     case MPV_FORMAT_NONE:
@@ -247,9 +299,11 @@ static int json_append(bstr *b, const struct mpv_node *src)
     case MPV_FORMAT_INT64:
         bstr_xappend_asprintf(NULL, b, "%"PRId64, src->u.int64);
         return 0;
-    case MPV_FORMAT_DOUBLE:
-        bstr_xappend_asprintf(NULL, b, "%f", src->u.double_);
+    case MPV_FORMAT_DOUBLE: {
+        const char *px = isfinite(src->u.double_) ? "" : "\"";
+        bstr_xappend_asprintf(NULL, b, "%s%f%s", px, src->u.double_, px);
         return 0;
+    }
     case MPV_FORMAT_STRING:
         write_json_str(b, src->u.string);
         return 0;
@@ -258,20 +312,31 @@ static int json_append(bstr *b, const struct mpv_node *src)
         struct mpv_node_list *list = src->u.list;
         bool is_obj = src->format == MPV_FORMAT_NODE_MAP;
         APPEND(b, is_obj ? "{" : "[");
+        int next_indent = indent >= 0 ? indent + 1 : -1;
         for (int n = 0; n < list->num; n++) {
             if (n)
                 APPEND(b, ",");
+            add_indent(b, next_indent);
             if (is_obj) {
                 write_json_str(b, list->keys[n]);
                 APPEND(b, ":");
             }
-            json_append(b, &list->values[n]);
+            json_append(b, &list->values[n], next_indent);
         }
+        add_indent(b, indent);
         APPEND(b, is_obj ? "}" : "]");
         return 0;
     }
     }
     return -1; // unknown format
+}
+
+static int json_append_str(char **dst, struct mpv_node *src, int indent)
+{
+    bstr buffer = bstr0(*dst);
+    int r = json_append(&buffer, src, indent);
+    *dst = buffer.start;
+    return r;
 }
 
 /* Write the contents of *src as JSON, and append the JSON string to *dst.
@@ -281,8 +346,11 @@ static int json_append(bstr *b, const struct mpv_node *src)
  */
 int json_write(char **dst, struct mpv_node *src)
 {
-    bstr buffer = bstr0(*dst);
-    int r = json_append(&buffer, src);
-    *dst = buffer.start;
-    return r;
+    return json_append_str(dst, src, -1);
+}
+
+// Same as json_write(), but add whitespace to make it readable.
+int json_write_pretty(char **dst, struct mpv_node *src)
+{
+    return json_append_str(dst, src, 0);
 }

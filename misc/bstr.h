@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_BSTR_H
@@ -69,7 +69,6 @@ int bstrspn(struct bstr str, const char *accept);
 int bstrcspn(struct bstr str, const char *reject);
 
 int bstr_find(struct bstr haystack, struct bstr needle);
-struct bstr *bstr_splitlines(void *talloc_ctx, struct bstr str);
 struct bstr bstr_lstrip(struct bstr str);
 struct bstr bstr_strip(struct bstr str);
 struct bstr bstr_split(struct bstr str, const char *sep, struct bstr *rest);
@@ -79,6 +78,10 @@ long long bstrtoll(struct bstr str, struct bstr *rest, int base);
 double bstrtod(struct bstr str, struct bstr *rest);
 void bstr_lower(struct bstr str);
 int bstr_sscanf(struct bstr str, const char *format, ...);
+
+// Decode a string containing hexadecimal data. All whitespace will be silently
+// ignored. When successful, this allocates a new array to store the output.
+bool bstr_decode_hex(void *talloc_ctx, struct bstr hex, struct bstr *out);
 
 // Decode the UTF-8 code point at the start of the string, and return the
 // character.
@@ -116,7 +119,7 @@ int bstr_validate_utf8(struct bstr s);
 // talloc, with talloc_ctx as parent.
 struct bstr bstr_sanitize_utf8_latin1(void *talloc_ctx, struct bstr s);
 
-// Return the text before the occurance of a character, and return it. Change
+// Return the text before the occurrence of a character, and return it. Change
 // *rest to point to the text following this character. (rest can be NULL.)
 struct bstr bstr_splitchar(struct bstr str, struct bstr *rest, const char c);
 
@@ -189,12 +192,15 @@ static inline int bstrcmp0(struct bstr str1, const char *str2)
 
 static inline bool bstr_equals(struct bstr str1, struct bstr str2)
 {
-    return bstrcmp(str1, str2) == 0;
+    if (str1.len != str2.len)
+        return false;
+
+    return str1.start == str2.start || bstrcmp(str1, str2) == 0;
 }
 
 static inline bool bstr_equals0(struct bstr str1, const char *str2)
 {
-    return bstrcmp(str1, bstr0(str2)) == 0;
+    return bstr_equals(str1, bstr0(str2));
 }
 
 static inline int bstrcasecmp0(struct bstr str1, const char *str2)

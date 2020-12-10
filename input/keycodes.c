@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <stddef.h>
@@ -78,66 +78,55 @@ static const struct key_name key_names[] = {
   { MP_KEY_KPDEC, "KP_DEC" },
   { MP_KEY_KPINS, "KP_INS" },
   { MP_KEY_KPENTER, "KP_ENTER" },
-  { MP_MOUSE_BTN0, "MOUSE_BTN0" },
-  { MP_MOUSE_BTN1, "MOUSE_BTN1" },
-  { MP_MOUSE_BTN2, "MOUSE_BTN2" },
-  { MP_MOUSE_BTN3, "MOUSE_BTN3" },
-  { MP_MOUSE_BTN4, "MOUSE_BTN4" },
-  { MP_MOUSE_BTN5, "MOUSE_BTN5" },
-  { MP_MOUSE_BTN6, "MOUSE_BTN6" },
-  { MP_MOUSE_BTN7, "MOUSE_BTN7" },
-  { MP_MOUSE_BTN8, "MOUSE_BTN8" },
-  { MP_MOUSE_BTN9, "MOUSE_BTN9" },
-  { MP_MOUSE_BTN10, "MOUSE_BTN10" },
-  { MP_MOUSE_BTN11, "MOUSE_BTN11" },
-  { MP_MOUSE_BTN12, "MOUSE_BTN12" },
-  { MP_MOUSE_BTN13, "MOUSE_BTN13" },
-  { MP_MOUSE_BTN14, "MOUSE_BTN14" },
-  { MP_MOUSE_BTN15, "MOUSE_BTN15" },
-  { MP_MOUSE_BTN16, "MOUSE_BTN16" },
-  { MP_MOUSE_BTN17, "MOUSE_BTN17" },
-  { MP_MOUSE_BTN18, "MOUSE_BTN18" },
-  { MP_MOUSE_BTN19, "MOUSE_BTN19" },
-  { MP_MOUSE_BTN0_DBL, "MOUSE_BTN0_DBL" },
-  { MP_MOUSE_BTN1_DBL, "MOUSE_BTN1_DBL" },
-  { MP_MOUSE_BTN2_DBL, "MOUSE_BTN2_DBL" },
-  { MP_MOUSE_BTN3_DBL, "MOUSE_BTN3_DBL" },
-  { MP_MOUSE_BTN4_DBL, "MOUSE_BTN4_DBL" },
-  { MP_MOUSE_BTN5_DBL, "MOUSE_BTN5_DBL" },
-  { MP_MOUSE_BTN6_DBL, "MOUSE_BTN6_DBL" },
-  { MP_MOUSE_BTN7_DBL, "MOUSE_BTN7_DBL" },
-  { MP_MOUSE_BTN8_DBL, "MOUSE_BTN8_DBL" },
-  { MP_MOUSE_BTN9_DBL, "MOUSE_BTN9_DBL" },
-  { MP_MOUSE_BTN10_DBL, "MOUSE_BTN10_DBL" },
-  { MP_MOUSE_BTN11_DBL, "MOUSE_BTN11_DBL" },
-  { MP_MOUSE_BTN12_DBL, "MOUSE_BTN12_DBL" },
-  { MP_MOUSE_BTN13_DBL, "MOUSE_BTN13_DBL" },
-  { MP_MOUSE_BTN14_DBL, "MOUSE_BTN14_DBL" },
-  { MP_MOUSE_BTN15_DBL, "MOUSE_BTN15_DBL" },
-  { MP_MOUSE_BTN16_DBL, "MOUSE_BTN16_DBL" },
-  { MP_MOUSE_BTN17_DBL, "MOUSE_BTN17_DBL" },
-  { MP_MOUSE_BTN18_DBL, "MOUSE_BTN18_DBL" },
-  { MP_MOUSE_BTN19_DBL, "MOUSE_BTN19_DBL" },
+  { MP_MBTN_LEFT, "MBTN_LEFT" },
+  { MP_MBTN_MID, "MBTN_MID" },
+  { MP_MBTN_RIGHT, "MBTN_RIGHT" },
+  { MP_WHEEL_UP, "WHEEL_UP" },
+  { MP_WHEEL_DOWN, "WHEEL_DOWN" },
+  { MP_WHEEL_LEFT, "WHEEL_LEFT" },
+  { MP_WHEEL_RIGHT, "WHEEL_RIGHT" },
+  { MP_MBTN_BACK, "MBTN_BACK" },
+  { MP_MBTN_FORWARD, "MBTN_FORWARD" },
+  { MP_MBTN9, "MBTN9" },
+  { MP_MBTN10, "MBTN10" },
+  { MP_MBTN11, "MBTN11" },
+  { MP_MBTN12, "MBTN12" },
+  { MP_MBTN13, "MBTN13" },
+  { MP_MBTN14, "MBTN14" },
+  { MP_MBTN15, "MBTN15" },
+  { MP_MBTN16, "MBTN16" },
+  { MP_MBTN17, "MBTN17" },
+  { MP_MBTN18, "MBTN18" },
+  { MP_MBTN19, "MBTN19" },
+  { MP_MBTN_LEFT_DBL, "MBTN_LEFT_DBL" },
+  { MP_MBTN_MID_DBL, "MBTN_MID_DBL" },
+  { MP_MBTN_RIGHT_DBL, "MBTN_RIGHT_DBL" },
 
-  { MP_AR_PLAY,         "AR_PLAY" },
-  { MP_AR_PLAY_HOLD,    "AR_PLAY_HOLD" },
-  { MP_AR_CENTER,       "AR_CENTER" },
-  { MP_AR_CENTER_HOLD,  "AR_CENTER_HOLD" },
-  { MP_AR_NEXT,         "AR_NEXT" },
-  { MP_AR_NEXT_HOLD,    "AR_NEXT_HOLD" },
-  { MP_AR_PREV,         "AR_PREV" },
-  { MP_AR_PREV_HOLD,    "AR_PREV_HOLD" },
-  { MP_AR_MENU,         "AR_MENU" },
-  { MP_AR_MENU_HOLD,    "AR_MENU_HOLD" },
-  { MP_AR_VUP,          "AR_VUP" },
-  { MP_AR_VUP_HOLD,     "AR_VUP_HOLD" },
-  { MP_AR_VDOWN,        "AR_VDOWN" },
-  { MP_AR_VDOWN_HOLD,   "AR_VDOWN_HOLD" },
-
-  { MP_AXIS_UP,         "AXIS_UP" },
-  { MP_AXIS_DOWN,       "AXIS_DOWN" },
-  { MP_AXIS_LEFT,       "AXIS_LEFT" },
-  { MP_AXIS_RIGHT,      "AXIS_RIGHT" },
+  { MP_KEY_GAMEPAD_ACTION_DOWN, "GAMEPAD_ACTION_DOWN" },
+  { MP_KEY_GAMEPAD_ACTION_RIGHT, "GAMEPAD_ACTION_RIGHT" },
+  { MP_KEY_GAMEPAD_ACTION_LEFT, "GAMEPAD_ACTION_LEFT" },
+  { MP_KEY_GAMEPAD_ACTION_UP, "GAMEPAD_ACTION_UP" },
+  { MP_KEY_GAMEPAD_BACK, "GAMEPAD_BACK" },
+  { MP_KEY_GAMEPAD_MENU, "GAMEPAD_MENU" },
+  { MP_KEY_GAMEPAD_START, "GAMEPAD_START" },
+  { MP_KEY_GAMEPAD_LEFT_SHOULDER, "GAMEPAD_LEFT_SHOULDER" },
+  { MP_KEY_GAMEPAD_RIGHT_SHOULDER, "GAMEPAD_RIGHT_SHOULDER" },
+  { MP_KEY_GAMEPAD_LEFT_TRIGGER, "GAMEPAD_LEFT_TRIGGER" },
+  { MP_KEY_GAMEPAD_RIGHT_TRIGGER, "GAMEPAD_RIGHT_TRIGGER" },
+  { MP_KEY_GAMEPAD_LEFT_STICK, "GAMEPAD_LEFT_STICK" },
+  { MP_KEY_GAMEPAD_RIGHT_STICK, "GAMEPAD_RIGHT_STICK" },
+  { MP_KEY_GAMEPAD_DPAD_UP, "GAMEPAD_DPAD_UP" },
+  { MP_KEY_GAMEPAD_DPAD_DOWN, "GAMEPAD_DPAD_DOWN" },
+  { MP_KEY_GAMEPAD_DPAD_LEFT, "GAMEPAD_DPAD_LEFT" },
+  { MP_KEY_GAMEPAD_DPAD_RIGHT, "GAMEPAD_DPAD_RIGHT" },
+  { MP_KEY_GAMEPAD_LEFT_STICK_UP, "GAMEPAD_LEFT_STICK_UP" },
+  { MP_KEY_GAMEPAD_LEFT_STICK_DOWN, "GAMEPAD_LEFT_STICK_DOWN" },
+  { MP_KEY_GAMEPAD_LEFT_STICK_LEFT, "GAMEPAD_LEFT_STICK_LEFT" },
+  { MP_KEY_GAMEPAD_LEFT_STICK_RIGHT, "GAMEPAD_LEFT_STICK_RIGHT" },
+  { MP_KEY_GAMEPAD_RIGHT_STICK_UP, "GAMEPAD_RIGHT_STICK_UP" },
+  { MP_KEY_GAMEPAD_RIGHT_STICK_DOWN, "GAMEPAD_RIGHT_STICK_DOWN" },
+  { MP_KEY_GAMEPAD_RIGHT_STICK_LEFT, "GAMEPAD_RIGHT_STICK_LEFT" },
+  { MP_KEY_GAMEPAD_RIGHT_STICK_RIGHT, "GAMEPAD_RIGHT_STICK_RIGHT" },
 
   { MP_KEY_POWER,       "POWER" },
   { MP_KEY_MENU,        "MENU" },
@@ -159,6 +148,11 @@ static const struct key_name key_names[] = {
   { MP_KEY_SEARCH,      "SEARCH" },
   { MP_KEY_SLEEP,       "SLEEP" },
   { MP_KEY_CANCEL,      "CANCEL" },
+  { MP_KEY_RECORD,      "RECORD" },
+  { MP_KEY_CHANNEL_UP,  "CHANNEL_UP" },
+  { MP_KEY_CHANNEL_DOWN,"CHANNEL_DOWN" },
+  { MP_KEY_PLAYONLY,    "PLAYONLY" },
+  { MP_KEY_PAUSEONLY,   "PAUSEONLY" },
 
   // These are kept for backward compatibility
   { MP_KEY_PAUSE,   "XF86_PAUSE" },
@@ -166,12 +160,42 @@ static const struct key_name key_names[] = {
   { MP_KEY_PREV,    "XF86_PREV" },
   { MP_KEY_NEXT,    "XF86_NEXT" },
 
+  // Deprecated numeric aliases for the mouse buttons
+  { MP_MBTN_LEFT, "MOUSE_BTN0" },
+  { MP_MBTN_MID, "MOUSE_BTN1" },
+  { MP_MBTN_RIGHT, "MOUSE_BTN2" },
+  { MP_WHEEL_UP, "MOUSE_BTN3" },
+  { MP_WHEEL_DOWN, "MOUSE_BTN4" },
+  { MP_WHEEL_LEFT, "MOUSE_BTN5" },
+  { MP_WHEEL_RIGHT, "MOUSE_BTN6" },
+  { MP_MBTN_BACK, "MOUSE_BTN7" },
+  { MP_MBTN_FORWARD, "MOUSE_BTN8" },
+  { MP_MBTN9, "MOUSE_BTN9" },
+  { MP_MBTN10, "MOUSE_BTN10" },
+  { MP_MBTN11, "MOUSE_BTN11" },
+  { MP_MBTN12, "MOUSE_BTN12" },
+  { MP_MBTN13, "MOUSE_BTN13" },
+  { MP_MBTN14, "MOUSE_BTN14" },
+  { MP_MBTN15, "MOUSE_BTN15" },
+  { MP_MBTN16, "MOUSE_BTN16" },
+  { MP_MBTN17, "MOUSE_BTN17" },
+  { MP_MBTN18, "MOUSE_BTN18" },
+  { MP_MBTN19, "MOUSE_BTN19" },
+  { MP_MBTN_LEFT_DBL, "MOUSE_BTN0_DBL" },
+  { MP_MBTN_MID_DBL, "MOUSE_BTN1_DBL" },
+  { MP_MBTN_RIGHT_DBL, "MOUSE_BTN2_DBL" },
+  { MP_WHEEL_UP, "AXIS_UP" },
+  { MP_WHEEL_DOWN, "AXIS_DOWN" },
+  { MP_WHEEL_LEFT, "AXIS_LEFT" },
+  { MP_WHEEL_RIGHT, "AXIS_RIGHT" },
+
   { MP_KEY_CLOSE_WIN,   "CLOSE_WIN" },
   { MP_KEY_MOUSE_MOVE,  "MOUSE_MOVE" },
   { MP_KEY_MOUSE_LEAVE, "MOUSE_LEAVE" },
   { MP_KEY_MOUSE_ENTER, "MOUSE_ENTER" },
 
   { MP_KEY_UNMAPPED,    "UNMAPPED" },
+  { MP_KEY_ANY_UNICODE, "ANY_UNICODE" },
 
   { 0, NULL }
 };
@@ -235,8 +259,7 @@ static void mp_input_append_key_name(bstr *buf, int key)
         }
     }
 
-    // printable, and valid unicode range
-    if (key >= 32 && key <= 0x10FFFF) {
+    if (MP_KEY_IS_UNICODE(key)) {
         mp_append_utf8_bstr(NULL, buf, key);
         return;
     }
@@ -297,6 +320,16 @@ void mp_print_key_list(struct mp_log *out)
     mp_info(out, "\n");
     for (int i = 0; key_names[i].name != NULL; i++)
         mp_info(out, "%s\n", key_names[i].name);
+}
+
+char **mp_get_key_list(void)
+{
+    char **list = NULL;
+    int num = 0;
+    for (int i = 0; key_names[i].name != NULL; i++)
+        MP_TARRAY_APPEND(NULL, list, num, talloc_strdup(NULL, key_names[i].name));
+    MP_TARRAY_APPEND(NULL, list, num, NULL);
+    return list;
 }
 
 int mp_normalize_keycode(int keycode)

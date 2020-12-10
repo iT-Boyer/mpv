@@ -24,120 +24,32 @@
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/CGLIOSurface.h>
 
+#include <libavutil/hwcontext.h>
+
+#include "config.h"
+
 #include "video/mp_image_pool.h"
-#include "hwdec.h"
-#include "common/global.h"
-#include "options/options.h"
+#include "video/out/gpu/hwdec.h"
+#include "ra_gl.h"
 
-struct vt_gl_plane_format {
-    GLenum gl_format;
-    GLenum gl_type;
-    GLenum gl_internal_format;
-    char swizzle[5];
-};
-
-struct vt_format {
-    uint32_t cvpixfmt;
-    int imgfmt;
-    int planes;
-    struct vt_gl_plane_format gl[MP_MAX_PLANES];
+struct priv_owner {
+    struct mp_hwdec_ctx hwctx;
 };
 
 struct priv {
-    struct mp_hwdec_ctx hwctx;
-    struct mp_vt_ctx vtctx;
-
     CVPixelBufferRef pbuf;
     GLuint gl_planes[MP_MAX_PLANES];
+
+    struct ra_imgfmt_desc desc;
 };
 
-static struct vt_format vt_formats[] = {
-    {
-        .cvpixfmt = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-        .imgfmt = IMGFMT_NV12,
-        .planes = 2,
-        .gl = {
-            { GL_RED, GL_UNSIGNED_BYTE, GL_RED },
-            { GL_RG,  GL_UNSIGNED_BYTE, GL_RG } ,
-        }
-    },
-    {
-        .cvpixfmt = kCVPixelFormatType_422YpCbCr8,
-        .imgfmt = IMGFMT_UYVY,
-        .planes = 1,
-        .gl = {
-            { GL_RGB_422_APPLE, GL_UNSIGNED_SHORT_8_8_APPLE, GL_RGB, "gbra" }
-        }
-    },
-    {
-        .cvpixfmt = kCVPixelFormatType_32BGRA,
-        .imgfmt = IMGFMT_RGB0,
-        .planes = 1,
-        .gl = {
-            { GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, GL_RGBA }
-        }
-    },
-};
-
-static struct vt_format *vt_get_gl_format(uint32_t cvpixfmt)
+static bool check_hwdec(struct ra_hwdec *hw)
 {
-    for (int i = 0; i < MP_ARRAY_SIZE(vt_formats); i++) {
-        if (vt_formats[i].cvpixfmt == cvpixfmt)
-            return &vt_formats[i];
-    }
-    return NULL;
-}
+    if (!ra_is_gl(hw->ra))
+        return false;
 
-static struct vt_format *vt_get_gl_format_from_imgfmt(uint32_t imgfmt)
-{
-    for (int i = 0; i < MP_ARRAY_SIZE(vt_formats); i++) {
-        if (vt_formats[i].imgfmt == imgfmt)
-            return &vt_formats[i];
-    }
-    return NULL;
-}
-
-static struct mp_image *download_image(struct mp_hwdec_ctx *ctx,
-                                       struct mp_image *hw_image,
-                                       struct mp_image_pool *swpool)
-{
-    if (hw_image->imgfmt != IMGFMT_VIDEOTOOLBOX)
-        return NULL;
-
-    struct mp_image *image = NULL;
-    CVPixelBufferRef pbuf = (CVPixelBufferRef)hw_image->planes[3];
-    CVPixelBufferLockBaseAddress(pbuf, kCVPixelBufferLock_ReadOnly);
-    size_t width  = CVPixelBufferGetWidth(pbuf);
-    size_t height = CVPixelBufferGetHeight(pbuf);
-    uint32_t cvpixfmt = CVPixelBufferGetPixelFormatType(pbuf);
-    struct vt_format *f = vt_get_gl_format(cvpixfmt);
-    if (!f)
-        goto unlock;
-
-    struct mp_image img = {0};
-    mp_image_setfmt(&img, f->imgfmt);
-    mp_image_set_size(&img, width, height);
-
-    for (int i = 0; i < f->planes; i++) {
-        void *base    = CVPixelBufferGetBaseAddressOfPlane(pbuf, i);
-        size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pbuf, i);
-        img.planes[i] = base;
-        img.stride[i] = stride;
-    }
-
-    mp_image_copy_attributes(&img, hw_image);
-
-    image = mp_image_pool_new_copy(swpool, &img);
-
-unlock:
-    CVPixelBufferUnlockBaseAddress(pbuf, kCVPixelBufferLock_ReadOnly);
-
-    return image;
-}
-
-static bool check_hwdec(struct gl_hwdec *hw)
-{
-    if (hw->gl->version < 300) {
+    GL *gl = ra_gl_get(hw->ra);
+    if (gl->version < 300) {
         MP_ERR(hw, "need >= OpenGL 3.0 for core rectangle texture support\n");
         return false;
     }
@@ -150,126 +62,160 @@ static bool check_hwdec(struct gl_hwdec *hw)
     return true;
 }
 
-static uint32_t get_vt_fmt(struct mp_vt_ctx *vtctx)
+static int init(struct ra_hwdec *hw)
 {
-    struct gl_hwdec *hw = vtctx->priv;
-    struct vt_format *f =
-        vt_get_gl_format_from_imgfmt(hw->global->opts->videotoolbox_format);
-    return f ? f->cvpixfmt : (uint32_t)-1;
-}
+    struct priv_owner *p = hw->priv;
 
-static int create(struct gl_hwdec *hw)
-{
     if (!check_hwdec(hw))
         return -1;
 
-    struct priv *p = talloc_zero(hw, struct priv);
-    hw->priv = p;
-
-    hw->gl->GenTextures(MP_MAX_PLANES, p->gl_planes);
-
-    p->vtctx = (struct mp_vt_ctx){
-        .priv = hw,
-        .get_vt_fmt = get_vt_fmt,
-    };
     p->hwctx = (struct mp_hwdec_ctx){
-        .type = HWDEC_VIDEOTOOLBOX,
-        .download_image = download_image,
-        .ctx = &p->vtctx,
+        .driver_name = hw->driver->name,
     };
+
+    av_hwdevice_ctx_create(&p->hwctx.av_device_ref, AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                           NULL, NULL, 0);
+
     hwdec_devices_add(hw->devs, &p->hwctx);
 
     return 0;
 }
 
-static int reinit(struct gl_hwdec *hw, struct mp_image_params *params)
+static void uninit(struct ra_hwdec *hw)
 {
-    assert(params->imgfmt == hw->driver->imgfmt);
+    struct priv_owner *p = hw->priv;
 
-    struct vt_format *f = vt_get_gl_format(params->hw_subfmt);
-    if (!f) {
-        MP_ERR(hw, "Unsupported CVPixelBuffer format.\n");
+    hwdec_devices_remove(hw->devs, &p->hwctx);
+    av_buffer_unref(&p->hwctx.av_device_ref);
+}
+
+static int mapper_init(struct ra_hwdec_mapper *mapper)
+{
+    struct priv *p = mapper->priv;
+    GL *gl = ra_gl_get(mapper->ra);
+
+    gl->GenTextures(MP_MAX_PLANES, p->gl_planes);
+
+    mapper->dst_params = mapper->src_params;
+    mapper->dst_params.imgfmt = mapper->src_params.hw_subfmt;
+    mapper->dst_params.hw_subfmt = 0;
+
+    if (!mapper->dst_params.imgfmt) {
+        MP_ERR(mapper, "Unsupported CVPixelBuffer format.\n");
         return -1;
     }
 
-    params->imgfmt = f->imgfmt;
+    if (!ra_get_imgfmt_desc(mapper->ra, mapper->dst_params.imgfmt, &p->desc)) {
+        MP_ERR(mapper, "Unsupported texture format.\n");
+        return -1;
+    }
+
+    for (int n = 0; n < p->desc.num_planes; n++) {
+        if (p->desc.planes[n]->ctype != RA_CTYPE_UNORM) {
+            MP_ERR(mapper, "Format unsupported.\n");
+            return -1;
+        }
+    }
     return 0;
 }
 
-static int map_frame(struct gl_hwdec *hw, struct mp_image *hw_image,
-                     struct gl_hwdec_frame *out_frame)
+static void mapper_unmap(struct ra_hwdec_mapper *mapper)
 {
-    struct priv *p = hw->priv;
-    GL *gl = hw->gl;
+    struct priv *p = mapper->priv;
+
+    // Is this sane? No idea how to release the texture without deleting it.
+    CVPixelBufferRelease(p->pbuf);
+    p->pbuf = NULL;
+
+    for (int i = 0; i < p->desc.num_planes; i++)
+        ra_tex_free(mapper->ra, &mapper->tex[i]);
+}
+
+static int mapper_map(struct ra_hwdec_mapper *mapper)
+{
+    struct priv *p = mapper->priv;
+    GL *gl = ra_gl_get(mapper->ra);
 
     CVPixelBufferRelease(p->pbuf);
-    p->pbuf = (CVPixelBufferRef)hw_image->planes[3];
+    p->pbuf = (CVPixelBufferRef)mapper->src->planes[3];
     CVPixelBufferRetain(p->pbuf);
     IOSurfaceRef surface = CVPixelBufferGetIOSurface(p->pbuf);
     if (!surface) {
-        MP_ERR(hw, "CVPixelBuffer has no IOSurface\n");
-        return -1;
-    }
-
-    uint32_t cvpixfmt = CVPixelBufferGetPixelFormatType(p->pbuf);
-    struct vt_format *f = vt_get_gl_format(cvpixfmt);
-    if (!f) {
-        MP_ERR(hw, "CVPixelBuffer has unsupported format type\n");
+        MP_ERR(mapper, "CVPixelBuffer has no IOSurface\n");
         return -1;
     }
 
     const bool planar = CVPixelBufferIsPlanar(p->pbuf);
     const int planes  = CVPixelBufferGetPlaneCount(p->pbuf);
-    assert(planar && planes == f->planes || f->planes == 1);
+    assert((planar && planes == p->desc.num_planes) || p->desc.num_planes == 1);
 
     GLenum gl_target = GL_TEXTURE_RECTANGLE;
 
-    for (int i = 0; i < f->planes; i++) {
+    for (int i = 0; i < p->desc.num_planes; i++) {
+        const struct ra_format *fmt = p->desc.planes[i];
+
+        GLint internal_format;
+        GLenum format;
+        GLenum type;
+        ra_gl_get_format(fmt, &internal_format, &format, &type);
+
         gl->BindTexture(gl_target, p->gl_planes[i]);
 
         CGLError err = CGLTexImageIOSurface2D(
             CGLGetCurrentContext(), gl_target,
-            f->gl[i].gl_internal_format,
+            internal_format,
             IOSurfaceGetWidthOfPlane(surface, i),
             IOSurfaceGetHeightOfPlane(surface, i),
-            f->gl[i].gl_format, f->gl[i].gl_type, surface, i);
-
-        if (err != kCGLNoError)
-            MP_ERR(hw, "error creating IOSurface texture for plane %d: %s (%x)\n",
-                   i, CGLErrorString(err), gl->GetError());
+            format, type, surface, i);
 
         gl->BindTexture(gl_target, 0);
 
-        out_frame->planes[i] = (struct gl_hwdec_plane){
-            .gl_texture = p->gl_planes[i],
-            .gl_target = gl_target,
-            .tex_w = IOSurfaceGetWidthOfPlane(surface, i),
-            .tex_h = IOSurfaceGetHeightOfPlane(surface, i),
+        if (err != kCGLNoError) {
+            MP_ERR(mapper,
+                   "error creating IOSurface texture for plane %d: %s (%x)\n",
+                   i, CGLErrorString(err), gl->GetError());
+            return -1;
+        }
+
+        struct ra_tex_params params = {
+            .dimensions = 2,
+            .w = IOSurfaceGetWidthOfPlane(surface, i),
+            .h = IOSurfaceGetHeightOfPlane(surface, i),
+            .d = 1,
+            .format = fmt,
+            .render_src = true,
+            .src_linear = true,
+            .non_normalized = gl_target == GL_TEXTURE_RECTANGLE,
         };
-        snprintf(out_frame->planes[i].swizzle, sizeof(out_frame->planes[i].swizzle),
-                 "%s", f->gl[i].swizzle);
+
+        mapper->tex[i] = ra_create_wrapped_tex(mapper->ra, &params,
+                                               p->gl_planes[i]);
+        if (!mapper->tex[i])
+            return -1;
     }
 
     return 0;
 }
 
-static void destroy(struct gl_hwdec *hw)
+static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 {
-    struct priv *p = hw->priv;
-    GL *gl = hw->gl;
+    struct priv *p = mapper->priv;
+    GL *gl = ra_gl_get(mapper->ra);
 
-    CVPixelBufferRelease(p->pbuf);
     gl->DeleteTextures(MP_MAX_PLANES, p->gl_planes);
-
-    hwdec_devices_remove(hw->devs, &p->hwctx);
 }
 
-const struct gl_hwdec_driver gl_hwdec_videotoolbox = {
+const struct ra_hwdec_driver ra_hwdec_videotoolbox = {
     .name = "videotoolbox",
-    .api = HWDEC_VIDEOTOOLBOX,
-    .imgfmt = IMGFMT_VIDEOTOOLBOX,
-    .create = create,
-    .reinit = reinit,
-    .map_frame = map_frame,
-    .destroy = destroy,
+    .priv_size = sizeof(struct priv_owner),
+    .imgfmts = {IMGFMT_VIDEOTOOLBOX, 0},
+    .init = init,
+    .uninit = uninit,
+    .mapper = &(const struct ra_hwdec_mapper_driver){
+        .priv_size = sizeof(struct priv),
+        .init = mapper_init,
+        .uninit = mapper_uninit,
+        .map = mapper_map,
+        .unmap = mapper_unmap,
+    },
 };

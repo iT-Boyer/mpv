@@ -29,6 +29,7 @@
 #include "common/msg.h"
 #include "input/input.h"
 #include "libmpv/client.h"
+#include "options/m_config.h"
 #include "options/options.h"
 #include "player/client.h"
 
@@ -222,7 +223,6 @@ static void *client_thread(void *p)
     MP_VERBOSE(arg, "Client connected\n");
 
     mpv_set_wakeup_callback(arg->client, wakeup_cb, wakeup_event);
-    mpv_suspend(arg->client);
 
     // Do the first read operation on the pipe
     if ((ioerr = async_read(arg->client_h, buf, 4096, &ol))) {
@@ -233,11 +233,8 @@ static void *client_thread(void *p)
     while (1) {
         HANDLE handles[] = { wakeup_event, ol.hEvent };
         int n = WaitForMultipleObjects(2, handles, FALSE, 0);
-        if (n == WAIT_TIMEOUT) {
-            mpv_resume(arg->client);
+        if (n == WAIT_TIMEOUT)
             n = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-            mpv_suspend(arg->client);
-        }
 
         switch (n) {
         case WAIT_OBJECT_0: // wakeup_event
@@ -308,7 +305,7 @@ done:
         CloseHandle(arg->write_ol.hEvent);
 
     CloseHandle(arg->client_h);
-    mpv_detach_destroy(arg->client);
+    mpv_destroy(arg->client);
     talloc_free(arg);
     return NULL;
 }
@@ -320,7 +317,7 @@ static void ipc_start_client(struct mp_ipc_ctx *ctx, struct client_arg *client)
 
     pthread_t client_thr;
     if (pthread_create(&client_thr, NULL, client_thread, client)) {
-        mpv_detach_destroy(client->client);
+        mpv_destroy(client->client);
         CloseHandle(client->client_h);
         talloc_free(client);
     }
@@ -336,6 +333,12 @@ static void ipc_start_client_json(struct mp_ipc_ctx *ctx, int id, HANDLE h)
     };
 
     ipc_start_client(ctx, client);
+}
+
+bool mp_ipc_start_anon_client(struct mp_ipc_ctx *ctx, struct mpv_handle *h,
+                              int out_fd[2])
+{
+    return false;
 }
 
 static void *ipc_thread(void *p)
@@ -380,6 +383,8 @@ static void *ipc_thread(void *p)
             mp_LastError_to_str());
         goto done;
     }
+
+    MP_VERBOSE(arg, "Listening to IPC pipe.\n");
 
     while (1) {
         DWORD err = ConnectNamedPipe(server, &ol) ? 0 : GetLastError();
@@ -451,7 +456,7 @@ done:
 struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
                                struct mpv_global *global)
 {
-    struct MPOpts *opts = global->opts;
+    struct MPOpts *opts = mp_get_config_group(NULL, global, &mp_opt_root);
 
     struct mp_ipc_ctx *arg = talloc_ptrtype(NULL, arg);
     *arg = (struct mp_ipc_ctx){
@@ -480,12 +485,14 @@ struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
     if (pthread_create(&arg->thread, NULL, ipc_thread, arg))
         goto out;
 
+    talloc_free(opts);
     return arg;
 
 out:
     if (arg->death_event)
         CloseHandle(arg->death_event);
     talloc_free(arg);
+    talloc_free(opts);
     return NULL;
 }
 

@@ -18,10 +18,8 @@
 #include <stddef.h>
 #include <assert.h>
 
-#include <GL/glx.h>
-
-#include "hwdec.h"
-#include "utils.h"
+#include "video/out/gpu/hwdec.h"
+#include "ra_gl.h"
 #include "video/vdpau.h"
 #include "video/vdpau_mixer.h"
 
@@ -29,120 +27,126 @@
 // follow it. I'm not sure about the original nvidia headers.
 #define BRAINDEATH(x) ((void *)(uintptr_t)(x))
 
-static int reinit(struct gl_hwdec *hw, struct mp_image_params *params);
+struct priv_owner {
+    struct mp_vdpau_ctx *ctx;
+};
 
 struct priv {
-    struct mp_log *log;
     struct mp_vdpau_ctx *ctx;
+    GL *gl;
     uint64_t preemption_counter;
-    struct mp_image_params image_params;
     GLuint gl_texture;
     bool vdpgl_initialized;
     GLvdpauSurfaceNV vdpgl_surface;
     VdpOutputSurface vdp_surface;
     struct mp_vdpau_mixer *mixer;
+    struct ra_imgfmt_desc direct_desc;
     bool mapped;
 };
 
-static void unmap(struct gl_hwdec *hw)
+static int init(struct ra_hwdec *hw)
 {
-    struct priv *p = hw->priv;
-    GL *gl = hw->gl;
+    Display *x11disp = ra_get_native_resource(hw->ra, "x11");
+    if (!x11disp || !ra_is_gl(hw->ra))
+        return -1;
+    GL *gl = ra_gl_get(hw->ra);
+    if (!(gl->mpgl_caps & MPGL_CAP_VDPAU))
+        return -1;
+    struct priv_owner *p = hw->priv;
+    p->ctx = mp_vdpau_create_device_x11(hw->log, x11disp, true);
+    if (!p->ctx)
+        return -1;
+    if (mp_vdpau_handle_preemption(p->ctx, NULL) < 1)
+        return -1;
+    if (hw->probing && mp_vdpau_guess_if_emulated(p->ctx))
+        return -1;
+    p->ctx->hwctx.driver_name = hw->driver->name;
+    hwdec_devices_add(hw->devs, &p->ctx->hwctx);
+    return 0;
+}
 
-    if (p->mapped)
+static void uninit(struct ra_hwdec *hw)
+{
+    struct priv_owner *p = hw->priv;
+
+    if (p->ctx)
+        hwdec_devices_remove(hw->devs, &p->ctx->hwctx);
+    mp_vdpau_destroy(p->ctx);
+}
+
+static void mapper_unmap(struct ra_hwdec_mapper *mapper)
+{
+    struct priv *p = mapper->priv;
+    GL *gl = p->gl;
+
+    for (int n = 0; n < 4; n++)
+        ra_tex_free(mapper->ra, &mapper->tex[n]);
+
+    if (p->mapped) {
         gl->VDPAUUnmapSurfacesNV(1, &p->vdpgl_surface);
+    }
     p->mapped = false;
 }
 
-static void mark_vdpau_objects_uninitialized(struct gl_hwdec *hw)
+static void mark_vdpau_objects_uninitialized(struct ra_hwdec_mapper *mapper)
 {
-    struct priv *p = hw->priv;
+    struct priv *p = mapper->priv;
 
     p->vdp_surface = VDP_INVALID_HANDLE;
     p->mapped = false;
 }
 
-static void destroy_objects(struct gl_hwdec *hw)
+static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 {
-    struct priv *p = hw->priv;
-    GL *gl = hw->gl;
+    struct priv *p = mapper->priv;
+    GL *gl = p->gl;
     struct vdp_functions *vdp = &p->ctx->vdp;
     VdpStatus vdp_st;
 
-    unmap(hw);
+    assert(!p->mapped);
 
     if (p->vdpgl_surface)
         gl->VDPAUUnregisterSurfaceNV(p->vdpgl_surface);
     p->vdpgl_surface = 0;
 
-    glDeleteTextures(1, &p->gl_texture);
-    p->gl_texture = 0;
+    gl->DeleteTextures(1, &p->gl_texture);
 
     if (p->vdp_surface != VDP_INVALID_HANDLE) {
         vdp_st = vdp->output_surface_destroy(p->vdp_surface);
-        CHECK_VDP_WARNING(p, "Error when calling vdp_output_surface_destroy");
+        CHECK_VDP_WARNING(mapper, "Error when calling vdp_output_surface_destroy");
     }
     p->vdp_surface = VDP_INVALID_HANDLE;
 
-    gl_check_error(gl, hw->log, "Before uninitializing OpenGL interop");
+    gl_check_error(gl, mapper->log, "Before uninitializing OpenGL interop");
 
     if (p->vdpgl_initialized)
         gl->VDPAUFiniNV();
 
     p->vdpgl_initialized = false;
 
-    gl_check_error(gl, hw->log, "After uninitializing OpenGL interop");
-}
+    gl_check_error(gl, mapper->log, "After uninitializing OpenGL interop");
 
-static void destroy(struct gl_hwdec *hw)
-{
-    struct priv *p = hw->priv;
-
-    destroy_objects(hw);
     mp_vdpau_mixer_destroy(p->mixer);
-    if (p->ctx)
-        hwdec_devices_remove(hw->devs, &p->ctx->hwctx);
-    mp_vdpau_destroy(p->ctx);
 }
 
-static int create(struct gl_hwdec *hw)
+static int mapper_init(struct ra_hwdec_mapper *mapper)
 {
-    GL *gl = hw->gl;
-    Display *x11disp = glXGetCurrentDisplay();
-    if (!x11disp)
-        return -1;
-    if (!(gl->mpgl_caps & MPGL_CAP_VDPAU))
-        return -1;
-    struct priv *p = talloc_zero(hw, struct priv);
-    hw->priv = p;
-    p->log = hw->log;
-    p->ctx = mp_vdpau_create_device_x11(hw->log, x11disp, true);
-    if (!p->ctx)
-        return -1;
-    if (mp_vdpau_handle_preemption(p->ctx, &p->preemption_counter) < 1)
-        return -1;
-    p->vdp_surface = VDP_INVALID_HANDLE;
-    p->mixer = mp_vdpau_mixer_create(p->ctx, hw->log);
-    if (hw->probing && mp_vdpau_guess_if_emulated(p->ctx)) {
-        destroy(hw);
-        return -1;
-    }
-    p->ctx->hwctx.driver_name = hw->driver->name;
-    hwdec_devices_add(hw->devs, &p->ctx->hwctx);
-    return 0;
-}
+    struct priv_owner *p_owner = mapper->owner->priv;
+    struct priv *p = mapper->priv;
 
-static int reinit(struct gl_hwdec *hw, struct mp_image_params *params)
-{
-    struct priv *p = hw->priv;
-    GL *gl = hw->gl;
+    p->gl = ra_gl_get(mapper->ra);
+    p->ctx = p_owner->ctx;
+
+    GL *gl = p->gl;
     struct vdp_functions *vdp = &p->ctx->vdp;
     VdpStatus vdp_st;
 
-    destroy_objects(hw);
+    p->vdp_surface = VDP_INVALID_HANDLE;
+    p->mixer = mp_vdpau_mixer_create(p->ctx, mapper->log);
+    if (!p->mixer)
+        return -1;
 
-    assert(params->imgfmt == hw->driver->imgfmt);
-    p->image_params = *params;
+    mapper->dst_params = mapper->src_params;
 
     if (mp_vdpau_handle_preemption(p->ctx, &p->preemption_counter) < 0)
         return -1;
@@ -151,18 +155,21 @@ static int reinit(struct gl_hwdec *hw, struct mp_image_params *params)
 
     p->vdpgl_initialized = true;
 
-    vdp_st = vdp->output_surface_create(p->ctx->vdp_device,
-                                        VDP_RGBA_FORMAT_B8G8R8A8,
-                                        params->w, params->h, &p->vdp_surface);
-    CHECK_VDP_ERROR(p, "Error when calling vdp_output_surface_create");
-
     gl->GenTextures(1, &p->gl_texture);
+
     gl->BindTexture(GL_TEXTURE_2D, p->gl_texture);
     gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     gl->BindTexture(GL_TEXTURE_2D, 0);
+
+    vdp_st = vdp->output_surface_create(p->ctx->vdp_device,
+                                        VDP_RGBA_FORMAT_B8G8R8A8,
+                                        mapper->src_params.w,
+                                        mapper->src_params.h,
+                                        &p->vdp_surface);
+    CHECK_VDP_ERROR(mapper, "Error when calling vdp_output_surface_create");
 
     p->vdpgl_surface = gl->VDPAURegisterOutputSurfaceNV(BRAINDEATH(p->vdp_surface),
                                                         GL_TEXTURE_2D,
@@ -172,55 +179,71 @@ static int reinit(struct gl_hwdec *hw, struct mp_image_params *params)
 
     gl->VDPAUSurfaceAccessNV(p->vdpgl_surface, GL_READ_ONLY);
 
-    gl_check_error(gl, hw->log, "After initializing vdpau OpenGL interop");
+    mapper->dst_params.imgfmt = IMGFMT_RGB0;
+    mapper->dst_params.hw_subfmt = 0;
 
-    params->imgfmt = IMGFMT_RGB0;
+    gl_check_error(gl, mapper->log, "After initializing vdpau OpenGL interop");
 
     return 0;
 }
 
-static int map_frame(struct gl_hwdec *hw, struct mp_image *hw_image,
-                     struct gl_hwdec_frame *out_frame)
+static int mapper_map(struct ra_hwdec_mapper *mapper)
 {
-    struct priv *p = hw->priv;
-    GL *gl = hw->gl;
+    struct priv *p = mapper->priv;
+    GL *gl = p->gl;
 
     int pe = mp_vdpau_handle_preemption(p->ctx, &p->preemption_counter);
     if (pe < 1) {
-        mark_vdpau_objects_uninitialized(hw);
+        mark_vdpau_objects_uninitialized(mapper);
         if (pe < 0)
             return -1;
-        if (reinit(hw, &p->image_params) < 0)
+        mapper_uninit(mapper);
+        if (mapper_init(mapper) < 0)
             return -1;
     }
 
     if (!p->vdpgl_surface)
         return -1;
 
-    mp_vdpau_mixer_render(p->mixer, NULL, p->vdp_surface, NULL, hw_image, NULL);
+    mp_vdpau_mixer_render(p->mixer, NULL, p->vdp_surface, NULL, mapper->src,
+                            NULL);
 
     gl->VDPAUMapSurfacesNV(1, &p->vdpgl_surface);
+
     p->mapped = true;
-    *out_frame = (struct gl_hwdec_frame){
-        .planes = {
-            {
-                .gl_texture = p->gl_texture,
-                .gl_target = GL_TEXTURE_2D,
-                .tex_w = p->image_params.w,
-                .tex_h = p->image_params.h,
-            },
-        },
+
+    struct ra_tex_params params = {
+        .dimensions = 2,
+        .w = mapper->src_params.w,
+        .h = mapper->src_params.h,
+        .d = 1,
+        .format = ra_find_unorm_format(mapper->ra, 1, 4),
+        .render_src = true,
+        .src_linear = true,
     };
+
+    if (!params.format)
+        return -1;
+
+    mapper->tex[0] =
+        ra_create_wrapped_tex(mapper->ra, &params, p->gl_texture);
+    if (!mapper->tex[0])
+        return -1;
+
     return 0;
 }
 
-const struct gl_hwdec_driver gl_hwdec_vdpau = {
-    .name = "vdpau-glx",
-    .api = HWDEC_VDPAU,
-    .imgfmt = IMGFMT_VDPAU,
-    .create = create,
-    .reinit = reinit,
-    .map_frame = map_frame,
-    .unmap = unmap,
-    .destroy = destroy,
+const struct ra_hwdec_driver ra_hwdec_vdpau = {
+    .name = "vdpau-gl",
+    .priv_size = sizeof(struct priv_owner),
+    .imgfmts = {IMGFMT_VDPAU, 0},
+    .init = init,
+    .uninit = uninit,
+    .mapper = &(const struct ra_hwdec_mapper_driver){
+        .priv_size = sizeof(struct priv),
+        .init = mapper_init,
+        .uninit = mapper_uninit,
+        .map = mapper_map,
+        .unmap = mapper_unmap,
+    },
 };

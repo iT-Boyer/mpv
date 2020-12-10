@@ -10,14 +10,15 @@ export PYTHON=/usr/bin/python3
 "$PYTHON" bootstrap.py
 "$PYTHON" waf configure \
     --check-c-compiler=gcc \
-    --disable-cdda \
-    --enable-egl-angle \
-    --enable-gpl3 \
+    --enable-spirv-cross \
+    --enable-d3d-hwaccel \
+    --enable-d3d11 \
     --enable-jpeg \
     --enable-lcms2 \
     --enable-libarchive \
-    --enable-libass \
     --enable-lua \
     --enable-rubberband \
-    --enable-uchardet
+    --enable-shaderc \
+    --enable-uchardet \
+    --enable-vulkan
 "$PYTHON" waf build

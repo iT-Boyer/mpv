@@ -1,18 +1,18 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_SUB_H
@@ -28,18 +28,9 @@
 enum sub_bitmap_format {
     SUBBITMAP_EMPTY = 0,// no bitmaps; always has num_parts==0
     SUBBITMAP_LIBASS,   // A8, with a per-surface blend color (libass.color)
-    SUBBITMAP_RGBA,     // B8G8R8A8 (MSB=A, LSB=B), scaled, premultiplied alpha
-    SUBBITMAP_INDEXED,  // scaled, bitmap points to osd_bmp_indexed
+    SUBBITMAP_RGBA,     // IMGFMT_BGRA (MSB=A, LSB=B), scaled, premultiplied alpha
 
     SUBBITMAP_COUNT
-};
-
-// For SUBBITMAP_INDEXED
-struct osd_bmp_indexed {
-    uint8_t *bitmap;
-    // Each entry is like a pixel in SUBBITMAP_RGBA format, but using straight
-    // alpha.
-    uint32_t palette[256];
 };
 
 struct sub_bitmap {
@@ -50,6 +41,11 @@ struct sub_bitmap {
     int w, h;
     int x, y;
     int dw, dh;
+
+    // If the containing struct sub_bitmaps has the packed field set, then this
+    // is the position within the source. (Strictly speaking this is redundant
+    // with the bitmap pointer.)
+    int src_x, src_y;
 
     struct {
         uint32_t color;
@@ -62,21 +58,50 @@ struct sub_bitmaps {
 
     enum sub_bitmap_format format;
 
-    // If false, dw==w && dh==h.
-    // SUBBITMAP_LIBASS is never scaled.
-    bool scaled;
-
     struct sub_bitmap *parts;
     int num_parts;
 
-    int change_id;  // Incremented on each change
+    // Packed representation of the bitmap data. If non-NULL, then the
+    // parts[].bitmap pointer points into the image data here (and stride will
+    // correspond to packed->stride[0]).
+    //  SUBBITMAP_RGBA: IMGFMT_BGRA (exact match)
+    //  SUBBITMAP_LIBASS: IMGFMT_Y8 (not the same, but compatible layout)
+    // Other formats have this set to NULL.
+    struct mp_image *packed;
+
+    // Bounding box for the packed image. All parts will be within the bounding
+    // box. (The origin of the box is at (0,0).)
+    int packed_w, packed_h;
+
+    int change_id;  // Incremented on each change (0 is never used)
 };
+
+struct sub_bitmap_list {
+    // Combined change_id - of any of the existing items change (even if they
+    // e.g. go away and are removed from items[]), this is incremented.
+    int64_t change_id;
+
+    // Bounding box for rendering. It's notable that SUBBITMAP_LIBASS images are
+    // always within these bounds, while SUBBITMAP_RGBA is not necessarily.
+    int w, h;
+
+    // Sorted by sub_bitmaps.render_index. Unused parts are not in the array,
+    // and you cannot index items[] with render_index.
+    struct sub_bitmaps **items;
+    int num_items;
+};
+
+struct sub_bitmap_copy_cache;
+struct sub_bitmaps *sub_bitmaps_copy(struct sub_bitmap_copy_cache **cache,
+                                     struct sub_bitmaps *in);
 
 struct mp_osd_res {
     int w, h; // screen dimensions, including black borders
     int mt, mb, ml, mr; // borders (top, bottom, left, right)
     double display_par;
 };
+
+bool osd_res_equals(struct mp_osd_res a, struct mp_osd_res b);
 
 // 0 <= sub_bitmaps.render_index < MAX_OSD_PARTS
 #define MAX_OSD_PARTS 5
@@ -130,6 +155,8 @@ struct osd_style_opts {
     float blur;
     int bold;
     int italic;
+    int justify;
+    int font_provider;
 };
 
 extern const struct m_sub_options osd_style_conf;
@@ -141,8 +168,7 @@ struct mpv_global;
 struct dec_sub;
 
 struct osd_state *osd_create(struct mpv_global *global);
-void osd_changed(struct osd_state *osd, int new_value);
-void osd_changed_all(struct osd_state *osd);
+void osd_changed(struct osd_state *osd);
 void osd_free(struct osd_state *osd);
 
 bool osd_query_and_reset_want_redraw(struct osd_state *osd);
@@ -152,6 +178,8 @@ void osd_set_sub(struct osd_state *osd, int index, struct dec_sub *dec_sub);
 
 bool osd_get_render_subs_in_filter(struct osd_state *osd);
 void osd_set_render_subs_in_filter(struct osd_state *osd, bool s);
+void osd_set_force_video_pts(struct osd_state *osd, double video_pts);
+double osd_get_force_video_pts(struct osd_state *osd);
 
 struct osd_progbar_state {
     int type;           // <0: disabled, 1-255: symbol, else: no symbol
@@ -174,8 +202,12 @@ void osd_draw(struct osd_state *osd, struct mp_osd_res res,
               const bool formats[SUBBITMAP_COUNT],
               void (*cb)(void *ctx, struct sub_bitmaps *imgs), void *cb_ctx);
 
+struct sub_bitmap_list *osd_render(struct osd_state *osd, struct mp_osd_res res,
+                                   double video_pts, int draw_flags,
+                                   const bool formats[SUBBITMAP_COUNT]);
+
 struct mp_image;
-bool osd_draw_on_image(struct osd_state *osd, struct mp_osd_res res,
+void osd_draw_on_image(struct osd_state *osd, struct mp_osd_res res,
                        double video_pts, int draw_flags, struct mp_image *dest);
 
 struct mp_image_pool;
@@ -193,18 +225,22 @@ struct mp_osd_res osd_get_vo_res(struct osd_state *osd);
 void osd_rescale_bitmaps(struct sub_bitmaps *imgs, int frame_w, int frame_h,
                          struct mp_osd_res res, double compensate_par);
 
+struct osd_external_ass {
+    void *owner; // unique pointer (NULL is also allowed)
+    int64_t id;
+    int format;
+    char *data;
+    int res_x, res_y;
+    int z;
+    bool hidden;
+
+    double *out_rc; // hack to pass boundary rect, [x0, y0, x1, y1]
+};
+
 // defined in osd_libass.c and osd_dummy.c
-
-// internal use only
-void osd_object_get_bitmaps(struct osd_state *osd, struct osd_object *obj,
-                            struct sub_bitmaps *out_imgs);
-void osd_init_backend(struct osd_state *osd);
-void osd_destroy_backend(struct osd_state *osd);
-
-void osd_set_external(struct osd_state *osd, void *id, int res_x, int res_y,
-                      char *text);
-
-// doesn't need locking
+void osd_set_external(struct osd_state *osd, struct osd_external_ass *ov);
+void osd_set_external_remove_owner(struct osd_state *osd, void *owner);
+void osd_get_text_size(struct osd_state *osd, int *out_screen_h, int *out_font_h);
 void osd_get_function_sym(char *buffer, size_t buffer_size, int osd_function);
 
 #endif /* MPLAYER_SUB_H */

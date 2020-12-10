@@ -4,13 +4,12 @@
 #include "common.h"
 
 struct gl_format {
+    const char *name;           // symbolic name for user interaction/debugging
     GLint internal_format;      // glTexImage argument
     GLenum format;              // glTexImage argument
     GLenum type;                // e.g. GL_UNSIGNED_SHORT
-    int flags;
+    int flags;                  // F_* flags
 };
-
-extern const struct gl_format gl_formats[];
 
 enum {
     // --- gl_format.flags
@@ -35,21 +34,14 @@ enum {
                            // the format is still GL_FLOAT (32 bit)
 
     // --- Other constants.
-    MPGL_TYPE_UNORM = 1,
-    MPGL_TYPE_UINT = 2,
-    MPGL_TYPE_FLOAT = 3,
+    MPGL_TYPE_UNORM = RA_CTYPE_UNORM,   // normalized integer (fixed point) formats
+    MPGL_TYPE_UINT  = RA_CTYPE_UINT,    // full integer formats
+    MPGL_TYPE_FLOAT = RA_CTYPE_FLOAT,   // float formats (both full and half)
 };
 
+extern const struct gl_format gl_formats[];
+
 int gl_format_feature_flags(GL *gl);
-const struct gl_format *gl_find_internal_format(GL *gl, GLint internal_format);
-const struct gl_format *gl_find_special_format(GL *gl, int mpfmt);
-const struct gl_format *gl_find_format(GL *gl, int type, int flags,
-                                       int bytes_per_component, int n_components);
-const struct gl_format *gl_find_unorm_format(GL *gl, int bytes_per_component,
-                                             int n_components);
-const struct gl_format *gl_find_uint_format(GL *gl, int bytes_per_component,
-                                            int n_components);
-const struct gl_format *gl_find_float16_format(GL *gl, int n_components);
 int gl_format_type(const struct gl_format *format);
 GLenum gl_integer_format_to_base(GLenum format);
 int gl_component_size(GLenum type);

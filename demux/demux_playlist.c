@@ -20,14 +20,18 @@
 #include <strings.h>
 #include <dirent.h>
 
+#include <libavutil/common.h>
+
 #include "config.h"
 #include "common/common.h"
 #include "options/options.h"
 #include "common/msg.h"
 #include "common/playlist.h"
+#include "misc/thread_tools.h"
 #include "options/path.h"
 #include "stream/stream.h"
 #include "osdep/io.h"
+#include "misc/natural_sort.h"
 #include "demux.h"
 
 #define PROBE_SIZE (8 * 1024)
@@ -46,7 +50,7 @@ static bool check_mimetype(struct stream *s, const char *const *list)
 struct pl_parser {
     struct mp_log *log;
     struct stream *s;
-    char buffer[8 * 1024];
+    char buffer[512 * 1024];
     int utf16;
     struct playlist *pl;
     bool error;
@@ -58,9 +62,78 @@ struct pl_parser {
     char *format;
 };
 
+
+static uint16_t stream_read_word_endian(stream_t *s, bool big_endian)
+{
+    unsigned int y = stream_read_char(s);
+    y = (y << 8) | stream_read_char(s);
+    if (!big_endian)
+        y = ((y >> 8) & 0xFF) | (y << 8);
+    return y;
+}
+
+// Read characters until the next '\n' (including), or until the buffer in s is
+// exhausted.
+static int read_characters(stream_t *s, uint8_t *dst, int dstsize, int utf16)
+{
+    if (utf16 == 1 || utf16 == 2) {
+        uint8_t *cur = dst;
+        while (1) {
+            if ((cur - dst) + 8 >= dstsize) // PUT_UTF8 writes max. 8 bytes
+                return -1; // line too long
+            uint32_t c;
+            uint8_t tmp;
+            GET_UTF16(c, stream_read_word_endian(s, utf16 == 2), return -1;)
+            if (s->eof)
+                break; // legitimate EOF; ignore the case of partial reads
+            PUT_UTF8(c, tmp, *cur++ = tmp;)
+            if (c == '\n')
+                break;
+        }
+        return cur - dst;
+    } else {
+        uint8_t buf[1024];
+        int buf_len = stream_read_peek(s, buf, sizeof(buf));
+        uint8_t *end = memchr(buf, '\n', buf_len);
+        int len = end ? end - buf + 1 : buf_len;
+        if (len > dstsize)
+            return -1; // line too long
+        memcpy(dst, buf, len);
+        stream_seek_skip(s, stream_tell(s) + len);
+        return len;
+    }
+}
+
+// On error, or if the line is larger than max-1, return NULL and unset s->eof.
+// On EOF, return NULL, and s->eof will be set.
+// Otherwise, return the line (including \n or \r\n at the end of the line).
+// If the return value is non-NULL, it's always the same as mem.
+// utf16: 0: UTF8 or 8 bit legacy, 1: UTF16-LE, 2: UTF16-BE
+static char *read_line(stream_t *s, char *mem, int max, int utf16)
+{
+    if (max < 1)
+        return NULL;
+    int read = 0;
+    while (1) {
+        // Reserve 1 byte of ptr for terminating \0.
+        int l = read_characters(s, &mem[read], max - read - 1, utf16);
+        if (l < 0 || memchr(&mem[read], '\0', l)) {
+            MP_WARN(s, "error reading line\n");
+            return NULL;
+        }
+        read += l;
+        if (l == 0 || (read > 0 && mem[read - 1] == '\n'))
+            break;
+    }
+    mem[read] = '\0';
+    if (!stream_read_peek(s, &(char){0}, 1) && read == 0) // legitimate EOF
+        return NULL;
+    return mem;
+}
+
 static char *pl_get_line0(struct pl_parser *p)
 {
-    char *res = stream_read_line(p->s, p->buffer, sizeof(p->buffer), p->utf16);
+    char *res = read_line(p->s, p->buffer, sizeof(p->buffer), p->utf16);
     if (res) {
         int len = strlen(res);
         if (len > 0 && res[len - 1] == '\n')
@@ -105,7 +178,9 @@ static int parse_m3u(struct pl_parser *p)
         // Last resort: if the file extension is m3u, it might be headerless.
         if (p->check_level == DEMUX_CHECK_UNSAFE) {
             char *ext = mp_splitext(p->real_stream->url, NULL);
-            bstr data = stream_peek(p->real_stream, PROBE_SIZE);
+            char probe[PROBE_SIZE];
+            int len = stream_read_peek(p->real_stream, probe, sizeof(probe));
+            bstr data = {probe, len};
             if (ext && data.len > 10 && maybe_text(data)) {
                 const char *exts[] = {"m3u", "m3u8", NULL};
                 for (int n = 0; exts[n]; n++) {
@@ -177,12 +252,13 @@ static int parse_ref_init(struct pl_parser *p)
     return 0;
 }
 
-static int parse_pls(struct pl_parser *p)
+static int parse_ini_thing(struct pl_parser *p, const char *header,
+                           const char *entry)
 {
     bstr line = {0};
     while (!line.len && !pl_eof(p))
         line = bstr_strip(pl_get_line(p));
-    if (bstrcasecmp0(line, "[playlist]") != 0)
+    if (bstrcasecmp0(line, header) != 0)
         return -1;
     if (p->probing)
         return 0;
@@ -190,7 +266,7 @@ static int parse_pls(struct pl_parser *p)
         line = bstr_strip(pl_get_line(p));
         bstr key, value;
         if (bstr_split_tok(line, "=", &key, &value) &&
-            bstr_case_startswith(key, bstr0("File")))
+            bstr_case_startswith(key, bstr0(entry)))
         {
             value = bstr_strip(value);
             if (bstr_startswith0(value, "\"") && bstr_endswith0(value, "\""))
@@ -199,6 +275,16 @@ static int parse_pls(struct pl_parser *p)
         }
     }
     return 0;
+}
+
+static int parse_pls(struct pl_parser *p)
+{
+    return parse_ini_thing(p, "[playlist]", "File");
+}
+
+static int parse_url(struct pl_parser *p)
+{
+    return parse_ini_thing(p, "[InternetShortcut]", "URL");
 }
 
 static int parse_txt(struct pl_parser *p)
@@ -221,7 +307,7 @@ static int parse_txt(struct pl_parser *p)
 
 static bool same_st(struct stat *st1, struct stat *st2)
 {
-    return HAVE_POSIX && st1->st_dev == st2->st_dev && st1->st_ino == st2->st_ino;
+    return st1->st_dev == st2->st_dev && st1->st_ino == st2->st_ino;
 }
 
 // Return true if this was a readable directory.
@@ -272,17 +358,19 @@ static bool scan_dir(struct pl_parser *p, char *path,
 
 static int cmp_filename(const void *a, const void *b)
 {
-    return strcmp(*(char **)a, *(char **)b);
+    return mp_natural_sort_cmp(*(char **)a, *(char **)b);
 }
 
 static int parse_dir(struct pl_parser *p)
 {
-    if (p->real_stream->type != STREAMTYPE_DIR)
+    if (!p->real_stream->is_directory)
         return -1;
     if (p->probing)
         return 0;
 
     char *path = mp_file_get_path(p, bstr0(p->real_stream->url));
+    if (!path)
+        return -1;
 
     char **files = NULL;
     int num_files = 0;
@@ -317,6 +405,7 @@ static const struct pl_format formats[] = {
     {"ini", parse_ref_init},
     {"pls", parse_pls,
      MIME_TYPES("audio/x-scpls")},
+    {"url", parse_url},
     {"txt", parse_txt},
 };
 
@@ -339,6 +428,9 @@ static const struct pl_format *probe_pl(struct pl_parser *p)
 
 static int open_file(struct demuxer *demuxer, enum demux_check check)
 {
+    if (!demuxer->access_references)
+        return -1;
+
     bool force = check < DEMUX_CHECK_UNSAFE || check == DEMUX_CHECK_REQUEST;
 
     struct pl_parser *p = talloc_zero(NULL, struct pl_parser);
@@ -347,8 +439,9 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     p->real_stream = demuxer->stream;
     p->add_base = true;
 
-    bstr probe_buf = stream_peek(demuxer->stream, PROBE_SIZE);
-    p->s = open_memory_stream(probe_buf.start, probe_buf.len);
+    char probe[PROBE_SIZE];
+    int probe_len = stream_read_peek(p->real_stream, probe, sizeof(probe));
+    p->s = stream_memory_open(demuxer->global, probe, probe_len);
     p->s->mime_type = demuxer->stream->mime_type;
     p->utf16 = stream_skip_bom(p->s);
     p->force = force;
@@ -369,10 +462,13 @@ static int open_file(struct demuxer *demuxer, enum demux_check check)
     bool ok = fmt->parse(p) >= 0 && !p->error;
     if (p->add_base)
         playlist_add_base_path(p->pl, mp_dirname(demuxer->filename));
+    playlist_set_stream_flags(p->pl, demuxer->stream_origin);
     demuxer->playlist = talloc_steal(demuxer, p->pl);
     demuxer->filetype = p->format ? p->format : fmt->name;
     demuxer->fully_read = true;
     talloc_free(p);
+    if (ok)
+        demux_close_stream(demuxer);
     return ok ? 0 : -1;
 }
 

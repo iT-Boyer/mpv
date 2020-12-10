@@ -3,18 +3,18 @@
  *
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef MPLAYER_PATH_H
@@ -24,6 +24,9 @@
 #include "misc/bstr.h"
 
 struct mpv_global;
+struct MPOpts;
+
+void mp_init_paths(struct mpv_global *global, struct MPOpts *opts);
 
 // Search for the input filename in several paths. These include user and global
 // config locations by default. Some platforms may implement additional platform
@@ -73,6 +76,9 @@ void mp_path_strip_trailing_separator(char *path);
  */
 char *mp_path_join(void *talloc_ctx, const char *p1, const char *p2);
 char *mp_path_join_bstr(void *talloc_ctx, struct bstr p1, struct bstr p2);
+
+// Return whether the path is absolute.
+bool mp_path_is_absolute(struct bstr path);
 
 char *mp_getcwd(void *talloc_ctx);
 
