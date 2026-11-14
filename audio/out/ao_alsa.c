@@ -34,12 +34,12 @@
 #include <math.h>
 #include <string.h>
 
-#include "config.h"
 #include "options/options.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
 #include "common/msg.h"
 #include "osdep/endian.h"
+#include "osdep/timer.h"
 
 #include <alsa/asoundlib.h>
 
@@ -57,9 +57,9 @@ struct ao_alsa_opts {
     char *mixer_device;
     char *mixer_name;
     int mixer_index;
-    int resample;
-    int ni;
-    int ignore_chmap;
+    bool resample;
+    bool ni;
+    bool ignore_chmap;
     int buffer_time;
     int frags;
 };
@@ -67,12 +67,12 @@ struct ao_alsa_opts {
 #define OPT_BASE_STRUCT struct ao_alsa_opts
 static const struct m_sub_options ao_alsa_conf = {
     .opts = (const struct m_option[]) {
-        {"alsa-resample", OPT_FLAG(resample)},
+        {"alsa-resample", OPT_BOOL(resample)},
         {"alsa-mixer-device", OPT_STRING(mixer_device)},
         {"alsa-mixer-name", OPT_STRING(mixer_name)},
         {"alsa-mixer-index", OPT_INT(mixer_index), M_RANGE(0, 99)},
-        {"alsa-non-interleaved", OPT_FLAG(ni)},
-        {"alsa-ignore-chmap", OPT_FLAG(ignore_chmap)},
+        {"alsa-non-interleaved", OPT_BOOL(ni)},
+        {"alsa-ignore-chmap", OPT_BOOL(ignore_chmap)},
         {"alsa-buffer-time", OPT_INT(buffer_time), M_RANGE(0, INT_MAX)},
         {"alsa-periods", OPT_INT(frags), M_RANGE(0, INT_MAX)},
         {0}
@@ -80,8 +80,6 @@ static const struct m_sub_options ao_alsa_conf = {
     .defaults = &(const struct ao_alsa_opts) {
         .mixer_device = "default",
         .mixer_name = "Master",
-        .mixer_index = 0,
-        .ni = 0,
         .buffer_time = 100000,
         .frags = 4,
     },
@@ -168,14 +166,12 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
 
         switch (cmd) {
         case AOCONTROL_SET_VOLUME: {
-            ao_control_vol_t *vol = arg;
-            set_vol = vol->left / f_multi + pmin + 0.5;
+            float *vol = arg;
+            set_vol = *vol / f_multi + pmin + 0.5;
 
             err = snd_mixer_selem_set_playback_volume(elem, 0, set_vol);
             CHECK_ALSA_ERROR("Error setting left channel");
             MP_DBG(ao, "left=%li, ", set_vol);
-
-            set_vol = vol->right / f_multi + pmin + 0.5;
 
             err = snd_mixer_selem_set_playback_volume(elem, 1, set_vol);
             CHECK_ALSA_ERROR("Error setting right channel");
@@ -184,12 +180,14 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
             break;
         }
         case AOCONTROL_GET_VOLUME: {
-            ao_control_vol_t *vol = arg;
+            float *vol = arg;
+            float left, right;
             snd_mixer_selem_get_playback_volume(elem, 0, &get_vol);
-            vol->left = (get_vol - pmin) * f_multi;
+            left = (get_vol - pmin) * f_multi;
             snd_mixer_selem_get_playback_volume(elem, 1, &get_vol);
-            vol->right = (get_vol - pmin) * f_multi;
-            MP_DBG(ao, "left=%f, right=%f\n", vol->left, vol->right);
+            right = (get_vol - pmin) * f_multi;
+            *vol = (left + right) / 2.0;
+            MP_DBG(ao, "vol=%f\n", *vol);
             break;
         }
         case AOCONTROL_SET_MUTE: {
@@ -286,6 +284,11 @@ static const int alsa_to_mp_channels[][2] = {
     {SND_CHMAP_TRC,     MP_SP(TBC)},
     {SND_CHMAP_RRC,     MP_SP(SDR)},
     {SND_CHMAP_RLC,     MP_SP(SDL)},
+    {SND_CHMAP_TSL,     MP_SP(TSL)},
+    {SND_CHMAP_TSR,     MP_SP(TSR)},
+    {SND_CHMAP_BC,      MP_SP(BFC)},
+    {SND_CHMAP_BLC,     MP_SP(BFL)},
+    {SND_CHMAP_BRC,     MP_SP(BFR)},
     {SND_CHMAP_MONO,    MP_SP(FC)},
     {SND_CHMAP_NA,      MP_SPEAKER_ID_NA},
     {SND_CHMAP_UNKNOWN, MP_SPEAKER_ID_NA},
@@ -311,7 +314,7 @@ static void replace_submap(struct mp_chmap *dst, struct mp_chmap *a,
     struct mp_chmap t = *dst;
     if (!mp_chmap_is_valid(&t) || mp_chmap_diffn(a, &t) != 0)
         return;
-    assert(a->num == b->num);
+    mp_assert(a->num == b->num);
     for (int n = 0; n < t.num; n++) {
         for (int i = 0; i < a->num; i++) {
             if (t.speaker[n] == a->speaker[i]) {
@@ -549,7 +552,7 @@ static char *append_params(void *ta_parent, const char *device, const char *p)
         return talloc_strdup(ta_parent, device);
 
     int len = strlen(device);
-    char *end = strchr(device, ':');
+    const char *end = strchr(device, ':');
     if (!end) {
         /* no existing parameters: add it behind device name */
         return talloc_asprintf(ta_parent, "%s:%s", device, p);
@@ -563,7 +566,7 @@ static char *append_params(void *ta_parent, const char *device, const char *p)
         /* a simple list of parameters: add it at the end of the list */
         return talloc_asprintf(ta_parent, "%s,%s", device, p);
     }
-    abort();
+    MP_ASSERT_UNREACHABLE();
 }
 
 static int try_open_device(struct ao *ao, const char *device, int mode)
@@ -626,7 +629,8 @@ static void uninit(struct ao *ao)
         CHECK_ALSA_ERROR("pcm close error");
     }
 
-alsa_error: ;
+alsa_error:
+    snd_config_update_free_global();
 }
 
 #define INIT_DEVICE_ERR_GENERIC -1
@@ -931,7 +935,7 @@ static bool recover_and_get_state(struct ao *ao, struct mp_pcm_state *state)
     // Give it a number of chances to recover. This tries to deal with the fact
     // that the API is asynchronous, and to account for some past cargo-cult
     // (where things were retried in a loop).
-    for (int n = 0; n < 10; n++) {
+    for (int n = 0; n <= 10; n++) {
         err = snd_pcm_status(p->alsa, st);
         if (err == -EPIPE) {
             // ALSA APIs can return -EPIPE when an XRUN happens,
@@ -942,8 +946,15 @@ static bool recover_and_get_state(struct ao *ao, struct mp_pcm_state *state)
             // Otherwise do error checking and query the PCM state properly.
             CHECK_ALSA_ERROR("snd_pcm_status");
 
+            // ALSA can compute xrun status *after* computing this return value,
+            // so ask again to make sure.
             pcmst = snd_pcm_status_get_state(st);
+            if (pcmst == SND_PCM_STATE_RUNNING)
+                pcmst = snd_pcm_state(p->alsa);
         }
+
+        if (n == 10)
+            pcmst = SND_PCM_STATE_DISCONNECTED;
 
         if (pcmst == SND_PCM_STATE_PREPARED ||
             pcmst == SND_PCM_STATE_RUNNING ||
@@ -961,7 +972,8 @@ static bool recover_and_get_state(struct ao *ao, struct mp_pcm_state *state)
         case SND_PCM_STATE_XRUN:
         case SND_PCM_STATE_DRAINING:
             err = snd_pcm_prepare(p->alsa);
-            CHECK_ALSA_ERROR("pcm prepare error");
+            if (err < 0)
+                MP_ERR(ao, "pcm prepare error: %s\n", snd_strerror(err));
             continue;
         // Hardware suspend.
         case SND_PCM_STATE_SUSPENDED:
@@ -970,7 +982,7 @@ static bool recover_and_get_state(struct ao *ao, struct mp_pcm_state *state)
             if (err == -EAGAIN) {
                 // Cargo-cult from decades ago, with a cargo cult timeout.
                 MP_INFO(ao, "PCM resume EAGAIN - retrying.\n");
-                sleep(1);
+                mp_sleep_ns(MP_TIME_S_TO_NS(1));
                 continue;
             }
             if (err == -ENOSYS) {

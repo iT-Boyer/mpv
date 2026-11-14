@@ -15,9 +15,9 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <pthread.h>
-
 #include "config.h"
+
+#include <dxgi.h>
 
 #include <libavcodec/avcodec.h>
 
@@ -28,20 +28,21 @@
 #include <libavutil/hwcontext_dxva2.h>
 #endif
 
-#include "common/common.h"
 #include "common/av_common.h"
+#include "common/common.h"
+#include "osdep/threads.h"
+#include "osdep/windows_utils.h"
 #include "video/fmt-conversion.h"
 #include "video/hwdec.h"
-#include "video/mp_image.h"
 #include "video/mp_image_pool.h"
-#include "osdep/windows_utils.h"
+#include "video/mp_image.h"
 
 #include "d3d.h"
 
 HMODULE d3d11_dll, d3d9_dll, dxva2_dll;
 PFN_D3D11_CREATE_DEVICE d3d11_D3D11CreateDevice;
 
-static pthread_once_t d3d_load_once = PTHREAD_ONCE_INIT;
+static mp_once d3d_load_once = MP_STATIC_ONCE_INITIALIZER;
 
 #if !HAVE_UWP
 static void d3d_do_load(void)
@@ -65,7 +66,7 @@ static void d3d_do_load(void)
 
 void d3d_load_dlls(void)
 {
-    pthread_once(&d3d_load_once, d3d_do_load);
+    mp_exec_once(&d3d_load_once, d3d_do_load);
 }
 
 // Test if Direct3D11 can be used by us. Basically, this prevents trying to use
@@ -78,6 +79,66 @@ bool d3d11_check_decoding(ID3D11Device *dev)
     UINT supported = 0;
     hr = ID3D11Device_CheckFormatSupport(dev, DXGI_FORMAT_NV12, &supported);
     return !FAILED(hr) && (supported & D3D11_BIND_DECODER);
+}
+
+#define D3D_DRIVER_VERSION(a, b, c, d) \
+    (((uint64_t)(a) << 48) | ((uint64_t)(b) << 32) | \
+     ((uint64_t)(c) << 16) | (uint64_t)(d))
+
+static const struct d3d11_codec_blocklist_entry {
+    int av_codec_id;
+    unsigned vendor_id;
+    uint64_t min_version;
+    uint64_t max_version;
+} d3d11_codec_blocklist[] = {
+    // HEVC decoding crashes on Intel
+    {AV_CODEC_ID_HEVC, 0x8086, D3D_DRIVER_VERSION(20, 19, 15, 4284),
+                               D3D_DRIVER_VERSION(20, 19, 15, 5172)},
+    // VP9 decoder does not accept bitstreams, even when advertised
+    {AV_CODEC_ID_VP9,  0x8086, D3D_DRIVER_VERSION(23, 20, 16, 4974),
+                               D3D_DRIVER_VERSION(23, 20, 16, 5044)},
+};
+
+static bool d3d11_is_codec_allowed(AVBufferRef *device_ref, int av_codec_id)
+{
+    AVHWDeviceContext *ctx = (void *)device_ref->data;
+    AVD3D11VADeviceContext *hwctx = ctx->hwctx;
+    ID3D11Device *device = hwctx->device;
+
+    bool allowed = true;
+    IDXGIDevice *dxgi_dev = NULL;
+    IDXGIAdapter *adapter = NULL;
+
+    if (FAILED(ID3D11Device_QueryInterface(device, &IID_IDXGIDevice,
+                                           (void **)&dxgi_dev)))
+        goto done;
+    if (FAILED(IDXGIDevice_GetAdapter(dxgi_dev, &adapter)))
+        goto done;
+
+    DXGI_ADAPTER_DESC desc;
+    if (FAILED(IDXGIAdapter_GetDesc(adapter, &desc)))
+        goto done;
+
+    LARGE_INTEGER umd_version;
+    if (FAILED(IDXGIAdapter_CheckInterfaceSupport(adapter, &IID_IDXGIDevice,
+                                                  &umd_version)))
+        goto done;
+    uint64_t version = umd_version.QuadPart;
+
+    for (int i = 0; i < MP_ARRAY_SIZE(d3d11_codec_blocklist); i++) {
+        const struct d3d11_codec_blocklist_entry *e = &d3d11_codec_blocklist[i];
+        if (av_codec_id == e->av_codec_id && desc.VendorId == e->vendor_id &&
+            version >= e->min_version && version <= e->max_version)
+        {
+            allowed = false;
+            break;
+        }
+    }
+
+done:
+    SAFE_RELEASE(adapter);
+    SAFE_RELEASE(dxgi_dev);
+    return allowed;
 }
 
 static void d3d11_refine_hwframes(AVBufferRef *hw_frames_ctx)
@@ -145,6 +206,7 @@ const struct hwcontext_fns hwcontext_fns_d3d11 = {
     .av_hwdevice_type       = AV_HWDEVICE_TYPE_D3D11VA,
     .refine_hwframes        = d3d11_refine_hwframes,
     .create_dev             = d3d11_create_standalone,
+    .is_codec_allowed       = d3d11_is_codec_allowed,
 };
 
 #if HAVE_D3D9_HWACCEL
@@ -187,7 +249,7 @@ AVBufferRef *d3d9_wrap_device_ref(IDirect3DDevice9 *device)
     if (FAILED(hr))
         goto fail;
 
-    IDirect3DDeviceManager9_ResetDevice(hwctx->devmgr, device, reset_token);
+    hr = IDirect3DDeviceManager9_ResetDevice(hwctx->devmgr, device, reset_token);
     if (FAILED(hr))
         goto fail;
 

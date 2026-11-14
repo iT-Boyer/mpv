@@ -82,7 +82,7 @@ static void *audio_from_av_ref(AVFrame *data)
 
 static void *packet_ref(void *data)
 {
-    return demux_copy_packet(data);
+    return demux_copy_packet(NULL, data);
 }
 
 static const struct frame_handler frame_handlers[] = {
@@ -152,7 +152,7 @@ void mp_frame_unref(struct mp_frame *frame)
 struct mp_frame mp_frame_ref(struct mp_frame frame)
 {
     if (frame_handlers[frame.type].new_ref) {
-        assert(frame.data);
+        mp_assert(frame.data);
         frame.data = frame_handlers[frame.type].new_ref(frame.data);
         if (!frame.data)
             frame.type = MP_FRAME_NONE;
@@ -169,7 +169,7 @@ double mp_frame_get_pts(struct mp_frame frame)
 
 void mp_frame_set_pts(struct mp_frame frame, double pts)
 {
-    if (frame_handlers[frame.type].get_pts)
+    if (frame_handlers[frame.type].set_pts)
         frame_handlers[frame.type].set_pts(frame.data, pts);
 }
 

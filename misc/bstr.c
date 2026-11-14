@@ -16,7 +16,6 @@
  */
 
 #include <string.h>
-#include <strings.h>
 #include <assert.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -64,18 +63,25 @@ int bstrcasecmp(struct bstr str1, struct bstr str2)
 
 int bstrchr(struct bstr str, int c)
 {
-    for (int i = 0; i < str.len; i++)
-        if (str.start[i] == c)
-            return i;
-    return -1;
+    if (!str.len)
+        return -1;
+    unsigned char *pos = memchr(str.start, c, str.len);
+    return pos ? pos - str.start : -1;
 }
 
 int bstrrchr(struct bstr str, int c)
 {
+    if (!str.len)
+        return -1;
+#if HAVE_MEMRCHR
+    unsigned char *pos = memrchr(str.start, c, str.len);
+    return pos ? pos - str.start : -1;
+#else
     for (int i = str.len - 1; i >= 0; i--)
         if (str.start[i] == c)
             return i;
     return -1;
+#endif
 }
 
 int bstrcspn(struct bstr str, const char *reject)
@@ -151,6 +157,9 @@ bool bstr_split_tok(bstr str, const char *tok, bstr *out_left, bstr *out_right)
 
 struct bstr bstr_splice(struct bstr str, int start, int end)
 {
+    if (!str.len)
+        return str;
+
     if (start < 0)
         start += str.len;
     if (end < 0)
@@ -252,36 +261,43 @@ int bstr_parse_utf8_code_length(unsigned char b)
     return (bytes >= 2 && bytes <= 4) ? bytes : -1;
 }
 
-int bstr_decode_utf8(struct bstr s, struct bstr *out_next)
+int bstr_decode_partial_utf8(struct bstr *s)
 {
-    if (s.len == 0)
+    if (s->len == 0)
         return -1;
-    unsigned int codepoint = s.start[0];
-    s.start++; s.len--;
+    unsigned int codepoint = s->start[0];
+    s->start++; s->len--;
     if (codepoint >= 128) {
         int bytes = bstr_parse_utf8_code_length(codepoint);
-        if (bytes < 1 || s.len < bytes - 1)
-            return -1;
+        if (bytes < 1)
+            return BSTR_DECODE_OUT_OF_RANGE;
         codepoint &= 127 >> bytes;
         for (int n = 1; n < bytes; n++) {
-            int tmp = (unsigned char)s.start[0];
+            if (!s->len)
+                return BSTR_DECODE_TRUNCATED_SEQUENCE;
+            int tmp = (unsigned char)s->start[0];
             if ((tmp & 0xC0) != 0x80)
-                return -1;
+                return BSTR_DECODE_TRUNCATED_SEQUENCE;
             codepoint = (codepoint << 6) | (tmp & ~0xC0);
-            s.start++; s.len--;
+            s->start++; s->len--;
         }
         if (codepoint > 0x10FFFF || (codepoint >= 0xD800 && codepoint <= 0xDFFF))
-            return -1;
+            return BSTR_DECODE_OUT_OF_RANGE;
+
         // Overlong sequences - check taken from libavcodec.
-        // (The only reason we even bother with this is to make libavcodec's
-        //  retarded subtitle utf-8 check happy.)
         unsigned int min = bytes == 2 ? 0x80 : 1 << (5 * bytes - 4);
         if (codepoint < min)
-            return -1;
+            return BSTR_DECODE_OVERLONG_ENCODING;
     }
-    if (out_next)
-        *out_next = s;
     return codepoint;
+}
+
+int bstr_decode_utf8(struct bstr s, struct bstr *out_next)
+{
+    int res = bstr_decode_partial_utf8(&s);
+    if (res >= 0 && out_next)
+        *out_next = s;
+    return res;
 }
 
 struct bstr bstr_split_utf8(struct bstr str, struct bstr *out_next)
@@ -345,7 +361,7 @@ struct bstr bstr_sanitize_utf8_latin1(void *talloc_ctx, struct bstr s)
 static void resize_append(void *talloc_ctx, bstr *s, size_t append_min)
 {
     size_t size = talloc_get_size(s->start);
-    assert(s->len <= size);
+    mp_assert(s->len <= size);
     if (append_min > size - s->len) {
         if (append_min < size)
             append_min = size; // preallocate in power of 2s
@@ -355,52 +371,45 @@ static void resize_append(void *talloc_ctx, bstr *s, size_t append_min)
     }
 }
 
-// Append the string, so that *s = *s + append. s->start is expected to be
-// a talloc allocation (which can be realloced) or NULL.
-// This function will always implicitly append a \0 after the new string for
-// convenience.
-// talloc_ctx will be used as parent context, if s->start is NULL.
 void bstr_xappend(void *talloc_ctx, bstr *s, bstr append)
 {
     if (!append.len)
         return;
     resize_append(talloc_ctx, s, append.len + 1);
-    memcpy(s->start + s->len, append.start, append.len);
+    memmove(s->start + s->len, append.start, append.len);
     s->len += append.len;
     s->start[s->len] = '\0';
 }
 
-void bstr_xappend_asprintf(void *talloc_ctx, bstr *s, const char *fmt, ...)
+int bstr_xappend_asprintf(void *talloc_ctx, bstr *s, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    bstr_xappend_vasprintf(talloc_ctx, s, fmt, ap);
+    int ret = bstr_xappend_vasprintf(talloc_ctx, s, fmt, ap);
     va_end(ap);
+    return ret;
 }
 
-// Exactly as bstr_xappend(), but with a formatted string.
-void bstr_xappend_vasprintf(void *talloc_ctx, bstr *s, const char *fmt,
-                            va_list ap)
+int bstr_xappend_vasprintf(void *talloc_ctx, bstr *s, const char *fmt,
+                           va_list ap)
 {
     int size;
     va_list copy;
     va_copy(copy, ap);
     size_t avail = talloc_get_size(s->start) - s->len;
     char *dest = s->start ? s->start + s->len : NULL;
-    char c;
-    if (avail < 1)
-        dest = &c;
-    size = vsnprintf(dest, MPMAX(avail, 1), fmt, copy);
+    size = vsnprintf(dest, avail, fmt, copy);
     va_end(copy);
 
     if (size < 0)
-        abort();
+        return size;
 
     if (avail < 1 || size + 1 > avail) {
         resize_append(talloc_ctx, s, size + 1);
         vsnprintf(s->start + s->len, size + 1, fmt, ap);
     }
     s->len += size;
+    return size;
 }
 
 bool bstr_case_startswith(struct bstr s, struct bstr prefix)
@@ -413,22 +422,6 @@ bool bstr_case_endswith(struct bstr s, struct bstr suffix)
 {
     struct bstr end = bstr_cut(s, -suffix.len);
     return end.len == suffix.len && bstrcasecmp(end, suffix) == 0;
-}
-
-struct bstr bstr_strip_ext(struct bstr str)
-{
-    int dotpos = bstrrchr(str, '.');
-    if (dotpos < 0)
-        return str;
-    return (struct bstr){str.start, dotpos};
-}
-
-struct bstr bstr_get_ext(struct bstr s)
-{
-    int dotpos = bstrrchr(s, '.');
-    if (dotpos < 0)
-        return (struct bstr){NULL, 0};
-    return bstr_splice(s, dotpos + 1, s.len);
 }
 
 static int h_to_i(unsigned char c)
@@ -467,3 +460,37 @@ bool bstr_decode_hex(void *talloc_ctx, struct bstr hex, struct bstr *out)
     *out = (struct bstr){ .start = arr, .len = len };
     return true;
 }
+
+int bstr_find_in_list0(struct bstr str, char **list, bool case_sensitive)
+{
+    for (int n = 0; list && list[n]; n++)
+        if (case_sensitive ? !bstrcmp0(str, list[n]) : !bstrcasecmp0(str, list[n]))
+            return n;
+
+    return -1;
+}
+
+bool bstr_in_list0(struct bstr str, char **list)
+{
+    return bstr_find_in_list0(str, list, false) != -1;
+}
+
+#ifdef _WIN32
+
+#include <windows.h>
+
+int bstr_to_wchar(void *talloc_ctx, struct bstr s, wchar_t **ret)
+{
+    int count = MultiByteToWideChar(CP_UTF8, 0, s.start, s.len, NULL, 0);
+    if (count <= 0)
+        abort();
+    wchar_t *wbuf = *ret;
+    if (!wbuf || ta_get_size(wbuf) < (count + 1) * sizeof(wchar_t))
+        wbuf = talloc_realloc(talloc_ctx, wbuf, wchar_t, count + 1);
+    MultiByteToWideChar(CP_UTF8, 0, s.start, s.len, wbuf, count);
+    wbuf[count] = L'\0';
+    *ret = wbuf;
+    return count;
+}
+
+#endif

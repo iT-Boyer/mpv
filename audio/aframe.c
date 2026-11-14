@@ -18,9 +18,12 @@
 #include <libavutil/frame.h>
 #include <libavutil/mem.h>
 
+#include "config.h"
+
 #include "common/common.h"
 
 #include "chmap.h"
+#include "chmap_avchannel.h"
 #include "fmt-conversion.h"
 #include "format.h"
 #include "aframe.h"
@@ -29,7 +32,8 @@ struct mp_aframe {
     AVFrame *av_frame;
     // We support channel layouts different from AVFrame channel masks
     struct mp_chmap chmap;
-    // We support spdif formats, which are allocated as AV_SAMPLE_FMT_S16.
+    // We support bitstream formats, which are allocated as fake integer PCM
+    // of matching sample size.
     int format;
     double pts;
     double speed;
@@ -49,8 +53,7 @@ struct mp_aframe *mp_aframe_create(void)
 {
     struct mp_aframe *frame = talloc_zero(NULL, struct mp_aframe);
     frame->av_frame = av_frame_alloc();
-    if (!frame->av_frame)
-        abort();
+    MP_HANDLE_OOM(frame->av_frame);
     talloc_set_destructor(frame, free_frame);
     mp_aframe_reset(frame);
     return frame;
@@ -121,6 +124,14 @@ struct mp_aframe *mp_aframe_from_avframe(struct AVFrame *av_frame)
     if (!av_frame || av_frame->width > 0 || av_frame->height > 0)
         return NULL;
 
+    if (!av_channel_layout_check(&av_frame->ch_layout))
+        return NULL;
+
+    struct mp_chmap converted_map = { 0 };
+    if (!mp_chmap_from_av_layout(&converted_map, &av_frame->ch_layout)) {
+        return NULL;
+    }
+
     int format = af_from_avformat(av_frame->format);
     if (!format && av_frame->format != AV_SAMPLE_FMT_NONE)
         return NULL;
@@ -132,11 +143,7 @@ struct mp_aframe *mp_aframe_from_avframe(struct AVFrame *av_frame)
         abort();
 
     frame->format = format;
-    mp_chmap_from_lavc(&frame->chmap, frame->av_frame->channel_layout);
-
-    // FFmpeg being a stupid POS again
-    if (frame->chmap.num != frame->av_frame->channels)
-        mp_chmap_from_channels(&frame->chmap, av_frame->channels);
+    frame->chmap = converted_map;
 
     if (av_frame->opaque_ref) {
         struct avframe_opaque *op = (void *)av_frame->opaque_ref->data;
@@ -204,9 +211,9 @@ void mp_aframe_config_copy(struct mp_aframe *dst, struct mp_aframe *src)
 
     dst->av_frame->sample_rate = src->av_frame->sample_rate;
     dst->av_frame->format = src->av_frame->format;
-    dst->av_frame->channel_layout = src->av_frame->channel_layout;
-    // FFmpeg being a stupid POS again
-    dst->av_frame->channels = src->av_frame->channels;
+
+    if (av_channel_layout_copy(&dst->av_frame->ch_layout, &src->av_frame->ch_layout) < 0)
+        abort();
 }
 
 // Copy "soft" attributes from src to dst, excluding things which affect
@@ -300,9 +307,10 @@ bool mp_aframe_set_format(struct mp_aframe *frame, int format)
         return false;
     enum AVSampleFormat av_format = af_to_avformat(format);
     if (av_format == AV_SAMPLE_FMT_NONE && format) {
-        if (!af_fmt_is_spdif(format))
+        if (af_fmt_is_pcm(format))
             return false;
-        av_format = AV_SAMPLE_FMT_S16;
+        av_format = af_fmt_to_bytes(format) == 4 ? AV_SAMPLE_FMT_S32
+                                                 : AV_SAMPLE_FMT_S16;
     }
     frame->format = format;
     frame->av_frame->format = av_format;
@@ -315,13 +323,10 @@ bool mp_aframe_set_chmap(struct mp_aframe *frame, struct mp_chmap *in)
         return false;
     if (mp_aframe_is_allocated(frame) && in->num != frame->chmap.num)
         return false;
-    uint64_t lavc_layout = mp_chmap_to_lavc_unchecked(in);
-    if (!lavc_layout && in->num)
-        return false;
+
     frame->chmap = *in;
-    frame->av_frame->channel_layout = lavc_layout;
-    // FFmpeg being a stupid POS again
-    frame->av_frame->channels = frame->chmap.num;
+    mp_chmap_to_av_layout(&frame->av_frame->ch_layout, in);
+
     return true;
 }
 
@@ -415,7 +420,7 @@ char *mp_aframe_format_str_buf(char *buf, size_t buf_size, struct mp_aframe *fmt
 // Set data to the audio after the given number of samples (i.e. slice it).
 void mp_aframe_skip_samples(struct mp_aframe *f, int samples)
 {
-    assert(samples >= 0 && samples <= mp_aframe_get_size(f));
+    mp_assert(samples >= 0 && samples <= mp_aframe_get_size(f));
 
     if (av_frame_make_writable(f->av_frame) < 0)
         return; // go complain to ffmpeg
@@ -432,6 +437,37 @@ void mp_aframe_skip_samples(struct mp_aframe *f, int samples)
 
     if (f->pts != MP_NOPTS_VALUE)
         f->pts += samples / mp_aframe_get_effective_rate(f);
+}
+
+// sanitize a floating point sample value
+#define sanitizef(f) do {       \
+    if (!isnormal(f))           \
+        (f) = 0;                \
+} while (0)
+
+void mp_aframe_sanitize_float(struct mp_aframe *mpa)
+{
+    int format = af_fmt_from_planar(mp_aframe_get_format(mpa));
+    if (format != AF_FORMAT_FLOAT && format != AF_FORMAT_DOUBLE)
+        return;
+    int num_planes = mp_aframe_get_planes(mpa);
+    uint8_t **planes = mp_aframe_get_data_rw(mpa);
+    if (!planes)
+        return;
+    for (int p = 0; p < num_planes; p++) {
+        void *ptr = planes[p];
+        int total = mp_aframe_get_total_plane_samples(mpa);
+        switch (format) {
+        case AF_FORMAT_FLOAT:
+            for (int s = 0; s < total; s++)
+                sanitizef(((float *)ptr)[s]);
+            break;
+        case AF_FORMAT_DOUBLE:
+            for (int s = 0; s < total; s++)
+                sanitizef(((double *)ptr)[s]);
+            break;
+        }
+    }
 }
 
 // Return the timestamp of the sample just after the end of this frame.
@@ -454,7 +490,7 @@ double mp_aframe_duration(struct mp_aframe *f)
 
 // Clip the given frame to the given timestamp range. Adjusts the frame size
 // and timestamp.
-// Refuses to change spdif frames.
+// Refuses to change bitstream (spdif/DoP) frames.
 void mp_aframe_clip_timestamps(struct mp_aframe *f, double start, double end)
 {
     double f_end = mp_aframe_end_pts(f);
@@ -466,7 +502,7 @@ void mp_aframe_clip_timestamps(struct mp_aframe *f, double start, double end)
             if (f->pts >= end) {
                 f->av_frame->nb_samples = 0;
             } else {
-                if (af_fmt_is_spdif(mp_aframe_get_format(f)))
+                if (!af_fmt_is_pcm(mp_aframe_get_format(f)))
                     return;
                 int new = (end - f->pts) * rate;
                 f->av_frame->nb_samples = MPCLAMP(new, 0, f->av_frame->nb_samples);
@@ -479,7 +515,7 @@ void mp_aframe_clip_timestamps(struct mp_aframe *f, double start, double end)
                 f->av_frame->nb_samples = 0;
                 f->pts = f_end;
             } else {
-                if (af_fmt_is_spdif(mp_aframe_get_format(f)))
+                if (!af_fmt_is_pcm(mp_aframe_get_format(f)))
                     return;
                 int skip = (start - f->pts) * rate;
                 skip = MPCLAMP(skip, 0, f->av_frame->nb_samples);
@@ -538,7 +574,7 @@ bool mp_aframe_set_silence(struct mp_aframe *f, int offset, int samples)
 bool mp_aframe_reverse(struct mp_aframe *f)
 {
     int format = mp_aframe_get_format(f);
-    size_t bps = af_fmt_to_bytes(format);
+    int bps = af_fmt_to_bytes(format);
     if (!af_fmt_is_pcm(format) || bps > 16)
         return false;
 
@@ -637,9 +673,8 @@ int mp_aframe_pool_allocate(struct mp_aframe_pool *pool, struct mp_aframe *frame
         av_freep(&av_frame->extended_data); // sigh
     if (planes > AV_NUM_DATA_POINTERS) {
         av_frame->extended_data =
-            av_mallocz_array(planes, sizeof(av_frame->extended_data[0]));
-        if (!av_frame->extended_data)
-            abort();
+            av_calloc(planes, sizeof(av_frame->extended_data[0]));
+        MP_HANDLE_OOM(av_frame->extended_data);
     } else {
         av_frame->extended_data = av_frame->data;
     }

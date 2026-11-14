@@ -1,55 +1,14 @@
 #include <libavutil/frame.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/version.h>
 
-#include "tests.h"
+#include "img_utils.h"
+#include "options/path.h"
+#include "test_utils.h"
 #include "video/fmt-conversion.h"
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/sws_utils.h"
-
-int imgfmts[IMGFMT_AVPIXFMT_END - IMGFMT_AVPIXFMT_START + 100];
-int num_imgfmts;
-
-static enum AVPixelFormat pixfmt_unsup[100];
-static int num_pixfmt_unsup;
-static bool imgfmts_initialized;
-
-static int cmp_imgfmt_name(const void *a, const void *b)
-{
-    char *name_a = mp_imgfmt_to_name(*(int *)a);
-    char *name_b = mp_imgfmt_to_name(*(int *)b);
-
-    return strcmp(name_a, name_b);
-}
-
-void init_imgfmts_list(void)
-{
-    if (imgfmts_initialized)
-        return;
-
-    const AVPixFmtDescriptor *avd = av_pix_fmt_desc_next(NULL);
-    for (; avd; avd = av_pix_fmt_desc_next(avd)) {
-        enum AVPixelFormat fmt = av_pix_fmt_desc_get_id(avd);
-        int mpfmt = pixfmt2imgfmt(fmt);
-        if (!mpfmt) {
-            assert(num_pixfmt_unsup < MP_ARRAY_SIZE(pixfmt_unsup));
-            pixfmt_unsup[num_pixfmt_unsup++] = fmt;
-        }
-    }
-
-    for (int fmt = IMGFMT_START; fmt <= IMGFMT_END; fmt++) {
-        struct mp_imgfmt_desc d = mp_imgfmt_get_desc(fmt);
-        enum AVPixelFormat pixfmt = imgfmt2pixfmt(fmt);
-        if (d.id || pixfmt != AV_PIX_FMT_NONE) {
-            assert(num_imgfmts < MP_ARRAY_SIZE(imgfmts)); // enlarge that array
-            imgfmts[num_imgfmts++] = fmt;
-        }
-    }
-
-    qsort(imgfmts, num_imgfmts, sizeof(imgfmts[0]), cmp_imgfmt_name);
-
-    imgfmts_initialized = true;
-}
 
 static const char *comp_type(enum mp_component_type type)
 {
@@ -60,11 +19,13 @@ static const char *comp_type(enum mp_component_type type)
     }
 }
 
-static void run(struct test_ctx *ctx)
+int main(int argc, char *argv[])
 {
     init_imgfmts_list();
+    const char *refdir = argv[1];
+    const char *outdir = argv[2];
 
-    FILE *f = test_open_out(ctx, "img_formats.txt");
+    FILE *f = test_open_out(outdir, "img_formats.txt");
 
     for (int z = 0; z < num_imgfmts; z++) {
         int mpfmt = imgfmts[z];
@@ -77,7 +38,7 @@ static void run(struct test_ctx *ctx)
 
         int fcsp = mp_imgfmt_get_forced_csp(mpfmt);
         if (fcsp)
-            fprintf(f, "fcsp=%s ", m_opt_choice_str(mp_csp_names, fcsp));
+            fprintf(f, "fcsp=%s ", m_opt_choice_str(pl_csp_names, fcsp));
         fprintf(f, "ctype=%s\n", comp_type(mp_imgfmt_get_component_type(mpfmt)));
 
         struct mp_imgfmt_desc d = mp_imgfmt_get_desc(mpfmt);
@@ -105,7 +66,7 @@ static void run(struct test_ctx *ctx)
             fprintf(f, "    {");
             for (int n = 0; n < MP_MAX_PLANES; n++) {
                 if (n >= d.num_planes) {
-                    assert(d.bpp[n] == 0 && d.xs[n] == 0 && d.ys[n] == 0);
+                    mp_require(d.bpp[n] == 0 && d.xs[n] == 0 && d.ys[n] == 0);
                     continue;
                 }
                 fprintf(f, "%d/[%d:%d] ", d.bpp[n], d.xs[n], d.ys[n]);
@@ -121,6 +82,24 @@ static void run(struct test_ctx *ctx)
                 fprintf(f, " endian_bytes=%d", 1 << d.endian_shift);
             for (int x = 0; x < MP_NUM_COMPONENTS; x++) {
                 struct mp_imgfmt_comp_desc cm = d.comps[x];
+                if (avd && x < avd->nb_components) {
+                    const AVComponentDescriptor *cd = &avd->comp[x];
+                    // Validate only if padding is not 0. fill_pixdesc_layout()
+                    // uses some heuristics to convert AVComponentDescriptor
+                    // to mp_imgfmt_comp_desc. Some formats, mostly packed ones,
+                    // are not fully supported. See fill_pixdesc_layout()
+                    // for more details.
+                    if (cm.pad) {
+                        struct pl_bit_encoding be = {
+                            .sample_depth = cm.size,
+                            .color_depth = cm.size - abs(cm.pad),
+                            .bit_shift = MPMAX(0, cm.pad),
+                        };
+                        mp_require(be.color_depth == cd->depth);
+                        mp_require(be.sample_depth == MP_ALIGN_UP(cd->depth, 8));
+                        mp_require(be.bit_shift == cd->shift);
+                    }
+                }
                 fprintf(f, " {");
                 if (cm.plane == n) {
                     if (cm.size) {
@@ -128,24 +107,24 @@ static void run(struct test_ctx *ctx)
                         if (cm.pad)
                             fprintf(f, "/%d", cm.pad);
                     } else {
-                        assert(cm.offset == 0);
-                        assert(cm.pad == 0);
+                        mp_require(cm.offset == 0);
+                        mp_require(cm.pad == 0);
                     }
                 }
                 fprintf(f, "}");
                 if (!(d.flags & (MP_IMGFLAG_PACKED_SS_YUV | MP_IMGFLAG_HAS_COMPS)))
                 {
-                    assert(cm.size == 0);
-                    assert(cm.offset == 0);
-                    assert(cm.pad == 0);
+                    mp_require(cm.size == 0);
+                    mp_require(cm.offset == 0);
+                    mp_require(cm.pad == 0);
                 }
             }
             fprintf(f, "\n");
             if (d.flags & MP_IMGFLAG_PACKED_SS_YUV) {
-                assert(!(d.flags & MP_IMGFLAG_HAS_COMPS));
+                mp_require(!(d.flags & MP_IMGFLAG_HAS_COMPS));
                 uint8_t offsets[10];
                 bool r = mp_imgfmt_get_packed_yuv_locations(mpfmt, offsets);
-                assert(r);
+                mp_require(r);
                 fprintf(f, "       luma_offsets=[");
                 for (int x = 0; x < d.align_x; x++)
                     fprintf(f, " %d", offsets[x]);
@@ -159,7 +138,7 @@ static void run(struct test_ctx *ctx)
             fr->width = 128;
             fr->height = 128;
             int err = av_frame_get_buffer(fr, MP_IMAGE_BYTE_ALIGN);
-            assert(err >= 0);
+            mp_require(err >= 0);
             struct mp_image *mpi = mp_image_alloc(mpfmt, fr->width, fr->height);
             if (mpi) {
                 // A rather fuzzy test, which might fail even if there's no bug.
@@ -225,11 +204,6 @@ static void run(struct test_ctx *ctx)
                 fprintf(f, "    %d: p=%-2d st=%-2d o=%-2d sh=%-2d d=%d\n",
                         n, cd->plane, cd->step, cd->offset, cd->shift, cd->depth);
             }
-            for (int n = avd->nb_components; n < 4; n++) {
-                const AVComponentDescriptor *cd = &avd->comp[n];
-                assert(!cd->plane && !cd->step && !cd->offset && !cd->shift &&
-                       !cd->depth);
-            }
         }
 
         const AVPixFmtDescriptor *avd2 = av_pix_fmt_desc_next(NULL);
@@ -241,18 +215,9 @@ static void run(struct test_ctx *ctx)
         }
     }
 
-    for (int z = 0; z < num_pixfmt_unsup; z++) {
-        const AVPixFmtDescriptor *avd = av_pix_fmt_desc_get(pixfmt_unsup[z]);
-        fprintf(f, "Unsupported: %s\n", avd->name);
-    }
-
     fclose(f);
 
-    assert_text_files_equal(ctx, "img_formats.txt", "img_formats.txt",
+    assert_text_files_equal(refdir, outdir, "img_formats.txt",
                             "This can fail if FFmpeg adds new formats or flags.");
+    return 0;
 }
-
-const struct unittest test_img_format = {
-    .name = "img_format",
-    .run = run,
-};

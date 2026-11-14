@@ -1,0 +1,471 @@
+/*
+ * Video output device using the kitty terminal graphics protocol
+ * See https://sw.kovidgoyal.net/kitty/graphics-protocol/
+ *
+ * This file is part of mpv.
+ *
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * mpv is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "config.h"
+
+#if HAVE_POSIX
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+#include <libswscale/swscale.h>
+#include <libavutil/base64.h>
+
+#include "options/m_config.h"
+#include "osdep/terminal.h"
+#include "sub/osd.h"
+#include "terminal_swapchain.h"
+#include "vo.h"
+#include "video/sws_utils.h"
+#include "video/mp_image.h"
+
+#define IMGFMT IMGFMT_RGB24
+#define BYTES_PER_PX 3
+#define DEFAULT_WIDTH_PX  320
+#define DEFAULT_HEIGHT_PX 240
+#define DEFAULT_WIDTH 80
+#define DEFAULT_HEIGHT 25
+
+#define KITTY_ESC_IMG        "\033_Ga=T,f=24,s=%d,v=%d,C=1,q=2,m=1;"
+#define KITTY_ESC_IMG_SHM    "\033_Ga=T,t=s,f=24,s=%d,v=%d,C=1,q=2,m=1;%s"
+#define KITTY_ESC_CONTINUE   "\033_Gm=%d;"
+static const bstr KITTY_ESC_END = bstr0_lit("\033\\");
+static const bstr KITTY_ESC_DELETE_ALL = bstr0_lit("\033_Ga=d;");
+
+static const bstr DCS_TMUX_PREFIX = bstr0_lit("\033Ptmux;\033");
+static const bstr DCS_SCREEN_PREFIX = bstr0_lit("\033P\033");
+static const bstr DCS_SUFFIX = bstr0_lit("\033\\");
+
+struct vo_kitty_opts {
+    int width, height, top, left, rows, cols;
+    bool config_clear, alt_screen;
+    bool use_shm;
+    bool auto_multiplexer_passthrough;
+};
+
+struct priv {
+    struct vo_kitty_opts opts;
+
+    uint8_t *buffer;
+    char    *output;
+    char    *shm_path, *shm_path_b64;
+    int     buffer_size, output_size;
+    int     shm_fd;
+    struct terminal_swapchain *swapchain;
+    bstr    dcs_prefix;
+    bstr    dcs_suffix;
+
+    int left, top, width, height, cols, rows;
+
+    struct mp_rect src;
+    struct mp_rect dst;
+    struct mp_osd_res osd;
+    struct mp_image *frame;
+    struct mp_sws_context *sws;
+};
+
+
+static inline void append_passthrough(struct priv *p, bstr *bs, bstr append)
+{
+    bstr_xappend(NULL, bs, p->dcs_prefix);
+    bstr_xappend(NULL, bs, append);
+    bstr_xappend(NULL, bs, p->dcs_suffix);
+}
+
+MP_PRINTF_ATTRIBUTE(3, 4)
+static inline void append_asprintf_passthrough(struct priv *p, bstr *bs,
+                                                     const char *fmt, ...)
+{
+    bstr_xappend(NULL, bs, p->dcs_prefix);
+
+    va_list ap;
+    va_start(ap, fmt);
+    bstr_xappend_vasprintf(NULL, bs, fmt, ap);
+    va_end(ap);
+
+    bstr_xappend(NULL, bs, p->dcs_suffix);
+}
+
+static void close_shm(struct priv *p)
+{
+#if HAVE_POSIX_SHM
+    if (p->buffer != NULL) {
+        munmap(p->buffer, p->buffer_size);
+        p->buffer = NULL;
+    }
+    if (p->shm_fd != -1) {
+        close(p->shm_fd);
+        p->shm_fd = -1;
+    }
+#endif
+}
+
+static void free_bufs(struct vo* vo)
+{
+    struct priv* p = vo->priv;
+
+    talloc_free(p->frame);
+    talloc_free(p->output);
+
+    if (p->opts.use_shm) {
+        close_shm(p);
+#if HAVE_POSIX_SHM
+        if (p->shm_path)
+            shm_unlink(p->shm_path);
+#endif
+    } else {
+        talloc_free(p->buffer);
+    }
+}
+
+static void get_win_size(struct vo *vo, int *out_rows, int *out_cols,
+                         int *out_width, int *out_height)
+{
+    struct priv *p = vo->priv;
+    *out_rows = DEFAULT_HEIGHT;
+    *out_cols = DEFAULT_WIDTH;
+    *out_width = DEFAULT_WIDTH_PX;
+    *out_height = DEFAULT_HEIGHT_PX;
+
+    terminal_get_size2(out_rows, out_cols, out_width, out_height);
+
+    *out_rows = p->opts.rows > 0 ? p->opts.rows : *out_rows;
+    *out_cols = p->opts.cols > 0 ? p->opts.cols : *out_cols;
+    *out_width = p->opts.width > 0 ? p->opts.width : *out_width;
+    *out_height = p->opts.height > 0 ? p->opts.height : *out_height;
+}
+
+static void set_out_params(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    vo_get_src_dst_rects(vo, &p->src, &p->dst, &p->osd);
+
+    p->width  = p->dst.x1 - p->dst.x0;
+    p->height = p->dst.y1 - p->dst.y0;
+    p->top  = p->opts.top > 0 ? p->opts.top : 0;
+    p->left = p->opts.left > 0 ? p->opts.left : 0;
+
+    p->buffer_size = 3 * vo->dwidth * vo->dheight;
+    p->output_size = AV_BASE64_SIZE(p->buffer_size);
+}
+
+static int reconfig(struct vo *vo, struct mp_image_params *params)
+{
+    struct priv *p = vo->priv;
+
+    vo->want_redraw = true;
+
+    bstr *next = terminal_swapchain_next(p->swapchain);
+    append_passthrough(p, next, KITTY_ESC_DELETE_ALL);
+    append_passthrough(p, next, KITTY_ESC_END);
+    if (p->opts.config_clear)
+        bstr_xappend(NULL, next, (bstr)bstr0_lit(TERM_ESC_CLEAR_SCREEN));
+
+    get_win_size(vo, &p->rows, &p->cols, &vo->dwidth, &vo->dheight);
+    set_out_params(vo);
+    free_bufs(vo);
+
+    p->sws->src = *params;
+    p->sws->src.w = mp_rect_w(p->src);
+    p->sws->src.h = mp_rect_h(p->src);
+    p->sws->dst = (struct mp_image_params) {
+        .imgfmt = IMGFMT,
+        .w = p->width,
+        .h = p->height,
+        .p_w = 1,
+        .p_h = 1,
+    };
+
+    p->frame = mp_image_alloc(IMGFMT, vo->dwidth, vo->dheight);
+    if (!p->frame)
+        return -1;
+    mp_image_clear(p->frame, 0, 0, p->frame->w, p->frame->h);
+
+    if (mp_sws_reinit(p->sws) < 0)
+        return -1;
+
+    if (!p->opts.use_shm) {
+        p->buffer = talloc_array(NULL, uint8_t, p->buffer_size);
+        p->output = talloc_array(NULL, char, p->output_size);
+    }
+
+    return 0;
+}
+
+static int create_shm(struct vo *vo)
+{
+#if HAVE_POSIX_SHM
+    struct priv *p = vo->priv;
+    p->shm_fd = shm_open(p->shm_path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+    if (p->shm_fd == -1) {
+        MP_ERR(vo, "Failed to create shared memory object");
+        return 0;
+    }
+
+    if (ftruncate(p->shm_fd, p->buffer_size) == -1) {
+        MP_ERR(vo, "Failed to truncate shared memory object");
+        shm_unlink(p->shm_path);
+        close(p->shm_fd);
+        return 0;
+    }
+
+    p->buffer = mmap(NULL, p->buffer_size,
+                        PROT_READ | PROT_WRITE, MAP_SHARED, p->shm_fd, 0);
+
+    if (p->buffer == MAP_FAILED) {
+        MP_ERR(vo, "Failed to mmap shared memory object");
+        shm_unlink(p->shm_path);
+        close(p->shm_fd);
+        return 0;
+    }
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+{
+    struct priv *p = vo->priv;
+    mp_image_t *mpi = NULL;
+
+    if (terminal_swapchain_size_changed(p->swapchain)) {
+        int prev_height = vo->dheight;
+        int prev_width = vo->dwidth;
+        get_win_size(vo, &p->rows, &p->cols, &vo->dwidth, &vo->dheight);
+        if (prev_width != vo->dwidth || prev_height != vo->dheight)
+            reconfig(vo, vo->params);
+    }
+
+    if (frame->current) {
+        mpi = mp_image_new_ref(frame->current);
+        struct mp_rect src_rc = p->src;
+        src_rc.x0 = MP_ALIGN_DOWN(src_rc.x0, mpi->fmt.align_x);
+        src_rc.y0 = MP_ALIGN_DOWN(src_rc.y0, mpi->fmt.align_y);
+        mp_image_crop_rc(mpi, src_rc);
+
+        mp_image_clear_rc_inv(p->frame, p->dst);
+        struct mp_image dst = *p->frame;
+        mp_image_crop_rc(&dst, p->dst);
+        mp_sws_scale(p->sws, &dst, mpi);
+    } else {
+        mp_image_clear(p->frame, 0, 0, p->frame->w, p->frame->h);
+    }
+
+    osd_draw_on_image(vo->osd, p->osd, mpi ? mpi->pts : 0, 0, p->frame);
+
+    if (p->opts.use_shm && !create_shm(vo))
+        goto done;
+
+    memcpy_pic(p->buffer, p->frame->planes[0], p->frame->w * BYTES_PER_PX,
+               p->frame->h, p->frame->w * BYTES_PER_PX, p->frame->stride[0]);
+
+    if (!p->opts.use_shm)
+        av_base64_encode(p->output, p->output_size, p->buffer, p->buffer_size);
+
+done:
+    talloc_free(mpi);
+    return VO_TRUE;
+}
+
+static void flip_page(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+    if (!p->buffer)
+        return;
+
+    bstr *cmd = terminal_swapchain_acquire(p->swapchain);
+
+    // Start with ESC to position the cursor
+    append_asprintf_passthrough(p, cmd, TERM_ESC_GOTO_YX, p->top, p->left);
+
+    if (p->opts.use_shm) {
+        append_asprintf_passthrough(p, cmd, KITTY_ESC_IMG_SHM,
+                                    vo->dwidth, vo->dheight, p->shm_path_b64);
+        append_passthrough(p, cmd, KITTY_ESC_END);
+    } else {
+        if (!p->output) {
+            terminal_swapchain_present(p->swapchain, cmd);
+            return;
+        }
+
+        append_asprintf_passthrough(p, cmd, KITTY_ESC_IMG,
+                                    vo->dwidth, vo->dheight);
+
+        int output_size = p->output_size - 1;
+        int offset = 0;
+
+        for (; offset < output_size; ) {
+            int chunk = MPMIN(4096, output_size - offset);
+
+            if (offset > 0)
+                append_asprintf_passthrough(p, cmd, KITTY_ESC_CONTINUE,
+                                            offset + chunk < output_size);
+
+            // Append at max chunk bytes
+            bstr_xappend(NULL, cmd, (bstr){p->output + offset, chunk});
+            append_passthrough(p, cmd, KITTY_ESC_END);
+            offset += chunk;
+        }
+
+        // When the data is less than or equal to chunk size the final packet
+        // isn't sent, i.e. an escape sequence with `m=0`.
+        // This ensures that an escape sequence with `m=0` is sent and
+        // terminals stay happy
+        if (offset == 0) {
+            append_asprintf_passthrough(p, cmd, KITTY_ESC_CONTINUE, 0);
+            append_passthrough(p, cmd, KITTY_ESC_END);
+        }
+    }
+
+    terminal_swapchain_present(p->swapchain, cmd);
+
+#if HAVE_POSIX
+    // The terminal reads the image from the shared memory when it gets the
+    // command, so that has to be written before the next frame replaces it.
+    if (p->opts.use_shm) {
+        terminal_swapchain_wait(p->swapchain);
+        close_shm(p);
+    }
+#endif
+}
+
+static int preinit(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    p->sws = mp_sws_alloc(vo);
+    p->sws->log = vo->log;
+    mp_sws_enable_cmdline_opts(p->sws, vo->global);
+
+#if HAVE_POSIX_SHM
+    if (p->opts.use_shm) {
+        p->shm_path = talloc_asprintf(vo, "/mpv-kitty-%p", vo);
+        int p_size = strlen(p->shm_path);
+        int b64_size = AV_BASE64_SIZE(p_size);
+        p->shm_path_b64 = talloc_array(vo, char, b64_size);
+        av_base64_encode(p->shm_path_b64, b64_size, p->shm_path, p_size);
+    }
+#else
+    if (p->opts.use_shm) {
+        MP_ERR(vo, "Shared memory support is not available on this platform.");
+        return -1;
+    }
+#endif
+
+    if (p->opts.auto_multiplexer_passthrough) {
+        if (getenv("TMUX")) {
+            p->dcs_prefix = DCS_TMUX_PREFIX;
+        } else if (getenv("STY")) {
+            p->dcs_prefix = DCS_SCREEN_PREFIX;
+        }
+
+        if (p->dcs_prefix.len)
+            p->dcs_suffix = DCS_SUFFIX;
+    }
+
+    p->swapchain = terminal_swapchain_create(vo);
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_HIDE_CURSOR));
+    if (p->opts.alt_screen)
+        bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_ALT_SCREEN));
+    terminal_swapchain_present(p->swapchain, out);
+    terminal_set_mouse_input(true);
+
+    return 0;
+}
+
+static int query_format(struct vo *vo, int format)
+{
+    return format == IMGFMT;
+}
+
+static int control(struct vo *vo, uint32_t request, void *data)
+{
+    struct priv *p = vo->priv;
+    switch (request) {
+    case VOCTRL_SET_PANSCAN:
+        return (vo->config_ok && !reconfig(vo, vo->params)) ? VO_TRUE : VO_FALSE;
+    case VOCTRL_CHECK_EVENTS:
+        terminal_swapchain_check_events(p->swapchain);
+        return VO_TRUE;
+    }
+    return VO_NOTIMPL;
+}
+
+static void uninit(struct vo *vo)
+{
+    struct priv *p = vo->priv;
+
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    append_passthrough(p, out, KITTY_ESC_DELETE_ALL);
+    append_passthrough(p, out, KITTY_ESC_END);
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_RESTORE_CURSOR));
+    if (p->opts.alt_screen) {
+        bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_NORMAL_SCREEN));
+    } else {
+        bstr_xappend_asprintf(NULL, out, TERM_ESC_GOTO_YX, p->cols, 0);
+    }
+    terminal_swapchain_present(p->swapchain, out);
+    terminal_set_mouse_input(false);
+    terminal_swapchain_destroy(p->swapchain);
+
+    free_bufs(vo);
+}
+
+#define OPT_BASE_STRUCT struct priv
+
+const struct vo_driver video_out_kitty = {
+    .name = "kitty",
+    .description = "Kitty terminal graphics protocol",
+    .preinit = preinit,
+    .query_format = query_format,
+    .reconfig = reconfig,
+    .control = control,
+    .draw_frame = draw_frame,
+    .flip_page = flip_page,
+    .uninit = uninit,
+    .priv_size = sizeof(struct priv),
+    .priv_defaults = &(const struct priv) {
+        .shm_fd = -1,
+        .opts.config_clear = true,
+        .opts.alt_screen = true,
+    },
+    .options = (const m_option_t[]) {
+        {"width", OPT_INT(opts.width)},
+        {"height", OPT_INT(opts.height)},
+        {"top", OPT_INT(opts.top)},
+        {"left", OPT_INT(opts.left)},
+        {"rows", OPT_INT(opts.rows)},
+        {"cols", OPT_INT(opts.cols)},
+        {"config-clear", OPT_BOOL(opts.config_clear), },
+        {"alt-screen", OPT_BOOL(opts.alt_screen), },
+        {"use-shm", OPT_BOOL(opts.use_shm), },
+        {"auto-multiplexer-passthrough", OPT_BOOL(opts.auto_multiplexer_passthrough), },
+        {0}
+    },
+    .options_prefix = "vo-kitty",
+};

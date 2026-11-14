@@ -22,17 +22,14 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dxgi1_6.h>
+#include <dxgidebug.h>
 
 #include "video/mp_image.h"
 
-#define D3D_FEATURE_LEVEL_12_0 (0xc000)
-#define D3D_FEATURE_LEVEL_12_1 (0xc100)
-
-#define DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P709       ((DXGI_COLOR_SPACE_TYPE)20)
-#define DXGI_COLOR_SPACE_RGB_STUDIO_G24_NONE_P2020      ((DXGI_COLOR_SPACE_TYPE)21)
-#define DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P709     ((DXGI_COLOR_SPACE_TYPE)22)
-#define DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P2020    ((DXGI_COLOR_SPACE_TYPE)23)
-#define DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_TOPLEFT_P2020 ((DXGI_COLOR_SPACE_TYPE)24)
+#if !HAVE_DXGI_DEBUG_D3D11
+DEFINE_GUID(DXGI_DEBUG_D3D11, 0x4b99317b, 0xac39, 0x4aa6, 0xbb, 0xb, 0xba, 0xa0, 0x47, 0x84, 0x79, 0x8f);
+#endif
 
 struct d3d11_device_opts {
     // Enable the debug layer (D3D11_CREATE_DEVICE_DEBUG)
@@ -65,9 +62,37 @@ struct d3d11_device_opts {
     char *adapter_name;
 };
 
-bool mp_d3d11_list_or_verify_adapters(struct mp_log *log,
-                                      bstr adapter_name,
-                                      bstr *listing);
+struct mp_dxgi_factory_ctx {
+    IDXGIFactory1 *factory;
+    IDXGIOutput6 *last_matched_output;
+    HMONITOR white_level_monitor;
+    float sdr_white_level;
+};
+
+void mp_dxgi_factory_uninit(struct mp_dxgi_factory_ctx *ctx);
+
+IDXGIAdapter1 *mp_get_dxgi_adapter(struct mp_log *log,
+                                   bstr requested_adapter_name,
+                                   bstr *listing);
+
+bool mp_dxgi_output_desc_from_hwnd(struct mp_dxgi_factory_ctx *ctx,
+                                   HWND hwnd, DXGI_OUTPUT_DESC1 *desc);
+bool mp_dxgi_output_desc_from_swapchain(struct mp_dxgi_factory_ctx *ctx,
+                                        IDXGISwapChain *swapchain,
+                                        DXGI_OUTPUT_DESC1 *desc);
+
+// Returns the system SDR white level for the monitor the window is on, in nits,
+// or 0 if unknown.
+float mp_dxgi_sdr_white_level_from_hwnd(struct mp_dxgi_factory_ctx *ctx,
+                                        HWND hwnd);
+
+struct pl_color_space mp_dxgi_desc_to_color_space(const DXGI_OUTPUT_DESC1 *desc);
+
+OPT_STRING_VALIDATE_FUNC(mp_dxgi_validate_adapter);
+
+bool mp_dxgi_list_or_verify_adapters(struct mp_log *log,
+                                     bstr adapter_name,
+                                     bstr *listing);
 
 bool mp_d3d11_create_present_device(struct mp_log *log,
                                     struct d3d11_device_opts *opts,
@@ -80,10 +105,10 @@ struct d3d11_swapchain_opts {
     DXGI_FORMAT format;
     DXGI_COLOR_SPACE_TYPE color_space;
 
-    // mp_colorspace mapping of the configured swapchain colorspace
+    // pl_color_space mapping of the configured swapchain colorspace
     // shall be written into this memory location if configuration
     // succeeds. Will be ignored if NULL.
-    struct mp_colorspace *configured_csp;
+    struct pl_color_space *configured_csp;
 
     // Use DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL if possible
     bool flip;
@@ -99,5 +124,19 @@ struct d3d11_swapchain_opts {
 bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
                                struct d3d11_swapchain_opts *opts,
                                IDXGISwapChain **swapchain_out);
+
+void mp_d3d11_get_debug_interfaces(struct mp_log *log, IDXGIDebug **debug,
+                                   IDXGIInfoQueue **iqueue);
+
+void mp_d3d11_debug_marker(struct mp_log *log, IDXGIInfoQueue *iqueue,
+                           const char *msg);
+
+void mp_d3d11_report_live_objects(struct mp_log *log, IDXGIDebug *debug,
+                                  IDXGIInfoQueue *iqueue);
+
+const char *d3d11_get_csp_name(DXGI_COLOR_SPACE_TYPE csp);
+
+DXGI_COLOR_SPACE_TYPE mp_params_to_dxgi_colorspace(struct mp_log *log,
+                                                   const struct mp_image_params *params);
 
 #endif

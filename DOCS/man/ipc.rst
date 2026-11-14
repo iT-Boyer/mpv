@@ -3,8 +3,10 @@ JSON IPC
 
 mpv can be controlled by external programs using the JSON-based IPC protocol.
 It can be enabled by specifying the path to a unix socket or a named pipe using
-the option ``--input-ipc-server``. Clients can connect to this socket and send
-commands to the player or receive events from it.
+the option ``--input-ipc-server``, or the file descriptor number of a unix socket
+or a named pipe using ``--input-ipc-client``.
+Clients can connect to this socket and send commands to the player or receive
+events from it.
 
 .. warning::
 
@@ -116,7 +118,7 @@ can also be present. See `List of events`_ for a list of all supported events.
 Because events can occur at any time, it may be difficult at times to determine
 which response goes with which command. Commands may optionally include a
 ``request_id`` which, if provided in the command request, will be copied
-verbatim into the response. mpv does not intrepret the ``request_id`` in any
+verbatim into the response. mpv does not interpret the ``request_id`` in any
 way; it is solely for the use of the requester. The only requirement is that
 the ``request_id`` field must be an integer (a number without fractional parts
 in the range ``-2^63..2^63-1``). Using other types is deprecated and will
@@ -193,8 +195,8 @@ And this is the completion:
     {"request_id":123,"error":"success","data":null}
 
 By design, you will not get a confirmation that the command was started. If a
-command is long running, sending the message will lead to any reply until much
-later when the command finishes.
+command is long running, sending the message will not lead to any reply until
+much later when the command finishes.
 
 Some commands execute synchronously, but these will behave like asynchronous
 commands that finished execution immediately.

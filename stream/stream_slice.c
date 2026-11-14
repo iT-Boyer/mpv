@@ -19,7 +19,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 #include "common/common.h"
 #include "options/m_option.h"
@@ -42,7 +41,7 @@ static int fill_buffer(struct stream *s, void *buffer, int len)
         if (s->pos + p->slice_start >= p->slice_max_end)
             return -1;
         // Avoid rading beyond p->slice_max_end
-        len = MPMIN(len, p->slice_max_end - s->pos);
+        len = MPMIN(len, p->slice_max_end - p->slice_start - s->pos);
     }
 
     return stream_read_partial(p->inner, buffer, len);
@@ -51,6 +50,8 @@ static int fill_buffer(struct stream *s, void *buffer, int len)
 static int seek(struct stream *s, int64_t newpos)
 {
     struct priv *p = s->priv;
+    if (newpos > INT64_MAX - p->slice_start)
+        return 0;
     return stream_seek(p->inner, newpos + p->slice_start);
 }
 
@@ -61,7 +62,7 @@ static int64_t get_size(struct stream *s)
     if (size <= 0)
         return size;
     if (size <= p->slice_start)
-      return 0;
+        return 0;
     if (p->slice_max_end)
         size = MPMIN(size, p->slice_max_end);
     return size - p->slice_start;
@@ -122,8 +123,13 @@ static int parse_slice_range(stream_t *stream)
             return STREAM_ERROR;
     }
 
-    if (max_end_is_offset)
-      p->slice_max_end += p->slice_start;
+    if (max_end_is_offset) {
+        if (p->slice_max_end > INT64_MAX - p->slice_start) {
+            MP_ERR(stream, "The byte range end overflows: '%s'\n", stream->url);
+            return STREAM_ERROR;
+        }
+        p->slice_max_end += p->slice_start;
+    }
 
     if (p->slice_max_end && p->slice_max_end < p->slice_start) {
         MP_ERR(stream, "The byte range end (%"PRId64") can't be smaller than the start (%"PRId64"): '%s'\n",
@@ -158,7 +164,11 @@ static int open2(struct stream *stream, const struct stream_open_args *args)
         return inner_ret;
     }
 
-    if (!p->inner->seekable) {
+    if (p->inner->is_directory) {
+        MP_FATAL(stream, "Inner stream '%s' is a directory\n", p->inner->url);
+        free_stream(p->inner);
+        return STREAM_ERROR;
+    } else if (!p->inner->seekable) {
         MP_FATAL(stream, "Non-seekable stream '%s' can't be used with 'slice://'\n", p->inner->url);
         free_stream(p->inner);
         return STREAM_ERROR;

@@ -18,6 +18,7 @@
 #ifndef MPLAYER_STHEADER_H
 #define MPLAYER_STHEADER_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 
 #include "common/common.h"
@@ -26,6 +27,21 @@
 
 struct MPOpts;
 struct demuxer;
+struct sh_stream;
+
+// Container-level stream groups (e.g. AVStreamGroup from libavformat).
+// A group bundles multiple real streams that the user should normally see as
+// a single logical track.
+struct sh_stream_group {
+    // The streams in the group. Index matches the [i] input label in lavfi_graph.
+    // All members must be of the same media type.
+    struct sh_stream **members;
+    int num_members;
+
+    // Frame-level merge recipe. A libavfilter graph string with labelled inputs
+    // ([0]..[N-1]) and one output [out].
+    char *lavfi_graph;
+};
 
 // Stream headers:
 
@@ -48,8 +64,14 @@ struct sh_stream {
     bool dependent_track;       // container dependent track flag
     bool visual_impaired_track; // container flag
     bool hearing_impaired_track;// container flag
-    bool still_image;           // video stream contains still images
+    bool original_track;        // container flag
+    bool commentary_track;      // container flag
+    bool image;                 // video stream is an image
+    bool still_image;           // video consists of multiple sparse still images
+    bool absent;                // the media provides no data for this stream
     int hls_bitrate;
+    int *program_ids;
+    int num_program_ids;
 
     struct mp_tags *tags;
 
@@ -60,15 +82,58 @@ struct sh_stream {
     // stream is a picture (such as album art)
     struct demux_packet *attached_picture;
 
+    // Stream group members that this track is parent of. This can be base track
+    // with all dependent streams or a virtual stream representing the group.
+    struct sh_stream_group *group;
+
     // Internal to demux.c
     struct demux_stream *ds;
 };
+
+// Returns true if the stream belongs to the given program.
+static inline bool sh_stream_has_program(const struct sh_stream *sh, int program_id)
+{
+    for (int i = 0; i < sh->num_program_ids; i++) {
+        if (sh->program_ids[i] == program_id)
+            return true;
+    }
+    return false;
+}
+
+// Return the dependent twin of the given base track (e.g. a Dolby Vision
+// enhancement-layer stream paired with the base layer), or NULL if none. Only
+// twin-track groups (exactly 2 members) of matching type are supported.
+static inline struct sh_stream *sh_stream_dependent_sibling(struct sh_stream *bl)
+{
+    if (!bl || !bl->group || bl->dependent_track)
+        return NULL;
+    if (bl->group->num_members != 2)
+        return NULL;
+    for (int i = 0; i < bl->group->num_members; i++) {
+        struct sh_stream *m = bl->group->members[i];
+        if (m && m != bl && m->dependent_track && m->type == bl->type)
+            return m->absent ? NULL : m;
+    }
+    return NULL;
+}
 
 struct mp_codec_params {
     enum stream_type type;
 
     // E.g. "h264" (usually corresponds to AVCodecDescriptor.name)
-    const char *codec;
+    const char *_Atomic codec;
+
+    // Usually corresponds to AVCodecDescriptor.long_name
+    const char *_Atomic codec_desc;
+
+    // Corresponding codec profile
+    const char *_Atomic codec_profile;
+
+    // E.g. "h264" (usually corresponds to AVCodec.name)
+    const char *_Atomic decoder;
+
+    // Usually corresponds to AVCodec.long_name
+    const char *_Atomic decoder_desc;
 
     // Usually a FourCC, exact meaning depends on codec.
     unsigned int codec_tag;
@@ -76,7 +141,8 @@ struct mp_codec_params {
     unsigned char *extradata;   // codec specific per-stream header
     int extradata_size;
 
-    // Codec specific header data (set by demux_lavf.c only)
+    // Codec specific header data (set by demux_{lavf,mkv,raw}, useful to pass
+    // through stream global side data)
     struct AVCodecParameters *lav_codecpar;
 
     // Timestamp granularity for converting double<->rational timestamps.
@@ -91,7 +157,6 @@ struct mp_codec_params {
     int samplerate;
     struct mp_chmap channels;
     bool force_channels;
-    int bitrate; // compressed bits/sec
     int block_align;
     struct replaygain_data *replaygain_data;
 
@@ -103,14 +168,27 @@ struct mp_codec_params {
     int disp_w, disp_h;   // display size
     int rotate;           // intended display rotation, in degrees, [0, 359]
     int stereo_mode;      // mp_stereo3d_mode (0 if none/unknown)
-    struct mp_colorspace color; // colorspace info where available
+    struct pl_color_space color; // colorspace info where available
+    struct pl_color_repr repr;   // color representation info where available
+    enum pl_chroma_location chroma_location; // chroma location
+    struct mp_rect crop;         // crop to be applied
+
+    bool dovi;
+    uint8_t dv_profile;
+    uint8_t dv_level;
+    bool dv_el_present;     // BL and EL interleaved in this stream (Profile 7)
 
     // STREAM_VIDEO + STREAM_AUDIO
     int bits_per_coded_sample;
+    char *format_name;    // pixel format (video) or sample format (audio)
+    int bitrate;          // compressed bits/sec
 
     // STREAM_SUB
     double frame_based;   // timestamps are frame-based (and this is the
                           // fallback framerate used for timestamps)
+
+    // STREAM_VIDEO + STREAM_AUDIO + STREAM_SUB
+    double duration;
 };
 
 #endif /* MPLAYER_STHEADER_H */

@@ -1,17 +1,23 @@
 #pragma once
 
+#include <libplacebo/colorspace.h>
+
 #include "video/out/vo.h"
 #include "video/csputils.h"
 
-#include "config.h"
 #include "ra.h"
 
 struct ra_ctx_opts {
-    int allow_sw;        // allow software renderers
-    int want_alpha;      // create an alpha framebuffer if possible
-    int debug;           // enable debugging layers/callbacks etc.
+    bool allow_sw;        // allow software renderers
+    bool want_alpha;      // create an alpha framebuffer if possible
+    bool debug;           // enable debugging layers/callbacks etc.
     bool probing;        // the backend was auto-probed
+    bool composition;    // enable swapchain composition
+    struct m_obj_settings *context_list; // list of `ra_ctx_fns.name` to probe
+    struct m_obj_settings *context_type_list;  // list of `ra_ctx_fns.type` to probe
 };
+
+extern const struct m_sub_options ra_ctx_conf;
 
 struct ra_ctx {
     struct vo *vo;
@@ -31,6 +37,7 @@ struct ra_ctx {
 struct ra_ctx_fns {
     const char *type; // API type (for --gpu-api)
     const char *name; // name (for --gpu-context)
+    const char *description; // description (for --gpu-context=help)
 
     // Resize the window, or create a new window if there isn't one yet.
     // Currently, there is an unfortunate interaction with ctx->vo, and
@@ -43,13 +50,47 @@ struct ra_ctx_fns {
     // These behave exactly like vo_driver.wakeup/wait_events. They are
     // optional.
     void (*wakeup)(struct ra_ctx *ctx);
-    void (*wait_events)(struct ra_ctx *ctx, int64_t until_time_us);
+    void (*wait_events)(struct ra_ctx *ctx, int64_t until_time_ns);
     void (*update_render_opts)(struct ra_ctx *ctx);
 
     // Initialize/destroy the 'struct ra' and possibly the underlying VO backend.
     // Not normally called by the user of the ra_ctx.
     bool (*init)(struct ra_ctx *ctx);
     void (*uninit)(struct ra_ctx *ctx);
+};
+
+typedef struct pl_color_space pl_color_space_t;
+
+// These are a set of helpers for ra_ctx providers based on ra_gl.
+// The init function also initializes ctx->ra and ctx->swapchain, so the user
+// doesn't have to do this manually. (Similarly, the uninit function will
+// clean them up)
+
+struct ra_ctx_params {
+    // For special contexts (i.e. wayland) that want to check visibility
+    // before drawing a frame.
+    bool (*check_visible)(struct ra_ctx *ctx);
+
+    // See ra_swapchain_fns.color_depth.
+    int (*color_depth)(struct ra_ctx *ctx);
+
+    // Preferred device color space. Optional.
+    pl_color_space_t (*preferred_csp)(struct ra_ctx *ctx);
+
+    // See ra_swapchain_fns.target_ref_luma. Optional.
+    float (*preferred_ref_luma)(struct ra_ctx *ctx);
+
+    // See ra_swapchain_fns.set_color. Optional.
+    bool (*set_color)(struct ra_ctx *ctx, struct mp_image_params *params);
+
+    // See ra_swapchain_fns.get_vsync.
+    void (*get_vsync)(struct ra_ctx *ctx, struct vo_vsync_info *info);
+
+    // Set to the platform-specific function to swap buffers, like
+    // glXSwapBuffers, eglSwapBuffers etc. This will be called by
+    // ra_gl_ctx_swap_buffers. Required unless you either never call that
+    // function or if you override it yourself.
+    void (*swap_buffers)(struct ra_ctx *ctx);
 };
 
 // Extra struct for the swapchain-related functions so they can be easily
@@ -67,12 +108,23 @@ struct ra_fbo {
 
     // Host system's colorspace that it will be interpreting
     // the frame buffer as.
-    struct mp_colorspace color_space;
+    struct pl_color_space color_space;
 };
 
 struct ra_swapchain_fns {
     // Gets the current framebuffer depth in bits (0 if unknown). Optional.
     int (*color_depth)(struct ra_swapchain *sw);
+
+    // Target device color space. Optional.
+    pl_color_space_t (*target_csp)(struct ra_swapchain *sw);
+
+    // Target device reference luminance in nits, i.e. the luminance at which
+    // the system displays diffuse (SDR) white. Returns 0 if unknown. Optional.
+    float (*target_ref_luma)(struct ra_swapchain *sw);
+
+    // Call into backends so they can use the appropriate platform-specific
+    // functions to configure color spaces. Returns true if request was handled.
+    bool (*set_color)(struct ra_swapchain *sw, struct mp_image_params *params);
 
     // Called when rendering starts. Returns NULL on failure. This must be
     // followed by submit_frame, to submit the rendered frame. This function
@@ -95,16 +147,8 @@ struct ra_swapchain_fns {
 
 // Create and destroy a ra_ctx. This also takes care of creating and destroying
 // the underlying `struct ra`, and perhaps the underlying VO backend.
-struct ra_ctx *ra_ctx_create(struct vo *vo, const char *context_type,
-                             const char *context_name, struct ra_ctx_opts opts);
+struct ra_ctx *ra_ctx_create(struct vo *vo, struct ra_ctx_opts opts);
 void ra_ctx_destroy(struct ra_ctx **ctx);
 
-struct m_option;
-int ra_ctx_api_help(struct mp_log *log, const struct m_option *opt,
-                    struct bstr name);
-int ra_ctx_validate_api(struct mp_log *log, const struct m_option *opt,
-                        struct bstr name, const char **value);
-int ra_ctx_context_help(struct mp_log *log, const struct m_option *opt,
-                        struct bstr name);
-int ra_ctx_validate_context(struct mp_log *log, const struct m_option *opt,
-                            struct bstr name, const char **value);
+// Special case of creating a ra_ctx while specifying a specific context by name.
+struct ra_ctx *ra_ctx_create_by_name(struct vo *vo, const char *name);

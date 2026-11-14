@@ -23,8 +23,6 @@
 #include <libavutil/pixfmt.h>
 #include <libavutil/pixdesc.h>
 
-#include "config.h"
-
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/fmt-conversion.h"
@@ -65,13 +63,6 @@ static const struct mp_imgfmt_entry mp_imgfmt_list[] = {
         .name = "vdpau_output",
         .desc = {
             .flags = MP_IMGFLAG_NE | MP_IMGFLAG_RGB | MP_IMGFLAG_HWACCEL,
-        },
-    },
-    [IMGFMT_RGB30 - IMGFMT_CUST_BASE] = {
-        .name = "rgb30",
-        .desc = {
-            .flags = MP_IMGFLAG_RGB,
-            .comps = { {0, 20, 10}, {0, 10, 10}, {0, 0, 10} },
         },
     },
     [IMGFMT_YAP8 - IMGFMT_CUST_BASE] = {
@@ -157,6 +148,15 @@ int mp_imgfmt_from_name(bstr name)
 {
     if (bstr_equals0(name, "none"))
         return 0;
+    static const struct { bstr old, new; } deprecated_fmt_names[] = {
+        {bstr0_lit("rgb30"), bstr0_lit("x2rgb10")},
+    };
+    for (int n = 0; n < MP_ARRAY_SIZE(deprecated_fmt_names); n++) {
+        if (bstr_equals(name, deprecated_fmt_names[n].old)) {
+            name = deprecated_fmt_names[n].new;
+            break;
+        }
+    }
     for (int n = 0; n < MP_ARRAY_SIZE(mp_imgfmt_list); n++) {
         const struct mp_imgfmt_entry *p = &mp_imgfmt_list[n];
         if (p->name && bstr_equals0(name, p->name))
@@ -401,7 +401,8 @@ fail:
     for (int n = 0; n < 4; n++)
         desc->comps[n] = (struct mp_imgfmt_comp_desc){0};
     // Average bit size fallback.
-    desc->num_planes = av_pix_fmt_count_planes(fmt);
+    int num_planes = av_pix_fmt_count_planes(fmt);
+    desc->num_planes = MPCLAMP(num_planes, 0, MP_MAX_PLANES);
     for (int p = 0; p < desc->num_planes; p++) {
         int ls = av_image_get_linesize(fmt, 256, p);
         desc->bpp[p] = ls > 0 ? ls * 8 / 256 : 0;
@@ -481,7 +482,7 @@ bool mp_imgfmt_get_packed_yuv_locations(int imgfmt, uint8_t *luma_offsets)
     if (!(desc.flags & MP_IMGFLAG_PACKED_SS_YUV))
         return false;
 
-    assert(desc.num_planes == 1);
+    mp_assert(desc.num_planes == 1);
 
     // Guess at which positions the additional luma samples are. We iterate
     // starting with the first byte, and then put a luma sample at places
@@ -552,7 +553,7 @@ static bool get_native_desc(int mpfmt, struct mp_imgfmt_desc *desc)
     return true;
 }
 
-int mp_imgfmt_desc_get_num_comps(struct mp_imgfmt_desc *desc)
+int mp_imgfmt_desc_get_num_comps(const struct mp_imgfmt_desc *desc)
 {
     int flags = desc->flags;
     if (!(flags & MP_IMGFLAG_COLOR_MASK))
@@ -666,18 +667,18 @@ static bool validate_regular_imgfmt(const struct mp_regular_imgfmt *fmt)
     return true;
 }
 
-static enum mp_csp get_forced_csp_from_flags(int flags)
+static enum pl_color_system get_forced_csp_from_flags(int flags)
 {
     if (flags & MP_IMGFLAG_COLOR_XYZ)
-        return MP_CSP_XYZ;
+        return PL_COLOR_SYSTEM_XYZ;
 
     if (flags & MP_IMGFLAG_COLOR_RGB)
-        return MP_CSP_RGB;
+        return PL_COLOR_SYSTEM_RGB;
 
-    return MP_CSP_AUTO;
+    return PL_COLOR_SYSTEM_UNKNOWN;
 }
 
-enum mp_csp mp_imgfmt_get_forced_csp(int imgfmt)
+enum pl_color_system mp_imgfmt_get_forced_csp(int imgfmt)
 {
     return get_forced_csp_from_flags(mp_imgfmt_get_desc(imgfmt).flags);
 }
@@ -823,4 +824,16 @@ int mp_imgfmt_select_best_list(int *dst, int num_dst, int src)
     for (int n = 0; n < num_dst; n++)
         best = best ? mp_imgfmt_select_best(best, dst[n], src) : dst[n];
     return best;
+}
+
+bool mp_imgfmt_is_subsampled(enum mp_imgfmt fmt)
+{
+    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(fmt);
+    return desc.chroma_xs || desc.chroma_ys;
+}
+
+bool mp_imgfmt_is_420_subsampled(enum mp_imgfmt fmt)
+{
+    struct mp_imgfmt_desc desc = mp_imgfmt_get_desc(fmt);
+    return desc.chroma_xs == 1 && desc.chroma_ys == 1;
 }

@@ -1,11 +1,11 @@
 local utils = require("mp.utils")
 
-function hardsleep()
-    os.execute("sleep 1s")
+local function hardsleep()
+    os.execute("sleep 1")
 end
 
 local hooks = {"on_before_start_file", "on_load", "on_load_fail",
-               "on_preloaded", "on_unload", "on_after_end_file"}
+               "on_preloaded", "on_loaded", "on_unload", "on_after_end_file"}
 
 for _, name in ipairs(hooks) do
     mp.add_hook(name, 0, function()
@@ -25,8 +25,8 @@ end
 
 local props = {"path", "metadata"}
 for _, name in ipairs(props) do
-    mp.observe_property(name, "native", function(name, val)
-        print("property '" .. name .. "' changed to '" ..
+    mp.observe_property(name, "native", function(prop, val)
+        print("property '" .. prop .. "' changed to '" ..
               utils.to_string(val) .. "'")
     end)
 end

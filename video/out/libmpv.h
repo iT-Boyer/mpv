@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "libmpv/render.h"
+#include "mpv/render.h"
 #include "vo.h"
 
 // Helper for finding a parameter value. It returns the direct pointer to the
@@ -58,7 +58,7 @@ struct render_backend_fns {
                      struct voctrl_performance_data *out);
     // Like vo_driver.get_image().
     struct mp_image *(*get_image)(struct render_backend *ctx, int imgfmt,
-                                  int w, int h, int stride_align);
+                                  int w, int h, int stride_align, int flags);
     // This has two purposes: 1. set queue attributes on VO, 2. update the
     // renderer's OSD pointer. Keep in mind that as soon as the caller releases
     // the renderer lock, the VO pointer can become invalid. The OSD pointer

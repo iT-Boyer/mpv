@@ -48,6 +48,8 @@
 #include <inttypes.h>
 #include <assert.h>
 
+#include <mpv/client.h>
+
 #include "common/common.h"
 #include "misc/bstr.h"
 #include "misc/ctype.h"
@@ -255,6 +257,8 @@ static const char special_escape[] = {
 
 static void write_json_str(bstr *b, unsigned char *str)
 {
+    mp_assert(str);
+
     APPEND(b, "\"");
     while (1) {
         unsigned char *cur = str;
@@ -287,7 +291,7 @@ static void add_indent(bstr *b, int indent)
         bstr_xappend(NULL, b, bstr0(" "));
 }
 
-static int json_append(bstr *b, const struct mpv_node *src, int indent)
+int json_append(bstr *b, const struct mpv_node *src, int indent)
 {
     switch (src->format) {
     case MPV_FORMAT_NONE:
@@ -300,12 +304,15 @@ static int json_append(bstr *b, const struct mpv_node *src, int indent)
         bstr_xappend_asprintf(NULL, b, "%"PRId64, src->u.int64);
         return 0;
     case MPV_FORMAT_DOUBLE: {
-        const char *px = isfinite(src->u.double_) ? "" : "\"";
+        const char *px = (isfinite(src->u.double_) || indent == 0) ? "" : "\"";
         bstr_xappend_asprintf(NULL, b, "%s%f%s", px, src->u.double_, px);
         return 0;
     }
     case MPV_FORMAT_STRING:
-        write_json_str(b, src->u.string);
+        if (indent == 0)
+            APPEND(b, src->u.string);
+        else
+            write_json_str(b, src->u.string);
         return 0;
     case MPV_FORMAT_NODE_ARRAY:
     case MPV_FORMAT_NODE_MAP: {

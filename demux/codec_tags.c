@@ -15,6 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <string.h>
+
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/common.h>
@@ -23,6 +25,7 @@
 #include "codec_tags.h"
 #include "stheader.h"
 #include "common/av_common.h"
+#include "misc/bstr.h"
 
 static const char *lookup_tag(int type, uint32_t tag)
 {
@@ -44,15 +47,69 @@ static const char *lookup_tag(int type, uint32_t tag)
     return id == AV_CODEC_ID_NONE ? NULL : mp_codec_from_av_codec_id(id);
 }
 
-// Corresponds to WMMEDIASUBTYPE_Base.
-static const unsigned char guid_ext_base[16] =
+
+/*
+ * As seen in the following page:
+ *
+ * <https://web.archive.org/web/20220406060153/
+ * http://dream.cs.bath.ac.uk/researchdev/wave-ex/bformat.html>
+ *
+ * Note that the GUID struct in the above citation has its
+ * integers encoded in little-endian format, which means that
+ * the unsigned short and unsigned long entries need to be
+ * byte-flipped for this encoding.
+ *
+ * In theory only the first element of this array should be used,
+ * however some encoders incorrectly encoded the GUID byte-for-byte
+ * and thus the second one exists as a fallback.
+ */
+static const unsigned char guid_ext_base[][16] = {
+    // MEDIASUBTYPE_BASE_GUID
     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
-     0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
+     0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71},
+     // SUBTYPE_AMBISONIC_B_FORMAT_PCM
+    {0x01, 0x00, 0x00, 0x00, 0x21, 0x07, 0xD3, 0x11,
+     0x86, 0x44, 0xC8, 0xC1, 0xCA, 0x00, 0x00, 0x00}
+};
+
+struct mp_waveformatex_guid {
+    const char *codec;
+    const unsigned char guid[16];
+};
+
+static const struct mp_waveformatex_guid guid_ext_other[] = {
+    {"ac3",
+        {0x2C, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11,
+         0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA}},
+    {"adpcm_agm",
+        {0x82, 0xEC, 0x1F, 0x6A, 0xCA, 0xDB, 0x19, 0x45,
+         0xBD, 0xE7, 0x56, 0xD3, 0xB3, 0xEF, 0x98, 0x1D}},
+    {"atrac3p",
+        {0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB, 0x71, 0x44,
+         0xA1, 0x19, 0xFF, 0xFA, 0x01, 0xE4, 0xCE, 0x62}},
+    {"atrac9",
+        {0xD2, 0x42, 0xE1, 0x47, 0xBA, 0x36, 0x8D, 0x4D,
+         0x88, 0xFC, 0x61, 0x65, 0x4F, 0x8C, 0x83, 0x6C}},
+    {"dfpwm",
+        {0x3A, 0xC1, 0xFA, 0x38, 0x81, 0x1D, 0x43, 0x61,
+         0xA4, 0x0D, 0xCE, 0x53, 0xCA, 0x60, 0x7C, 0xD1}},
+    {"eac3",
+        {0xAF, 0x87, 0xFB, 0xA7, 0x02, 0x2D, 0xFB, 0x42,
+         0xA4, 0xD4, 0x05, 0xCD, 0x93, 0x84, 0x3B, 0xDD}},
+    {"mp2",
+        {0x2B, 0x80, 0x6D, 0xE0, 0x46, 0xDB, 0xCF, 0x11,
+         0xB4, 0xD1, 0x00, 0x80, 0x5F, 0x6C, 0xBB, 0xEA}}
+};
 
 static void map_audio_pcm_tag(struct mp_codec_params *c)
 {
     // MS PCM, Extended
     if (c->codec_tag == 0xfffe && c->extradata_size >= 22) {
+        // WAVEFORMATEXTENSIBLE.wBitsPerSample
+        int bits_per_sample = AV_RL16(c->extradata);
+        if (bits_per_sample)
+            c->bits_per_coded_sample = bits_per_sample;
+
         // WAVEFORMATEXTENSIBLE.dwChannelMask
         uint64_t chmask = AV_RL32(c->extradata + 2);
         struct mp_chmap chmap;
@@ -62,9 +119,23 @@ static void map_audio_pcm_tag(struct mp_codec_params *c)
 
         // WAVEFORMATEXTENSIBLE.SubFormat
         unsigned char *subformat = c->extradata + 6;
-        if (memcmp(subformat + 4, guid_ext_base + 4, 12) == 0) {
-            c->codec_tag = AV_RL32(subformat);
-            c->codec = lookup_tag(c->type, c->codec_tag);
+        for (int i = 0; i < MP_ARRAY_SIZE(guid_ext_base); i++) {
+            if (memcmp(subformat + 4, guid_ext_base[i] + 4, 12) == 0) {
+                c->codec_tag = AV_RL32(subformat);
+                c->codec = lookup_tag(c->type, c->codec_tag);
+                break;
+            }
+        }
+
+        // extra subformat, not a base one
+        if (c->codec_tag == 0xfffe) {
+            for (int i = 0; i < MP_ARRAY_SIZE(guid_ext_other); i++) {
+                if (memcmp(subformat, &guid_ext_other[i].guid, 16) == 0) {
+                    c->codec = guid_ext_other[i].codec;
+                    c->codec_tag = mp_codec_to_av_codec_id(c->codec);
+                    break;
+                }
+            }
         }
 
         // Compressed formats might use this.
@@ -73,6 +144,9 @@ static void map_audio_pcm_tag(struct mp_codec_params *c)
     }
 
     int bits = c->bits_per_coded_sample;
+    if (!bits)
+        return;
+
     int bytes = (bits + 7) / 8;
     switch (c->codec_tag) {
     case 0x0:       // Microsoft PCM
@@ -89,8 +163,7 @@ static void map_audio_pcm_tag(struct mp_codec_params *c)
 void mp_set_codec_from_tag(struct mp_codec_params *c)
 {
     c->codec = lookup_tag(c->type, c->codec_tag);
-
-    if (c->type == STREAM_AUDIO && c->bits_per_coded_sample)
+    if (c->type == STREAM_AUDIO)
         map_audio_pcm_tag(c);
 }
 
@@ -111,8 +184,15 @@ void mp_set_pcm_codec(struct mp_codec_params *c, bool sign, bool is_float,
 }
 
 static const char *const mimetype_to_codec[][2] = {
+    {"image/apng",      "apng"},
+    {"image/avif",      "av1"},
+    {"image/bmp",       "bmp"},
+    {"image/gif",       "gif"},
     {"image/jpeg",      "mjpeg"},
+    {"image/jxl",       "jpegxl"},
     {"image/png",       "png"},
+    {"image/tiff",      "tiff"},
+    {"image/webp",      "webp"},
     {0}
 };
 
@@ -125,4 +205,83 @@ const char *mp_map_mimetype_to_video_codec(const char *mimetype)
         }
     }
     return NULL;
+}
+
+// MPEG-4 ObjectTypeIndication (ISO/IEC 14496-1), second field of mp4a and mp4v
+// codec strings. Keep in sync with ff_mp4_obj_type in libavformat/isom.c.
+static const enum AVCodecID mp4_object_types[] = {
+    [0x20] = AV_CODEC_ID_MPEG4,
+    [0x21] = AV_CODEC_ID_H264,
+    [0x23] = AV_CODEC_ID_HEVC,
+    [0x33] = AV_CODEC_ID_VVC,
+    [0x40] = AV_CODEC_ID_AAC,
+    [0x60] = AV_CODEC_ID_MPEG2VIDEO,
+    [0x61] = AV_CODEC_ID_MPEG2VIDEO,
+    [0x62] = AV_CODEC_ID_MPEG2VIDEO,
+    [0x63] = AV_CODEC_ID_MPEG2VIDEO,
+    [0x64] = AV_CODEC_ID_MPEG2VIDEO,
+    [0x65] = AV_CODEC_ID_MPEG2VIDEO,
+    [0x66] = AV_CODEC_ID_AAC,
+    [0x67] = AV_CODEC_ID_AAC,
+    [0x68] = AV_CODEC_ID_AAC,
+    [0x69] = AV_CODEC_ID_MP3,
+    [0x6A] = AV_CODEC_ID_MPEG1VIDEO,
+    [0x6B] = AV_CODEC_ID_MP3,
+    [0x6C] = AV_CODEC_ID_MJPEG,
+    [0x6D] = AV_CODEC_ID_PNG,
+    [0x6E] = AV_CODEC_ID_JPEG2000,
+    [0xA3] = AV_CODEC_ID_VC1,
+    [0xA4] = AV_CODEC_ID_DIRAC,
+    [0xA5] = AV_CODEC_ID_AC3,
+    [0xA6] = AV_CODEC_ID_EAC3,
+    [0xA9] = AV_CODEC_ID_DTS,
+    [0xAD] = AV_CODEC_ID_OPUS,
+    [0xB1] = AV_CODEC_ID_VP9,
+    [0xDD] = AV_CODEC_ID_VORBIS,
+};
+
+// MPEG-4 AudioObjectType (ISO/IEC 14496-3), third field of mp4a.40 codec
+// strings. Keep in sync with mp4_audio_types in libavformat/isom.c.
+static const enum AVCodecID mp4_audio_object_types[] = {
+    [32] = AV_CODEC_ID_MP1,
+    [33] = AV_CODEC_ID_MP2,
+    [34] = AV_CODEC_ID_MP3,
+    [36] = AV_CODEC_ID_MP4ALS,
+};
+
+const char *mp_map_rfc6381_to_codec(int type, const char *str)
+{
+    bstr name, fields;
+    bstr_split_tok(bstr0(str), ".", &name, &fields);
+    char *lower = bstrdup0(NULL, name);
+    bstr_lower(bstr0(lower));
+
+    // mpv codec name, "vp9.2" style suffixes are ignored
+    int id = mp_codec_to_av_codec_id(lower);
+
+    // ISOBMFF sample entry, matched against the lowercase entries only
+    if (id == AV_CODEC_ID_NONE && name.len == 4) {
+        const struct AVCodecTag *tags[] = {
+            type == STREAM_VIDEO ? avformat_get_mov_video_tags()
+                                 : avformat_get_mov_audio_tags(),
+            NULL,
+        };
+        id = av_codec_get_id(tags, AV_RL32(lower));
+        if (!strcmp(lower, "dvh1")) {
+            // HEVC-based Dolby Vision derived from hvc1, see mov.c.
+            id = AV_CODEC_ID_HEVC;
+        } else if (!strcmp(lower, "mp4a") || !strcmp(lower, "mp4v")) {
+            unsigned oti, aot;
+            int num = bstr_sscanf(fields, "%x.%u", &oti, &aot);
+            if (num >= 1 && oti < MP_ARRAY_SIZE(mp4_object_types))
+                id = mp4_object_types[oti] ? mp4_object_types[oti] : id;
+            if (num >= 2 && oti == 0x40 && aot < MP_ARRAY_SIZE(mp4_audio_object_types))
+                id = mp4_audio_object_types[aot] ? mp4_audio_object_types[aot] : id;
+        }
+    }
+    talloc_free(lower);
+
+    if (id == AV_CODEC_ID_NONE || avcodec_get_type(id) != mp_to_av_stream_type(type))
+        return NULL;
+    return mp_codec_from_av_codec_id(id);
 }

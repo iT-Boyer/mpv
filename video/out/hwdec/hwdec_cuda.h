@@ -19,18 +19,22 @@
 
 #pragma once
 
-#include <ffnvcodec/dynlink_loader.h>
-
 #include "video/out/gpu/hwdec.h"
+
+#define FFNV_LOG_FUNC(logctx, ...) \
+    mp_msg(((struct ra_hwdec *)(logctx))->log, \
+           ((struct ra_hwdec *)(logctx))->probing ? MSGL_V : MSGL_ERR, \
+           __VA_ARGS__)
+#define FFNV_DEBUG_LOG_FUNC(logctx, ...) \
+    mp_msg(((struct ra_hwdec *)(logctx))->log, MSGL_DEBUG, __VA_ARGS__)
+
+#include <ffnvcodec/dynlink_loader.h>
 
 struct cuda_hw_priv {
     struct mp_hwdec_ctx hwctx;
     CudaFunctions *cu;
     CUcontext display_ctx;
     CUcontext decode_ctx;
-
-    // Stored as int to avoid depending on libplacebo enum
-    int handle_type;
 
     // Do we need to do a full CPU sync after copying
     bool do_full_sync;
@@ -53,10 +57,13 @@ struct cuda_mapper_priv {
     void *ext[4];
 };
 
-typedef bool (*cuda_interop_init)(const struct ra_hwdec *hw);
+struct cuda_interop_fn {
+    bool (*check)(const struct ra_hwdec *hw);
+    bool (*init)(const struct ra_hwdec *hw);
+};
 
-bool cuda_gl_init(const struct ra_hwdec *hw);
+extern struct cuda_interop_fn cuda_gl_fn;
 
-bool cuda_vk_init(const struct ra_hwdec *hw);
+extern struct cuda_interop_fn cuda_vk_fn;
 
 int check_cu(const struct ra_hwdec *hw, CUresult err, const char *func);

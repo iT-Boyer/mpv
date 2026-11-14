@@ -85,3 +85,12 @@ void mp_output_chain_set_audio_speed(struct mp_output_chain *p,
 // due to the change.
 // Makes sense for audio only.
 double mp_output_get_measured_total_delay(struct mp_output_chain *p);
+
+// Check if deinterlace user filter is inserted
+bool mp_output_chain_deinterlace_active(struct mp_output_chain *p);
+
+// Add an enhancement-layer pairing filter at the tail of the chain.
+// Pass el_sh=NULL to remove. No-op if the same el_sh is already installed.
+struct sh_stream;
+void mp_output_chain_set_el_stream(struct mp_output_chain *p,
+                                   struct sh_stream *el_sh);

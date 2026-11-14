@@ -63,21 +63,21 @@ struct mp_repack {
     int components[4];          // b[n] = mp_image.planes[components[n]]
     //  pack:   a is dst, b is src
     //  unpack: a is src, b is dst
-    void (*packed_repack_scanline)(void *a, void *b[], int w);
+    void (*packed_repack_scanline)(void *restrict a, void *restrict b[], int w);
 
     // Fringe RGB/YUV.
     uint8_t comp_size;
     uint8_t comp_map[6];
     uint8_t comp_shifts[3];
     uint8_t *comp_lut;
-    void (*repack_fringe_yuv)(void *dst, void *src[], int w, uint8_t *c);
+    void (*repack_fringe_yuv)(void *restrict dst, void *restrict src[], int w, uint8_t *restrict c);
 
     // F32 repacking.
     int f32_comp_size;
     float f32_m[4], f32_o[4];
     uint32_t f32_pmax[4];
-    enum mp_csp f32_csp_space;
-    enum mp_csp_levels f32_csp_levels;
+    enum pl_color_system f32_csp_space;
+    enum pl_color_levels f32_csp_levels;
 
     // REPACK_STEP_REPACK: if true, need to copy this plane
     bool copy_buf[4];
@@ -95,7 +95,7 @@ static int find_gbrp_format(int depth, int num_planes)
         return 0;
     struct mp_regular_imgfmt desc = {
         .component_type = MP_COMPONENT_TYPE_UINT,
-        .forced_csp = MP_CSP_RGB,
+        .forced_csp = PL_COLOR_SYSTEM_RGB,
         .component_size = depth > 8 ? 2 : 1,
         .component_pad = depth - (depth > 8 ? 16 : 8),
         .num_planes = num_planes,
@@ -130,11 +130,11 @@ static void copy_plane(struct mp_image *dst, int dst_x, int dst_y,
     int h = (1 << dst->fmt.chroma_ys) - (1 << dst->fmt.ys[p]) + 1;
     size_t size = mp_image_plane_bytes(dst, p, dst_x, w);
 
-    assert(dst->fmt.bpp[p] == src->fmt.bpp[p]);
+    mp_assert(dst->fmt.bpp[p] == src->fmt.bpp[p]);
 
     for (int y = 0; y < h; y++) {
-        void *pd = mp_image_pixel_ptr_ny(dst, p, dst_x, dst_y + y);
-        void *ps = mp_image_pixel_ptr_ny(src, p, src_x, src_y + y);
+        void *restrict pd = mp_image_pixel_ptr_ny(dst, p, dst_x, dst_y + y);
+        void *restrict ps = mp_image_pixel_ptr_ny(src, p, src_x, src_y + y);
         memcpy(pd, ps, size);
     }
 }
@@ -144,7 +144,7 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
                         struct mp_image *src, int src_x, int src_y,
                         int w, int endian_size)
 {
-    assert(src->fmt.num_planes == dst->fmt.num_planes);
+    mp_assert(src->fmt.num_planes == dst->fmt.num_planes);
 
     for (int p = 0; p < dst->fmt.num_planes; p++) {
         int xs = dst->fmt.xs[p];
@@ -154,11 +154,11 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
         // Number of lines on this plane.
         int h = (1 << dst->fmt.chroma_ys) - (1 << dst->fmt.ys[p]) + 1;
 
-        assert(src->fmt.bpp[p] == bpp * 8);
+        mp_assert(src->fmt.bpp[p] == bpp * 8);
 
         for (int y = 0; y < h; y++) {
-            void *s = mp_image_pixel_ptr_ny(src, p, src_x, src_y + y);
-            void *d = mp_image_pixel_ptr_ny(dst, p, dst_x, dst_y + y);
+            void *restrict s = mp_image_pixel_ptr_ny(src, p, src_x, src_y + y);
+            void *restrict d = mp_image_pixel_ptr_ny(dst, p, dst_x, dst_y + y);
             switch (endian_size) {
             case 2:
                 for (int x = 0; x < num_words; x++)
@@ -169,7 +169,7 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
                     ((uint32_t *)d)[x] = av_bswap32(((uint32_t *)s)[x]);
                 break;
             default:
-                assert(0);
+                MP_ASSERT_UNREACHABLE();
             }
         }
     }
@@ -191,7 +191,7 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
 // packers will use "z" because they write zero.
 
 #define PA_WORD_4(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, sh_c3)      \
-    static void name(void *dst, void *src[], int w) {                       \
+    static void name(void *restrict dst, void *restrict src[], int w) {     \
         for (int x = 0; x < w; x++) {                                       \
             ((packed_t *)dst)[x] =                                          \
                 ((packed_t)((plane_t *)src[0])[x] << (sh_c0)) |             \
@@ -202,7 +202,7 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
     }
 
 #define UN_WORD_4(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, sh_c3, mask)\
-    static void name(void *src, void *dst[], int w) {                       \
+    static void name(void *restrict src, void *restrict dst[], int w) {     \
         for (int x = 0; x < w; x++) {                                       \
             packed_t c = ((packed_t *)src)[x];                              \
             ((plane_t *)dst[0])[x] = (c >> (sh_c0)) & (mask);               \
@@ -214,7 +214,7 @@ static void swap_endian(struct mp_image *dst, int dst_x, int dst_y,
 
 
 #define PA_WORD_3(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, pad)        \
-    static void name(void *dst, void *src[], int w) {                       \
+    static void name(void *restrict dst, void *restrict src[], int w) {     \
         for (int x = 0; x < w; x++) {                                       \
             ((packed_t *)dst)[x] = (pad) |                                  \
                 ((packed_t)((plane_t *)src[0])[x] << (sh_c0)) |             \
@@ -230,7 +230,7 @@ UN_WORD_4(un_cccc16,  uint64_t, uint16_t,  0, 16,  32, 48, 0xFFFFu)
 PA_WORD_4(pa_cccc16,  uint64_t, uint16_t,  0, 16,  32, 48)
 
 #define UN_WORD_3(name, packed_t, plane_t, sh_c0, sh_c1, sh_c2, mask)       \
-    static void name(void *src, void *dst[], int w) {                       \
+    static void name(void *restrict src, void *restrict dst[], int w) {     \
         for (int x = 0; x < w; x++) {                                       \
             packed_t c = ((packed_t *)src)[x];                              \
             ((plane_t *)dst[0])[x] = (c >> (sh_c0)) & (mask);               \
@@ -245,9 +245,11 @@ UN_WORD_3(un_x8ccc8,  uint32_t, uint8_t,  8, 16, 24, 0xFFu)
 PA_WORD_3(pa_z8ccc8,  uint32_t, uint8_t,  8, 16, 24, 0)
 UN_WORD_3(un_ccc10x2, uint32_t, uint16_t, 0, 10, 20, 0x3FFu)
 PA_WORD_3(pa_ccc10z2, uint32_t, uint16_t, 0, 10, 20, 0)
+UN_WORD_3(un_ccc16x16, uint64_t, uint16_t, 0, 16, 32, 0xFFFFu)
+PA_WORD_3(pa_ccc16z16, uint64_t, uint16_t, 0, 16, 32, 0)
 
 #define PA_WORD_2(name, packed_t, plane_t, sh_c0, sh_c1, pad)               \
-    static void name(void *dst, void *src[], int w) {                       \
+    static void name(void *restrict dst, void *restrict src[], int w) {     \
         for (int x = 0; x < w; x++) {                                       \
             ((packed_t *)dst)[x] = (pad) |                                  \
                 ((packed_t)((plane_t *)src[0])[x] << (sh_c0)) |             \
@@ -256,7 +258,7 @@ PA_WORD_3(pa_ccc10z2, uint32_t, uint16_t, 0, 10, 20, 0)
     }
 
 #define UN_WORD_2(name, packed_t, plane_t, sh_c0, sh_c1, mask)              \
-    static void name(void *src, void *dst[], int w) {                       \
+    static void name(void *restrict src, void *restrict dst[], int w) {     \
         for (int x = 0; x < w; x++) {                                       \
             packed_t c = ((packed_t *)src)[x];                              \
             ((plane_t *)dst[0])[x] = (c >> (sh_c0)) & (mask);               \
@@ -270,7 +272,7 @@ UN_WORD_2(un_cc16, uint32_t, uint16_t, 0, 16, 0xFFFFu)
 PA_WORD_2(pa_cc16, uint32_t, uint16_t, 0, 16, 0)
 
 #define PA_SEQ_3(name, comp_t)                                              \
-    static void name(void *dst, void *src[], int w) {                       \
+    static void name(void *restrict dst, void *restrict src[], int w) {     \
         comp_t *r = dst;                                                    \
         for (int x = 0; x < w; x++) {                                       \
             *r++ = ((comp_t *)src[0])[x];                                   \
@@ -280,7 +282,7 @@ PA_WORD_2(pa_cc16, uint32_t, uint16_t, 0, 16, 0)
     }
 
 #define UN_SEQ_3(name, comp_t)                                              \
-    static void name(void *src, void *dst[], int w) {                       \
+    static void name(void *restrict src, void *restrict dst[], int w) {     \
         comp_t *r = src;                                                    \
         for (int x = 0; x < w; x++) {                                       \
             ((comp_t *)dst[0])[x] = *r++;                                   \
@@ -300,20 +302,21 @@ struct regular_repacker {
     int component_width;    // number of bits for a single component
     int prepadding;         // number of bits of LSB padding
     int num_components;     // number of components that can be accessed
-    void (*pa_scanline)(void *a, void *b[], int w);
-    void (*un_scanline)(void *a, void *b[], int w);
+    void (*pa_scanline)(void *restrict a, void *restrict b[], int w);
+    void (*un_scanline)(void *restrict a, void *restrict b[], int w);
 };
 
 static const struct regular_repacker regular_repackers[] = {
-    {32, 8,  0, 3, pa_ccc8z8,  un_ccc8x8},
-    {32, 8,  8, 3, pa_z8ccc8,  un_x8ccc8},
-    {32, 8,  0, 4, pa_cccc8,   un_cccc8},
-    {64, 16, 0, 4, pa_cccc16,  un_cccc16},
-    {24, 8,  0, 3, pa_ccc8,    un_ccc8},
-    {48, 16, 0, 3, pa_ccc16,   un_ccc16},
-    {16, 8,  0, 2, pa_cc8,     un_cc8},
-    {32, 16, 0, 2, pa_cc16,    un_cc16},
-    {32, 10, 0, 3, pa_ccc10z2, un_ccc10x2},
+    {32, 8,  0, 3, pa_ccc8z8,   un_ccc8x8},
+    {32, 8,  8, 3, pa_z8ccc8,   un_x8ccc8},
+    {32, 8,  0, 4, pa_cccc8,    un_cccc8},
+    {64, 16, 0, 4, pa_cccc16,   un_cccc16},
+    {64, 16, 0, 3, pa_ccc16z16, un_ccc16x16},
+    {24, 8,  0, 3, pa_ccc8,     un_ccc8},
+    {48, 16, 0, 3, pa_ccc16,    un_ccc16},
+    {16, 8,  0, 2, pa_cc8,      un_cc8},
+    {32, 16, 0, 2, pa_cc16,     un_cc16},
+    {32, 10, 0, 3, pa_ccc10z2,  un_ccc10x2},
 };
 
 static void packed_repack(struct mp_repack *rp,
@@ -381,7 +384,7 @@ static void setup_packed_packer(struct mp_repack *rp)
 
         int prepad = components[0] ? 0 : 8;
         int first_comp = components[0] ? 0 : 1;
-        void (*repack_cb)(void *pa, void *pb[], int w) =
+        void (*repack_cb)(void *restrict pa, void *restrict pb[], int w) =
             rp->pack ? pa->pa_scanline : pa->un_scanline;
 
         if (pa->packed_width != desc.bpp[0] ||
@@ -405,8 +408,8 @@ static void setup_packed_packer(struct mp_repack *rp)
 }
 
 #define PA_SHIFT_LUT8(name, packed_t)                                       \
-    static void name(void *dst, void *src[], int w, uint8_t *lut,           \
-                     uint8_t s0, uint8_t s1, uint8_t s2) {                  \
+    static void name(void *restrict dst, void *restrict src[], int w,       \
+                     uint8_t *restrict lut, uint8_t s0, uint8_t s1, uint8_t s2) { \
         for (int x = 0; x < w; x++) {                                       \
             ((packed_t *)dst)[x] =                                          \
                 (lut[((uint8_t *)src[0])[x] + 256 * 0] << s0) |             \
@@ -417,8 +420,8 @@ static void setup_packed_packer(struct mp_repack *rp)
 
 
 #define UN_SHIFT_LUT8(name, packed_t)                                       \
-    static void name(void *src, void *dst[], int w, uint8_t *lut,           \
-                     uint8_t s0, uint8_t s1, uint8_t s2) {                  \
+    static void name(void *restrict src, void *restrict dst[], int w,       \
+                     uint8_t *restrict lut, uint8_t s0, uint8_t s1, uint8_t s2) { \
         for (int x = 0; x < w; x++) {                                       \
             packed_t c = ((packed_t *)src)[x];                              \
             ((uint8_t *)dst[0])[x] = lut[((c >> s0) & 0xFF) + 256 * 0];     \
@@ -444,9 +447,9 @@ static void fringe_rgb_repack(struct mp_repack *rp,
         pb[p] = mp_image_pixel_ptr(b, s, b_x, b_y);
     }
 
-    assert(rp->comp_size == 1 || rp->comp_size == 2);
+    mp_assert(rp->comp_size == 1 || rp->comp_size == 2);
 
-    void (*repack)(void *pa, void *pb[], int w, uint8_t *lut,
+    void (*repack)(void *restrict pa, void *restrict pb[], int w, uint8_t *restrict lut,
                    uint8_t s0, uint8_t s1, uint8_t s2) = NULL;
     if (rp->pack) {
         repack = rp->comp_size == 1 ? pa_shift_lut8_8 : pa_shift_lut8_16;
@@ -464,7 +467,7 @@ static void setup_fringe_rgb_packer(struct mp_repack *rp)
         return;
 
     if (desc.bpp[0] > 16 || (desc.bpp[0] % 8u) ||
-        mp_imgfmt_get_forced_csp(rp->imgfmt_a) != MP_CSP_RGB ||
+        mp_imgfmt_get_forced_csp(rp->imgfmt_a) != PL_COLOR_SYSTEM_RGB ||
         desc.num_planes != 1 || desc.comps[3].size)
         return;
 
@@ -510,10 +513,10 @@ static void setup_fringe_rgb_packer(struct mp_repack *rp)
     }
 
     rp->comp_size = (desc.bpp[0] + 7) / 8;
-    assert(rp->comp_size == 1 || rp->comp_size == 2);
+    mp_assert(rp->comp_size == 1 || rp->comp_size == 2);
 
     if (desc.endian_shift) {
-        assert(rp->comp_size == 2 && (1 << desc.endian_shift) == 2);
+        mp_assert(rp->comp_size == 2 && (1 << desc.endian_shift) == 2);
         rp->endian_size = 2;
     }
 }
@@ -522,10 +525,10 @@ static void unpack_pal(struct mp_repack *rp,
                        struct mp_image *a, int a_x, int a_y,
                        struct mp_image *b, int b_x, int b_y, int w)
 {
-    uint8_t *src = mp_image_pixel_ptr(a, 0, a_x, a_y);
+    uint8_t *restrict src = mp_image_pixel_ptr(a, 0, a_x, a_y);
     uint32_t *pal = (void *)a->planes[1];
 
-    uint8_t *dst[4] = {0};
+    uint8_t *restrict dst[4] = {0};
     for (int p = 0; p < b->num_planes; p++)
         dst[p] = mp_image_pixel_ptr(b, p, b_x, b_y);
 
@@ -542,8 +545,8 @@ static void bitmap_repack(struct mp_repack *rp,
                           struct mp_image *a, int a_x, int a_y,
                           struct mp_image *b, int b_x, int b_y, int w)
 {
-    uint8_t *pa = mp_image_pixel_ptr(a, 0, a_x, a_y);
-    uint8_t *pb = mp_image_pixel_ptr(b, 0, b_x, b_y);
+    uint8_t *restrict pa = mp_image_pixel_ptr(a, 0, a_x, a_y);
+    uint8_t *restrict pb = mp_image_pixel_ptr(b, 0, b_x, b_y);
 
     if (rp->pack) {
         for (unsigned x = 0; x < w; x += 8) {
@@ -593,7 +596,7 @@ static void setup_misc_packer(struct mp_repack *rp)
 }
 
 #define PA_P422(name, comp_t)                                               \
-    static void name(void *dst, void *src[], int w, uint8_t *c) {           \
+    static void name(void *restrict dst, void *restrict src[], int w, uint8_t *restrict c) { \
         for (int x = 0; x < w; x += 2) {                                    \
             ((comp_t *)dst)[x * 2 + c[0]] = ((comp_t *)src[0])[x + 0];      \
             ((comp_t *)dst)[x * 2 + c[1]] = ((comp_t *)src[0])[x + 1];      \
@@ -604,7 +607,7 @@ static void setup_misc_packer(struct mp_repack *rp)
 
 
 #define UN_P422(name, comp_t)                                               \
-    static void name(void *src, void *dst[], int w, uint8_t *c) {           \
+    static void name(void *restrict src, void *restrict dst[], int w, uint8_t *restrict c) { \
         for (int x = 0; x < w; x += 2) {                                    \
             ((comp_t *)dst[0])[x + 0]  = ((comp_t *)src)[x * 2 + c[0]];     \
             ((comp_t *)dst[0])[x + 1]  = ((comp_t *)src)[x * 2 + c[1]];     \
@@ -618,7 +621,7 @@ PA_P422(pa_p422_16, uint16_t)
 UN_P422(un_p422_8,  uint8_t)
 UN_P422(un_p422_16, uint16_t)
 
-static void pa_p411_8(void *dst, void *src[], int w, uint8_t *c)
+static void pa_p411_8(void *restrict dst, void *restrict src[], int w, uint8_t *restrict c)
 {
     for (int x = 0; x < w; x += 4) {
         ((uint8_t *)dst)[x / 4 * 6 + c[0]] = ((uint8_t *)src[0])[x + 0];
@@ -631,7 +634,7 @@ static void pa_p411_8(void *dst, void *src[], int w, uint8_t *c)
 }
 
 
-static void un_p411_8(void *src, void *dst[], int w, uint8_t *c)
+static void un_p411_8(void *restrict src, void *restrict dst[], int w, uint8_t *restrict c)
 {
     for (int x = 0; x < w; x += 4) {
         ((uint8_t *)dst[0])[x + 0]  = ((uint8_t *)src)[x / 4 * 6 + c[0]];
@@ -711,7 +714,7 @@ static void setup_fringe_yuv_packer(struct mp_repack *rp)
 
     if (desc.endian_shift) {
         rp->endian_size = 1 << desc.endian_shift;
-        assert(rp->endian_size == 2);
+        mp_assert(rp->endian_size == 2);
     }
 }
 
@@ -770,7 +773,7 @@ static void setup_nv_packer(struct mp_repack *rp)
     for (int i = 0; i < MP_ARRAY_SIZE(regular_repackers); i++) {
         const struct regular_repacker *pa = &regular_repackers[i];
 
-        void (*repack_cb)(void *pa, void *pb[], int w) =
+        void (*repack_cb)(void *restrict pa, void *restrict pb[], int w) =
             rp->pack ? pa->pa_scanline : pa->un_scanline;
 
         if (pa->packed_width != desc.component_size * 2 * 8 ||
@@ -791,8 +794,8 @@ static void setup_nv_packer(struct mp_repack *rp)
 }
 
 #define PA_F32(name, packed_t)                                              \
-    static void name(void *dst, float *src, int w, float m, float o,        \
-                     uint32_t p_max) {                                      \
+    static void name(void *restrict dst, float *restrict src, int w, float m, \
+                     float o, uint32_t p_max) {                             \
         for (int x = 0; x < w; x++) {                                       \
             ((packed_t *)dst)[x] =                                          \
                 MPCLAMP(lrint((src[x] + o) * m), 0, (packed_t)p_max);       \
@@ -800,8 +803,8 @@ static void setup_nv_packer(struct mp_repack *rp)
     }
 
 #define UN_F32(name, packed_t)                                              \
-    static void name(void *src, float *dst, int w, float m, float o,        \
-                     uint32_t unused) {                                     \
+    static void name(void *restrict src, float *restrict dst, int w, float m, \
+                     float o, uint32_t unused) {                            \
         for (int x = 0; x < w; x++)                                         \
             dst[x] = ((packed_t *)src)[x] * m + o;                          \
     }
@@ -816,9 +819,9 @@ static void repack_float(struct mp_repack *rp,
                          struct mp_image *a, int a_x, int a_y,
                          struct mp_image *b, int b_x, int b_y, int w)
 {
-    assert(rp->f32_comp_size == 1 || rp->f32_comp_size == 2);
+    mp_assert(rp->f32_comp_size == 1 || rp->f32_comp_size == 2);
 
-    void (*packer)(void *a, float *b, int w, float fm, float fb, uint32_t max)
+    void (*packer)(void *restrict a, float *restrict b, int w, float fm, float fb, uint32_t max)
         = rp->pack ? (rp->f32_comp_size == 1 ? pa_f32_8 : pa_f32_16)
                    : (rp->f32_comp_size == 1 ? un_f32_8 : un_f32_16);
 
@@ -842,15 +845,15 @@ static void update_repack_float(struct mp_repack *rp)
     // Image in input format.
     struct mp_image *ui =  rp->pack ? rp->steps[rp->num_steps - 1].buf[1]
                                     : rp->steps[0].buf[0];
-    enum mp_csp csp = ui->params.color.space;
-    enum mp_csp_levels levels = ui->params.color.levels;
+    enum pl_color_system csp = ui->params.repr.sys;
+    enum pl_color_levels levels = ui->params.repr.levels;
     if (rp->f32_csp_space == csp && rp->f32_csp_levels == levels)
         return;
 
     // The fixed point format.
     struct mp_regular_imgfmt desc = {0};
     mp_get_regular_imgfmt(&desc, rp->imgfmt_b);
-    assert(desc.component_size);
+    mp_assert(desc.component_size);
 
     int comp_bits = desc.component_size * 8 + MPMIN(desc.component_pad, 0);
     for (int p = 0; p < desc.num_planes; p++) {
@@ -869,21 +872,21 @@ static void update_repack_float(struct mp_repack *rp)
 void repack_line(struct mp_repack *rp, int dst_x, int dst_y,
                  int src_x, int src_y, int w)
 {
-    assert(rp->configured);
+    mp_assert(rp->configured);
 
     struct repack_step *first = &rp->steps[0];
     struct repack_step *last = &rp->steps[rp->num_steps - 1];
 
-    assert(dst_x >= 0 && dst_y >= 0 && src_x >= 0 && src_y >= 0 && w >= 0);
-    assert(dst_x + w <= MP_ALIGN_UP(last->buf[1]->w, last->fmt[1].align_x));
-    assert(src_x + w <= MP_ALIGN_UP(first->buf[0]->w, first->fmt[0].align_x));
-    assert(dst_y < last->buf[1]->h);
-    assert(src_y < first->buf[0]->h);
-    assert(!(dst_x & (last->fmt[1].align_x - 1)));
-    assert(!(src_x & (first->fmt[0].align_x - 1)));
-    assert(!(w & ((1 << first->fmt[0].chroma_xs) - 1)));
-    assert(!(dst_y & (last->fmt[1].align_y - 1)));
-    assert(!(src_y & (first->fmt[0].align_y - 1)));
+    mp_assert(dst_x >= 0 && dst_y >= 0 && src_x >= 0 && src_y >= 0 && w >= 0);
+    mp_assert(dst_x + w <= MP_ALIGN_UP(last->buf[1]->w, last->fmt[1].align_x));
+    mp_assert(src_x + w <= MP_ALIGN_UP(first->buf[0]->w, first->fmt[0].align_x));
+    mp_assert(dst_y < last->buf[1]->h);
+    mp_assert(src_y < first->buf[0]->h);
+    mp_assert(!(dst_x & (last->fmt[1].align_x - 1)));
+    mp_assert(!(src_x & (first->fmt[0].align_x - 1)));
+    mp_assert(!(w & ((1 << first->fmt[0].chroma_xs) - 1)));
+    mp_assert(!(dst_y & (last->fmt[1].align_y - 1)));
+    mp_assert(!(src_y & (first->fmt[0].align_y - 1)));
 
     for (int n = 0; n < rp->num_steps; n++) {
         struct repack_step *rs = &rp->steps[n];
@@ -986,8 +989,8 @@ static bool setup_format_ne(struct mp_repack *rp)
                 (desc.component_size != 1 && desc.component_size != 2))
                 return false;
             rp->f32_comp_size = desc.component_size;
-            rp->f32_csp_space = MP_CSP_COUNT;
-            rp->f32_csp_levels = MP_CSP_LEVELS_COUNT;
+            rp->f32_csp_space = PL_COLOR_SYSTEM_COUNT;
+            rp->f32_csp_levels = PL_COLOR_LEVELS_COUNT;
             rp->steps[rp->num_steps++] = (struct repack_step) {
                 .type = REPACK_STEP_FLOAT,
                 .fmt = {
@@ -1026,7 +1029,7 @@ static bool setup_format_ne(struct mp_repack *rp)
     }
 
     for (int n = 0; n < rp->num_steps - 1; n++)
-        assert(rp->steps[n].fmt[1].id == rp->steps[n + 1].fmt[0].id);
+        mp_assert(rp->steps[n].fmt[1].id == rp->steps[n + 1].fmt[0].id);
 
     return true;
 }
@@ -1112,12 +1115,12 @@ bool repack_config_buffers(struct mp_repack *rp,
 
     rp->configured = false;
 
-    assert(dst && src);
+    mp_assert(dst && src);
 
     int buf_w = MPMAX(dst->w, src->w);
 
-    assert(dst->imgfmt == rs_last->fmt[1].id);
-    assert(src->imgfmt == rs_first->fmt[0].id);
+    mp_assert(dst->imgfmt == rs_last->fmt[1].id);
+    mp_assert(src->imgfmt == rs_first->fmt[0].id);
 
     // Chain/allocate buffers.
 
@@ -1131,7 +1134,7 @@ bool repack_config_buffers(struct mp_repack *rp,
         struct repack_step *rs = &rp->steps[n];
 
         if (!rs->buf[0]) {
-            assert(n > 0);
+            mp_assert(n > 0);
             rs->buf[0] = rp->steps[n - 1].buf[1];
         }
 

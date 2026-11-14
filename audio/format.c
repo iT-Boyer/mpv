@@ -33,6 +33,10 @@ int af_fmt_to_bytes(int format)
     case AF_FORMAT_FLOAT:   return 4;
     case AF_FORMAT_DOUBLE:  return 8;
     }
+    if (format == AF_FORMAT_S_DOP)
+        return 4;
+    if (format == AF_FORMAT_DSD)
+        return 1;
     if (af_fmt_is_spdif(format))
         return 2;
     return 0;
@@ -53,9 +57,11 @@ bool af_fmt_is_float(int format)
 // true for both unsigned and signed ints
 bool af_fmt_is_int(int format)
 {
-    return format && !af_fmt_is_spdif(format) && !af_fmt_is_float(format);
+    return format && af_fmt_is_pcm(format) && !af_fmt_is_float(format) &&
+           format != AF_FORMAT_DSD;
 }
 
+// true for IEC61937 wrapped formats only (not other bitstream formats)
 bool af_fmt_is_spdif(int format)
 {
     return af_format_sample_alignment(format) > 1;
@@ -63,7 +69,8 @@ bool af_fmt_is_spdif(int format)
 
 bool af_fmt_is_pcm(int format)
 {
-    return af_fmt_is_valid(format) && !af_fmt_is_spdif(format);
+    return af_fmt_is_valid(format) && !af_fmt_is_spdif(format) &&
+           format != AF_FORMAT_S_DOP;
 }
 
 static const int planar_formats[][2] = {
@@ -135,13 +142,20 @@ const char *af_fmt_to_str(int format)
     case AF_FORMAT_S_EAC3:      return "spdif-eac3";
     case AF_FORMAT_S_MP3:       return "spdif-mp3";
     case AF_FORMAT_S_TRUEHD:    return "spdif-truehd";
+    case AF_FORMAT_S_DOP:       return "dop";
+    case AF_FORMAT_DSD:         return "dsd";
     }
     return "??";
 }
 
 void af_fill_silence(void *dst, size_t bytes, int format)
 {
-    memset(dst, af_fmt_is_unsigned(format) ? 0x80 : 0, bytes);
+    int fill = 0;
+    if (af_fmt_is_unsigned(format))
+        fill = 0x80;
+    if (format == AF_FORMAT_DSD)
+        fill = 0x69; // only ultrasonic tones, filtered out on playback
+    memset(dst, fill, bytes);
 }
 
 // Returns a "score" that serves as heuristic how lossy or hard a conversion is.
@@ -154,6 +168,13 @@ int af_format_conversion_score(int dst_format, int src_format)
         return INT_MIN;
     if (dst_format == src_format)
         return 1024;
+    if (src_format == AF_FORMAT_DSD) {
+        return af_fmt_is_pcm(dst_format) && dst_format != AF_FORMAT_DSD
+               ? af_format_conversion_score(dst_format, AF_FORMAT_FLOAT) - 1
+               : INT_MIN;
+    }
+    if (dst_format == AF_FORMAT_DSD)
+        return INT_MIN;
     // Can't be normally converted
     if (!af_fmt_is_pcm(dst_format) || !af_fmt_is_pcm(src_format))
         return INT_MIN;
@@ -187,7 +208,7 @@ int af_format_conversion_score(int dst_format, int src_format)
     return score;
 }
 
-struct entry {
+struct mp_entry {
     int fmt;
     int score;
 };
@@ -195,7 +216,7 @@ struct entry {
 static int cmp_entry(const void *a, const void *b)
 {
 #define CMP_INT(a, b) (a > b ? 1 : (a < b ? -1 : 0))
-    return -CMP_INT(((struct entry *)a)->score, ((struct entry *)b)->score);
+    return -CMP_INT(((struct mp_entry *)a)->score, ((struct mp_entry *)b)->score);
 }
 
 // Return a list of sample format compatible to src_format, sorted by order
@@ -207,11 +228,11 @@ static int cmp_entry(const void *a, const void *b)
 void af_get_best_sample_formats(int src_format, int *out_formats)
 {
     int num = 0;
-    struct entry e[AF_FORMAT_COUNT + 1];
+    struct mp_entry e[AF_FORMAT_COUNT + 1];
     for (int fmt = 1; fmt < AF_FORMAT_COUNT; fmt++) {
         int score = af_format_conversion_score(fmt, src_format);
         if (score > INT_MIN)
-            e[num++] = (struct entry){fmt, score};
+            e[num++] = (struct mp_entry){fmt, score};
     }
     qsort(e, num, sizeof(e[0]), cmp_entry);
     for (int n = 0; n < num; n++)

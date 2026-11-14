@@ -21,15 +21,18 @@
 #include "utils.h"
 
 // 0-terminated list of desktop GL versions a backend should try to
-// initialize. The first entry is the most preferred version.
-const int mpgl_preferred_gl_versions[] = {
+// initialize. Each entry is the minimum required version.
+const int mpgl_min_required_gl_versions[] = {
+    /*
+     * Nvidia drivers will not provide the highest supported version
+     * when 320 core is requested. Instead, it just returns 3.2. This
+     * would be bad, as we actually want compute shaders that require
+     * 4.2, so we have to request a sufficiently high version. We use
+     * 440 to maximise driver compatibility as we don't need anything
+     * from newer versions.
+     */
     440,
-    430,
-    400,
-    330,
     320,
-    310,
-    300,
     210,
     0
 };
@@ -40,39 +43,29 @@ enum {
     FLUSH_AUTO,
 };
 
-enum {
-    GLES_AUTO = 0,
-    GLES_YES,
-    GLES_NO,
-};
-
 struct opengl_opts {
-    int use_glfinish;
-    int waitvsync;
+    bool use_glfinish;
+    bool waitvsync;
     int vsync_pattern[2];
     int swapinterval;
     int early_flush;
-    int restrict_version;
     int gles_mode;
 };
 
 #define OPT_BASE_STRUCT struct opengl_opts
 const struct m_sub_options opengl_conf = {
     .opts = (const struct m_option[]) {
-        {"opengl-glfinish", OPT_FLAG(use_glfinish)},
-        {"opengl-waitvsync", OPT_FLAG(waitvsync)},
-        {"opengl-swapinterval", OPT_INT(swapinterval)},
+        {"opengl-glfinish", OPT_BOOL(use_glfinish)},
+        {"opengl-waitvsync", OPT_BOOL(waitvsync)},
+        {"opengl-swapinterval", OPT_INT(swapinterval), .flags = UPDATE_VO},
         {"opengl-check-pattern-a", OPT_INT(vsync_pattern[0])},
         {"opengl-check-pattern-b", OPT_INT(vsync_pattern[1])},
-        {"opengl-restrict", OPT_INT(restrict_version)},
         {"opengl-es", OPT_CHOICE(gles_mode,
-            {"auto", GLES_AUTO}, {"yes", GLES_YES}, {"no", GLES_NO})},
+            {"auto", GLES_AUTO}, {"yes", GLES_YES}, {"no", GLES_NO}),
+            .flags = UPDATE_VO,
+        },
         {"opengl-early-flush", OPT_CHOICE(early_flush,
             {"no", FLUSH_NO}, {"yes", FLUSH_YES}, {"auto", FLUSH_AUTO})},
-        {"opengl-debug", OPT_REPLACED("gpu-debug")},
-        {"opengl-sw", OPT_REPLACED("gpu-sw")},
-        {"opengl-vsync-fences", OPT_REPLACED("swapchain-depth")},
-        {"opengl-backend", OPT_REPLACED("gpu-context")},
         {0},
     },
     .defaults = &(const struct opengl_opts) {
@@ -84,9 +77,8 @@ const struct m_sub_options opengl_conf = {
 struct priv {
     GL *gl;
     struct mp_log *log;
-    struct ra_gl_ctx_params params;
+    struct ra_ctx_params params;
     struct opengl_opts *opts;
-    struct ra_swapchain_fns fns;
     GLuint main_fb;
     struct ra_tex *wrapped_fb; // corresponds to main_fb
     // for debugging:
@@ -100,29 +92,17 @@ struct priv {
     int num_vsync_fences;
 };
 
-bool ra_gl_ctx_test_version(struct ra_ctx *ctx, int version, bool es)
+enum gles_mode ra_gl_ctx_get_glesmode(struct ra_ctx *ctx)
 {
-    bool ret;
-    struct opengl_opts *opts;
     void *tmp = talloc_new(NULL);
+    struct opengl_opts *opts;
+    enum gles_mode mode;
+
     opts = mp_get_config_group(tmp, ctx->global, &opengl_conf);
+    mode = opts->gles_mode;
 
-    // Version too high
-    if (opts->restrict_version && version >= opts->restrict_version) {
-        ret = false;
-        goto done;
-    }
-
-    switch (opts->gles_mode) {
-    case GLES_YES:  ret = es;   goto done;
-    case GLES_NO:   ret = !es;  goto done;
-    case GLES_AUTO: ret = true; goto done;
-    default: abort();
-    }
-
-done:
     talloc_free(tmp);
-    return ret;
+    return mode;
 }
 
 void ra_gl_ctx_uninit(struct ra_ctx *ctx)
@@ -144,11 +124,12 @@ void ra_gl_ctx_uninit(struct ra_ctx *ctx)
 
 static const struct ra_swapchain_fns ra_gl_swapchain_fns;
 
-bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
+bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_ctx_params params)
 {
     struct ra_swapchain *sw = ctx->swapchain = talloc_ptrtype(NULL, sw);
     *sw = (struct ra_swapchain) {
         .ctx = ctx,
+        .fns = &ra_gl_swapchain_fns,
     };
 
     struct priv *p = sw->priv = talloc_ptrtype(sw, p);
@@ -157,30 +138,15 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
         .log    = ctx->log,
         .params = params,
         .opts   = mp_get_config_group(p, ctx->global, &opengl_conf),
-        .fns    = ra_gl_swapchain_fns,
     };
 
-    sw->fns = &p->fns;
-
-    const struct ra_swapchain_fns *ext = p->params.external_swapchain;
-    if (ext) {
-        if (ext->color_depth)
-            p->fns.color_depth = ext->color_depth;
-        if (ext->start_frame)
-            p->fns.start_frame = ext->start_frame;
-        if (ext->submit_frame)
-            p->fns.submit_frame = ext->submit_frame;
-        if (ext->swap_buffers)
-            p->fns.swap_buffers = ext->swap_buffers;
-    }
-
     if (!gl->version && !gl->es)
-        return false;
+        goto fail;
 
     if (gl->mpgl_caps & MPGL_CAP_SW) {
         MP_WARN(p, "Suspected software renderer or indirect context.\n");
         if (ctx->opts.probing && !ctx->opts.allow_sw)
-            return false;
+            goto fail;
     }
 
     gl->debug_context = ctx->opts.debug;
@@ -192,7 +158,14 @@ bool ra_gl_ctx_init(struct ra_ctx *ctx, GL *gl, struct ra_gl_ctx_params params)
     }
 
     ctx->ra = ra_create_gl(p->gl, ctx->log);
-    return !!ctx->ra;
+    if (!ctx->ra)
+        goto fail;
+
+    return true;
+
+fail:
+    ra_gl_ctx_uninit(ctx);
+    return false;
 }
 
 void ra_gl_ctx_resize(struct ra_swapchain *sw, int w, int h, int fbo)
@@ -220,6 +193,12 @@ int ra_gl_ctx_color_depth(struct ra_swapchain *sw)
     if ((gl->es < 300 && !gl->version) || !(gl->mpgl_caps & MPGL_CAP_FB))
         return 0;
 
+    // The *_SIZE attachment queries need GL_ARB_framebuffer_object or
+    // GL 3.0+; GL_EXT_framebuffer_object does not provide them.
+    if (gl->version && gl->version < 300 &&
+        !gl_check_extension(gl->extensions, "GL_ARB_framebuffer_object"))
+        return 0;
+
     gl->BindFramebuffer(GL_FRAMEBUFFER, p->main_fb);
 
     GLenum obj = gl->version ? GL_BACK_LEFT : GL_BACK;
@@ -239,9 +218,18 @@ int ra_gl_ctx_color_depth(struct ra_swapchain *sw)
 bool ra_gl_ctx_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
 {
     struct priv *p = sw->priv;
+
+    bool visible = true;
+    if (p->params.check_visible)
+        visible = p->params.check_visible(sw->ctx);
+
+    // If out_fbo is NULL, this was called from vo_gpu_next. Bail out.
+    if (!out_fbo || !visible)
+        return visible;
+
     *out_fbo = (struct ra_fbo) {
          .tex = p->wrapped_fb,
-         .flip = !p->params.flipped, // OpenGL FBs are normally flipped
+         .flip = !p->gl->flipped, // OpenGL FBs are normally flipped
     };
     return true;
 }
@@ -254,7 +242,7 @@ bool ra_gl_ctx_submit_frame(struct ra_swapchain *sw, const struct vo_frame *fram
     if (p->opts->use_glfinish)
         gl->Finish();
 
-    if (gl->FenceSync && !p->params.external_swapchain) {
+    if (gl->FenceSync && p->params.swap_buffers) {
         GLsync fence = gl->FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         if (fence)
             MP_TARRAY_APPEND(p, p->vsync_fences, p->num_vsync_fences, fence);
@@ -264,7 +252,7 @@ bool ra_gl_ctx_submit_frame(struct ra_swapchain *sw, const struct vo_frame *fram
     case FLUSH_AUTO:
         if (frame->display_synced)
             break;
-        // fall through
+        MP_FALLTHROUGH;
     case FLUSH_YES:
         gl->Flush();
     }
@@ -282,7 +270,7 @@ static void check_pattern(struct priv *p, int item)
         p->matches++;
     } else {
         p->mismatches++;
-        MP_WARN(p, "wrong pattern, expected %d got %d (hit: %d, mis: %d)\n",
+        MP_WARN(p, "wrong pattern, expected %d got %d (hit: %d, miss: %d)\n",
                 expected, item, p->matches, p->mismatches);
     }
 }
@@ -327,8 +315,26 @@ static void ra_gl_ctx_get_vsync(struct ra_swapchain *sw,
         p->params.get_vsync(sw->ctx, info);
 }
 
+static bool ra_gl_ctx_set_color(struct ra_swapchain *sw, struct mp_image_params *params)
+{
+    struct priv *p = sw->priv;
+    if (p->params.set_color)
+        return p->params.set_color(sw->ctx, params);
+    return false;
+}
+
+static pl_color_space_t ra_gl_ctx_target_csp(struct ra_swapchain *sw)
+{
+    struct priv *p = sw->priv;
+    if (p->params.preferred_csp)
+        return p->params.preferred_csp(sw->ctx);
+    return (pl_color_space_t){0};
+}
+
 static const struct ra_swapchain_fns ra_gl_swapchain_fns = {
     .color_depth   = ra_gl_ctx_color_depth,
+    .set_color     = ra_gl_ctx_set_color,
+    .target_csp    = ra_gl_ctx_target_csp,
     .start_frame   = ra_gl_ctx_start_frame,
     .submit_frame  = ra_gl_ctx_submit_frame,
     .swap_buffers  = ra_gl_ctx_swap_buffers,

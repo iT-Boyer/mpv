@@ -1,5 +1,6 @@
 #include "common/msg.h"
 #include "video/out/vo.h"
+#include "video/mp_image.h"
 #include "utils.h"
 
 // Standard parallel 2D projection, except y1 < y0 means that the coordinate
@@ -33,10 +34,60 @@ void gl_transform_trans(struct gl_transform t, struct gl_transform *x)
     gl_transform_vec(t, &x->t[0], &x->t[1]);
 }
 
-void gl_transform_ortho_fbo(struct gl_transform *t, struct ra_fbo fbo)
+void gl_transform_ortho_fbo(struct gl_transform *t, const struct ra_fbo *fbo)
 {
-    int y_dir = fbo.flip ? -1 : 1;
-    gl_transform_ortho(t, 0, fbo.tex->params.w, 0, fbo.tex->params.h * y_dir);
+    int y_dir = fbo->flip ? -1 : 1;
+    gl_transform_ortho(t, 0, fbo->tex->params.w, 0, fbo->tex->params.h * y_dir);
+}
+
+double gl_video_scale_ambient_lux(float lmin, float lmax,
+                                  float rmin, float rmax, double lux)
+{
+    mp_assert(lmax > lmin);
+
+    double num = (rmax - rmin) * (log10(lux) - log10(lmin));
+    double den = log10(lmax) - log10(lmin);
+    double result = num / den + rmin;
+
+    // clamp the result
+    float max = MPMAX(rmax, rmin);
+    float min = MPMIN(rmax, rmin);
+    return MPMAX(MPMIN(result, max), min);
+}
+
+bool gpu_get_auto_param(const struct mp_image *mpi, struct bstr name, double *out)
+{
+    const struct mp_image_params *params = &mpi->params;
+    float chroma_offset_x, chroma_offset_y;
+    pl_chroma_location_offset(params->chroma_location,
+                              &chroma_offset_x, &chroma_offset_y);
+
+    const struct {
+        const char *name;
+        double value;
+    } opts[] = {
+        {             "PTS", mpi->pts                       },
+        { "chroma_offset_x", chroma_offset_x                },
+        { "chroma_offset_y", chroma_offset_y                },
+        {        "min_luma", params->color.hdr.min_luma     },
+        {        "max_luma", params->color.hdr.max_luma     },
+        {         "max_cll", params->color.hdr.max_cll      },
+        {        "max_fall", params->color.hdr.max_fall     },
+        {     "scene_max_r", params->color.hdr.scene_max[0] },
+        {     "scene_max_g", params->color.hdr.scene_max[1] },
+        {     "scene_max_b", params->color.hdr.scene_max[2] },
+        {       "scene_avg", params->color.hdr.scene_avg    },
+        {        "max_pq_y", params->color.hdr.max_pq_y     },
+        {        "avg_pq_y", params->color.hdr.avg_pq_y     },
+    };
+
+    for (int n = 0; n < MP_ARRAY_SIZE(opts); n++) {
+        if (bstrcmp0(name, opts[n].name) != 0)
+            continue;
+        *out = opts[n].value;
+        return true;
+    }
+    return false;
 }
 
 void ra_buf_pool_uninit(struct ra *ra, struct ra_buf_pool *pool)
@@ -72,7 +123,7 @@ static bool ra_buf_pool_grow(struct ra *ra, struct ra_buf_pool *pool)
 struct ra_buf *ra_buf_pool_get(struct ra *ra, struct ra_buf_pool *pool,
                                const struct ra_buf_params *params)
 {
-    assert(!params->initial_data);
+    mp_assert(!params->initial_data);
 
     if (!ra_buf_params_compatible(params, &pool->current_params)) {
         ra_buf_pool_uninit(ra, pool);
@@ -257,7 +308,7 @@ void timer_pool_start(struct timer_pool *pool)
     if (!pool)
         return;
 
-    assert(!pool->running);
+    mp_assert(!pool->running);
     pool->ra->fns->timer_start(pool->ra, pool->timer);
     pool->running = true;
 }
@@ -267,7 +318,7 @@ void timer_pool_stop(struct timer_pool *pool)
     if (!pool)
         return;
 
-    assert(pool->running);
+    mp_assert(pool->running);
     uint64_t res = pool->ra->fns->timer_stop(pool->ra, pool->timer);
     pool->running = false;
 
@@ -324,9 +375,12 @@ void mp_log_source(struct mp_log *log, int lev, const char *src)
         return;
     while (*src) {
         const char *end = strchr(src, '\n');
-        const char *next = end + 1;
-        if (!end)
+        const char *next;
+        if (!end) {
             next = end = src + strlen(src);
+        } else {
+            next = end + 1;
+        }
         mp_msg(log, lev, "[%3d] %.*s\n", line, (int)(end - src), src);
         line++;
         src = next;

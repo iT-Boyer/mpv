@@ -1,11 +1,14 @@
 #include "config.h"
 #include "hwdec.h"
 #include "libmpv_gpu.h"
-#include "libmpv/render_gl.h"
+#include "mpv/render_gl.h"
 #include "video.h"
 #include "video/out/libmpv.h"
 
 static const struct libmpv_gpu_context_fns *context_backends[] = {
+#if HAVE_D3D11
+    &libmpv_gpu_context_d3d11,
+#endif
 #if HAVE_GL
     &libmpv_gpu_context_gl,
 #endif
@@ -81,15 +84,15 @@ static int init(struct render_backend *ctx, mpv_render_param *params)
             void *data = params[n].data;
             if (entry->size)
                 data = talloc_memdup(p, data, entry->size);
-            ra_add_native_resource(p->context->ra, entry->name, data);
+            ra_add_native_resource(p->context->ra_ctx->ra, entry->name, data);
         }
     }
 
-    p->renderer = gl_video_init(p->context->ra, ctx->log, ctx->global);
+    p->renderer = gl_video_init(p->context->ra_ctx->ra, ctx->log, ctx->global);
 
     ctx->hwdec_devs = hwdec_devices_create();
-    gl_video_load_hwdecs(p->renderer, ctx->hwdec_devs, true);
-    ctx->driver_caps = VO_CAP_ROTATE90;
+    gl_video_init_hwdecs(p->renderer, p->context->ra_ctx, ctx->hwdec_devs, true);
+    ctx->driver_caps = VO_CAP_ROTATE90 | VO_CAP_VFLIP;
     return 0;
 }
 
@@ -107,12 +110,14 @@ static int set_parameter(struct render_backend *ctx, mpv_render_param param)
     switch (param.type) {
     case MPV_RENDER_PARAM_ICC_PROFILE: {
         mpv_byte_array *data = param.data;
-        gl_video_set_icc_profile(p->renderer, (bstr){data->data, data->size});
+        gl_video_set_icc_profile(p->renderer, bstrdup(NULL, (bstr){data->data, data->size}));
         return 0;
     }
     case MPV_RENDER_PARAM_AMBIENT_LIGHT: {
+        MP_WARN(ctx, "MPV_RENDER_PARAM_AMBIENT_LIGHT is deprecated and might be "
+                     "removed in the future (replacement: gamma-auto.lua)\n");
         int lux = *(int *)param.data;
-        gl_video_set_ambient_lux(p->renderer, lux);
+        gl_video_set_ambient_lux(p->renderer, (double)lux);
         return 0;
     }
     default:
@@ -179,24 +184,26 @@ static int render(struct render_backend *ctx, mpv_render_param *params,
 
     int depth = *(int *)get_mpv_render_param(params, MPV_RENDER_PARAM_DEPTH,
                                              &(int){0});
+    if (!depth)
+        depth = tex->params.format->component_depth[0];
     gl_video_set_fb_depth(p->renderer, depth);
 
     bool flip = *(int *)get_mpv_render_param(params, MPV_RENDER_PARAM_FLIP_Y,
                                              &(int){0});
 
     struct ra_fbo target = {.tex = tex, .flip = flip};
-    gl_video_render_frame(p->renderer, frame, target, RENDER_FRAME_DEF);
+    gl_video_render_frame(p->renderer, frame, &target, RENDER_FRAME_DEF);
     p->context->fns->done_frame(p->context, frame->display_synced);
 
     return 0;
 }
 
 static struct mp_image *get_image(struct render_backend *ctx, int imgfmt,
-                                  int w, int h, int stride_align)
+                                  int w, int h, int stride_align, int flags)
 {
     struct priv *p = ctx->priv;
 
-    return gl_video_get_image(p->renderer, imgfmt, w, h, stride_align);
+    return gl_video_get_image(p->renderer, imgfmt, w, h, stride_align, flags);
 }
 
 static void screenshot(struct render_backend *ctx, struct vo_frame *frame,

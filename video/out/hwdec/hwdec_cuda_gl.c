@@ -17,15 +17,14 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
 #include "hwdec_cuda.h"
 #include "options/m_config.h"
+#include "options/options.h"
 #include "video/out/opengl/formats.h"
 #include "video/out/opengl/ra_gl.h"
 
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
-#include <unistd.h>
 
 #define CHECK_CU(x) check_cu((mapper)->owner, (x), #x)
 
@@ -40,9 +39,8 @@ static bool cuda_ext_gl_init(struct ra_hwdec_mapper *mapper,
     struct cuda_mapper_priv *p = mapper->priv;
     CudaFunctions *cu = p_owner->cu;
     int ret = 0;
-    CUcontext dummy;
 
-    struct ext_gl *egl = talloc_ptrtype(NULL, egl);
+    struct ext_gl *egl = talloc_zero_ptrtype(NULL, egl);
     p->ext[n] = egl;
 
     struct ra_tex_params params = {
@@ -85,7 +83,6 @@ static bool cuda_ext_gl_init(struct ra_hwdec_mapper *mapper,
     return true;
 
 error:
-    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return false;
 }
 
@@ -106,21 +103,23 @@ static void cuda_ext_gl_uninit(const struct ra_hwdec_mapper *mapper, int n)
 #undef CHECK_CU
 #define CHECK_CU(x) check_cu(hw, (x), #x)
 
-bool cuda_gl_init(const struct ra_hwdec *hw) {
+static bool cuda_gl_check(const struct ra_hwdec *hw) {
+    if (!ra_is_gl(hw->ra_ctx->ra))
+        return false; // This is not an OpenGL RA.
+
+    GL *gl = ra_gl_get(hw->ra_ctx->ra);
+    if (gl->version < 210 && gl->es < 300) {
+        MP_VERBOSE(hw, "need OpenGL >= 2.1 or OpenGL-ES >= 3.0\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool cuda_gl_init(const struct ra_hwdec *hw) {
     int ret = 0;
     struct cuda_hw_priv *p = hw->priv;
     CudaFunctions *cu = p->cu;
-
-    if (ra_is_gl(hw->ra)) {
-        GL *gl = ra_gl_get(hw->ra);
-        if (gl->version < 210 && gl->es < 300) {
-            MP_VERBOSE(hw, "need OpenGL >= 2.1 or OpenGL-ES >= 3.0\n");
-            return false;
-        }
-    } else {
-        // This is not an OpenGL RA.
-        return false;
-    }
 
     CUdevice display_dev;
     unsigned int device_count;
@@ -136,9 +135,9 @@ bool cuda_gl_init(const struct ra_hwdec *hw) {
 
     p->decode_ctx = p->display_ctx;
 
-    int decode_dev_idx = -1;
-    mp_read_option_raw(hw->global, "cuda-decode-device", &m_option_type_choice,
-                       &decode_dev_idx);
+    struct cuda_opts *opts = mp_get_config_group(NULL, hw->global, &cuda_conf);
+    int decode_dev_idx = opts->cuda_device;
+    talloc_free(opts);
 
     if (decode_dev_idx > -1) {
         CUcontext dummy;
@@ -172,3 +171,8 @@ bool cuda_gl_init(const struct ra_hwdec *hw) {
 
     return true;
 }
+
+struct cuda_interop_fn cuda_gl_fn = {
+    .check = cuda_gl_check,
+    .init = cuda_gl_init
+};

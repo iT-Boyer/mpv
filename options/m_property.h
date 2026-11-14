@@ -48,6 +48,18 @@ enum mp_property_action {
     //  arg: char**
     M_PROPERTY_PRINT,
 
+    // Like M_PROPERTY_PRINT, but a list is printed whole instead of being cut
+    // to the OSD or terminal size. If unimplemented, the property wrapper
+    // falls back to M_PROPERTY_PRINT.
+    //  arg: char**
+    M_PROPERTY_PRINT_UNCUT,
+
+    // Get human readable fixed length string representing the current value.
+    // If unimplemented, the property wrapper uses the property type as
+    // fallback.
+    //  arg: char**
+    M_PROPERTY_FIXED_LEN_PRINT,
+
     // Like M_PROPERTY_GET_TYPE, but get a type that is compatible to the real
     // type, but reflect practical limits, such as runtime-available values.
     // This is mostly used for "UI" related things.
@@ -86,6 +98,14 @@ enum mp_property_action {
     // Pass down an action to a sub-property.
     //  arg: struct m_property_action_arg*
     M_PROPERTY_KEY_ACTION,
+
+    // Delete a value.
+    // Most properties do not implement this.
+    //  arg: (ignored)
+    M_PROPERTY_DELETE,
+
+    // Total number of actions.
+    M_PROPERTY_MAX_ACTION,
 };
 
 // Argument for M_PROPERTY_SWITCH
@@ -102,6 +122,9 @@ struct m_property_action_arg {
 };
 
 enum mp_property_return {
+    // Returned from validator if action should be executed.
+    M_PROPERTY_VALID = 2,
+
     // Returned on success.
     M_PROPERTY_OK = 1,
 
@@ -133,27 +156,39 @@ struct m_property {
     void *priv;
     // Special-case: mark options for which command.c uses the option-bridge
     bool is_option;
+    // Special-case: option-bridge properties should be coalesced
+    bool coalesce;
+    // Whether to log changes only on the trace level.
+    bool is_noisy;
 };
 
-struct m_property *m_property_list_find(const struct m_property *list,
+// A set of properties, sorted by name with m_property_list_sort().
+struct m_property_list {
+    struct m_property *props;
+    int num;
+};
+
+void m_property_list_sort(struct m_property_list *list);
+
+struct m_property *m_property_list_find(const struct m_property_list *list,
                                         const char *name);
 
 // Access a property.
 // action: one of m_property_action
 // ctx: opaque value passed through to property implementation
 // returns: one of mp_property_return
-int m_property_do(struct mp_log *log, const struct m_property* prop_list,
+int m_property_do(struct mp_log *log, const struct m_property_list *prop_list,
                   const char* property_name, int action, void* arg, void *ctx);
 
 // Given a path of the form "a/b/c", this function will set *prefix to "a",
 // and rem to "b/c", and return true.
 // If there is no '/' in the path, set prefix to path, and rem to "", and
 // return false.
-bool m_property_split_path(const char *path, bstr *prefix, char **rem);
+bool m_property_split_path(const char *path, bstr *prefix, const char **rem);
 
 // Print a list of properties.
 void m_properties_print_help_list(struct mp_log *log,
-                                  const struct m_property *list);
+                                  const struct m_property_list *list);
 
 // Expand a property string.
 // This function allows to print strings containing property values.
@@ -167,11 +202,13 @@ void m_properties_print_help_list(struct mp_log *log,
 // STR is recursively expanded using the same rules.
 // "$$" can be used to escape "$", and "$}" to escape "}".
 // "$>" disables parsing of "$" for the rest of the string.
-char* m_properties_expand_string(const struct m_property *prop_list,
-                                 const char *str, void *ctx);
+// print_action is the action used for ${NAME}, M_PROPERTY_PRINT or
+// M_PROPERTY_PRINT_UNCUT.
+char* m_properties_expand_string(const struct m_property_list *prop_list,
+                                 const char *str, void *ctx, int print_action);
 
 // Trivial helpers for implementing properties.
-int m_property_flag_ro(int action, void* arg, int var);
+int m_property_bool_ro(int action, void* arg, bool var);
 int m_property_int_ro(int action, void* arg, int var);
 int m_property_int64_ro(int action, void* arg, int64_t var);
 int m_property_float_ro(int action, void* arg, float var);
@@ -202,11 +239,27 @@ struct m_sub_property {
     .type = {.type = CONF_TYPE_FLOAT}, .value = {.float_ = (f)}
 #define SUB_PROP_DOUBLE(f) \
     .type = {.type = CONF_TYPE_DOUBLE}, .value = {.double_ = (f)}
-#define SUB_PROP_FLAG(f) \
-    .type = {.type = CONF_TYPE_FLAG}, .value = {.flag = (f)}
+#define SUB_PROP_BOOL(f) \
+    .type = {.type = CONF_TYPE_BOOL}, .value = {.bool_ = (f)}
 #define SUB_PROP_PTS(f) \
     .type = {.type = &m_option_type_time}, .value = {.double_ = (f)}
+#define SUB_PROP_KEYVALUE_LIST(l) \
+    .type = {.type = &m_option_type_keyvalue_list}, .value = {.keyvalue_list = (l)}
+#define SUB_PROP_STRING_LIST(l) \
+    .type = {.type = CONF_TYPE_STRING_LIST}, .value = {.string_list = (l)}
+// Expose a C array as a read-only array sub-property. The caller retains
+// ownership of the data pointer. It will be copied if needed. Used for
+// to expose arrays as sub-properties.
+#define SUB_PROP_TYPE_ARRAY(etype, ptr, n) \
+    .type = {.type = &m_option_type_prop_array}, \
+    .value = {.prop_arr = {.data = (ptr), .count = (n), .elem_type = (etype)}}
+#define SUB_PROP_INT_ARRAY(ptr, n)    SUB_PROP_TYPE_ARRAY(CONF_TYPE_INT, ptr, n)
+#define SUB_PROP_INT64_ARRAY(ptr, n)  SUB_PROP_TYPE_ARRAY(CONF_TYPE_INT64, ptr, n)
+#define SUB_PROP_FLOAT_ARRAY(ptr, n)  SUB_PROP_TYPE_ARRAY(CONF_TYPE_FLOAT, ptr, n)
+#define SUB_PROP_DOUBLE_ARRAY(ptr, n) SUB_PROP_TYPE_ARRAY(CONF_TYPE_DOUBLE, ptr, n)
 
+int m_property_read_sub_validate(void *ctx, struct m_property *prop,
+                                 int action, void *arg);
 int m_property_read_sub(const struct m_sub_property *props, int action, void *arg);
 
 

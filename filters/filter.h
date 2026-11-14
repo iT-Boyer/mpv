@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <libavutil/hwcontext.h>
 
 #include "frame.h"
 
@@ -63,7 +64,7 @@ bool mp_pin_out_has_data(struct mp_pin *p);
 // frame is available, but to get proper data flow in filters, you should
 // probably follow the preferred conventions.)
 // If no frame is returned, a frame is automatically requested via
-// mp_pin_out_request_data() (so it might be retuned in the future).
+// mp_pin_out_request_data() (so it might be returned in the future).
 // If a frame is returned, no new frame is automatically requested (this is
 // usually not wanted, because it could lead to additional buffering).
 // This is guaranteed to return a non-NONE frame if mp_pin_out_has_data()
@@ -311,6 +312,7 @@ struct mp_filter {
 
     struct mpv_global *global;
     struct mp_log *log;
+    struct demux_packet_pool *packet_pool;
 
     // Array of public pins. API users can read this, but are not allowed to
     // modify the array. Filter implementations use mp_filter_add_pin() to add
@@ -376,6 +378,7 @@ struct mp_filter_command {
     enum mp_filter_command_type type;
 
     // For MP_FILTER_COMMAND_TEXT
+    const char *target;
     const char *cmd;
     const char *arg;
 
@@ -398,18 +401,21 @@ struct mp_stream_info {
     void *priv; // for use by whoever implements the callbacks
 
     double (*get_display_fps)(struct mp_stream_info *i);
+    void   (*get_display_res)(struct mp_stream_info *i, int *res);
 
     struct mp_hwdec_devices *hwdec_devs;
     struct osd_state *osd;
+    bool vflip;
     bool rotate90;
+    bool force_swdec;
     struct vo *dr_vo; // for calling vo_get_image()
 };
 
 // Search for a parent filter (including f) that has this set, and return it.
 struct mp_stream_info *mp_filter_find_stream_info(struct mp_filter *f);
 
-struct AVBufferRef;
-struct AVBufferRef *mp_filter_load_hwdec_device(struct mp_filter *f, int avtype);
+struct mp_hwdec_ctx *mp_filter_load_hwdec_device(struct mp_filter *f, int imgfmt,
+                                                 enum AVHWDeviceType device_type);
 
 // Perform filtering. This runs until the filter graph is blocked (due to
 // missing external input or unread output). It returns whether any outside

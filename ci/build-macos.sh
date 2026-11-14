@@ -2,26 +2,28 @@
 
 set -e
 
-FFMPEG_SYSROOT="${HOME}/deps/sysroot"
-MPV_INSTALL_PREFIX="${HOME}/out/mpv"
-MPV_VARIANT="${TRAVIS_OS_NAME}"
+. ./ci/build-common.sh
 
-if [[ -d "./build/${MPV_VARIANT}" ]] ; then
-    rm -rf "./build/${MPV_VARIANT}"
+objc_args="-Wno-error=deprecated -Wno-error=deprecated-declarations"
+c_args=""
+if [[ "${MACOS_TARGET_OS}" == "test" ]]; then
+    # remove -werror + tests and keep libmpv for test builds only
+    common_args="-Dlibmpv=true"
+    # add back -werror for compiling only, not for linking
+    objc_args="-Werror ${objc_args}"
+    c_args="-Werror"
 fi
 
-if [[ ! -e "./waf" ]] ; then
-    python3 ./bootstrap.py
-fi
+PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig/" CC="${CC}" CXX="${CXX}" \
+meson setup build $common_args \
+  -Dobjc_args="${objc_args}" \
+  -Dc_args="${c_args}" \
+  -D{caca,cdda,dvda,dvdnav,gl,iconv,lcms2,libarchive,libbluray,lua,jpeg}=enabled \
+  -D{plain-gl,rubberband,sixel,vapoursynth,zimg,zlib}=enabled \
+  -D{cocoa,coreaudio,gl-cocoa,videotoolbox-gl,videotoolbox-pl}=enabled \
+  -D{swift-build,macos-cocoa-cb,macos-media-player,macos-touchbar,vulkan}=enabled \
+  -Dswift-flags="${SWIFT_FLAGS}"
 
-PKG_CONFIG_PATH="${FFMPEG_SYSROOT}/lib/pkgconfig/" CC="${CC}" CXX="${CXX}" python3 \
-  ./waf configure \
-    --variant="${MPV_VARIANT}" \
-    --prefix="${MPV_INSTALL_PREFIX}" \
-    --enable-{gl,iconv,lcms2,libmpv-shared,lua,jpeg,plain-gl,zlib} \
-    --enable-{cocoa,coreaudio,gl-cocoa,macos-cocoa-cb,macos-touchbar,videotoolbox-gl} \
-    --swift-flags="${CI_SWIFT_FLAGS}"
-
-python3 ./waf build --variant="${MPV_VARIANT}" -j4
-
-python3 ./waf install --variant="${MPV_VARIANT}"
+meson compile -C build -j4
+meson install -C build
+./build/mpv -v --no-config

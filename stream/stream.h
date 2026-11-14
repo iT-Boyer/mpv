@@ -24,32 +24,40 @@
 #include <string.h>
 #include <inttypes.h>
 #include <sys/types.h>
-#include <fcntl.h>
 
+#include "common/common.h"
 #include "misc/bstr.h"
 
 // Minimum guaranteed buffer and seek-back size. For any reads <= of this size,
 // it's guaranteed that you can seek back by <= of this size again.
 #define STREAM_BUFFER_SIZE 2048
 
+// Maximum size of a complete read.
+#define STREAM_MAX_READ_SIZE (INT_MAX - 1)
+
 // flags for stream_open_ext (this includes STREAM_READ and STREAM_WRITE)
 
 // stream->mode
-#define STREAM_READ             0
-#define STREAM_WRITE            (1 << 0)
+#define STREAM_READ               0
+#define STREAM_WRITE              (1 << 0)
 
-#define STREAM_SILENT           (1 << 1)
+#define STREAM_SILENT             (1 << 1)
 
 // Origin value for "security". This is an integer within the flags bit-field.
-#define STREAM_ORIGIN_DIRECT    (1 << 2) // passed from cmdline or loadfile
-#define STREAM_ORIGIN_FS        (2 << 2) // referenced from playlist on unix FS
-#define STREAM_ORIGIN_NET       (3 << 2) // referenced from playlist on network
-#define STREAM_ORIGIN_UNSAFE    (4 << 2) // from a grotesque source
+#define STREAM_ORIGIN_DIRECT      (1 << 2) // passed from cmdline or loadfile
+#define STREAM_ORIGIN_FS          (2 << 2) // referenced from playlist on unix FS
+#define STREAM_ORIGIN_NET         (3 << 2) // referenced from playlist on network
+#define STREAM_ORIGIN_UNSAFE      (4 << 2) // from a grotesque source
 
-#define STREAM_ORIGIN_MASK      (7 << 2) // for extracting origin value from flags
+#define STREAM_ORIGIN_MASK        (7 << 2) // for extracting origin value from flags
 
-#define STREAM_LOCAL_FS_ONLY    (1 << 5) // stream_file only, no URLs
-#define STREAM_LESS_NOISE       (1 << 6) // try to log errors only
+#define STREAM_LOCAL_FS_ONLY      (1 << 5) // stream_file only, no URLs
+#define STREAM_LESS_NOISE         (1 << 6) // try to log errors only
+#define STREAM_ALLOW_PARTIAL_READ (1 << 7) // allows partial read with stream_read_file()
+
+// Default flags used by stream_read_file().
+#define STREAM_READ_FILE_FLAGS_DEFAULT \
+    (STREAM_ORIGIN_DIRECT | STREAM_READ | STREAM_LOCAL_FS_ONLY | STREAM_LESS_NOISE)
 
 // end flags for stream_open_ext (the naming convention sucks)
 
@@ -58,6 +66,9 @@
 #define STREAM_UNSUPPORTED -1
 #define STREAM_ERROR 0
 #define STREAM_OK    1
+
+// EOF value returned by stream_read_char()
+#define STREAM_EOF (-256)
 
 enum stream_ctrl {
     // Certain network protocols
@@ -72,27 +83,187 @@ enum stream_ctrl {
     STREAM_CTRL_GET_NUM_CHAPTERS,
     STREAM_CTRL_GET_CURRENT_TIME,
     STREAM_CTRL_GET_CHAPTER_TIME,
-    STREAM_CTRL_SEEK_TO_TIME,
+    STREAM_CTRL_SEEK_TO_TIME,        // struct stream_seek_req*
     STREAM_CTRL_GET_ASPECT_RATIO,
     STREAM_CTRL_GET_NUM_ANGLES,
     STREAM_CTRL_GET_ANGLE,
     STREAM_CTRL_SET_ANGLE,
     STREAM_CTRL_GET_NUM_TITLES,
-    STREAM_CTRL_GET_TITLE_LENGTH,       // double* (in: title number, out: len)
-    STREAM_CTRL_GET_LANG,
+    STREAM_CTRL_GET_TITLE_LENGTH,    // double* (in: title number, out: len)
+    STREAM_CTRL_GET_TITLE_PLAYLIST,  // double* (in: title number, out: playlist)
+    STREAM_CTRL_GET_TRACK_INFO,
+    STREAM_CTRL_GET_CHAPTER_NAME,    // struct stream_name_req*
+    STREAM_CTRL_GET_TITLE_NAME,      // struct stream_name_req*
+    STREAM_CTRL_SET_ACTIVE_TRACK,    // struct stream_track_req* (audio, id in)
+    STREAM_CTRL_SET_PLAYBACK_TIME,   // double*, current presentation time
+    STREAM_CTRL_SET_PLAYBACK_RATE,   // double*, 0 = paused, 1 = normal
     STREAM_CTRL_GET_CURRENT_TITLE,
     STREAM_CTRL_SET_CURRENT_TITLE,
+    STREAM_CTRL_NAV_CMD,             // struct stream_nav_cmd*
+    STREAM_CTRL_GET_NAV_STATE,       // struct stream_nav_state*
+    STREAM_CTRL_GET_NAV_OVERLAY,     // struct stream_nav_overlay_req*
+    STREAM_CTRL_GET_STILL,           // struct stream_still_req*
+    STREAM_CTRL_SET_STILL_PAGE,      // int*, force the shown still page
+    STREAM_CTRL_NAV_DRAIN_ENABLE,    // start holding EOF at jump boundaries
+    STREAM_CTRL_NAV_DRAIN_ACK,       // flush done, release the held EOF
+    STREAM_CTRL_GET_STREAMS,         // struct stream_streams_req*
+    STREAM_CTRL_GET_SEGMENTS,        // struct stream_segments_req*
 };
 
-struct stream_lang_req {
+// Fetch the still image that a disc (DVD-Audio ASVS) associates with the given
+// playback position, as an MPEG-2 video elementary stream.
+struct stream_still_req {
+    double time;      // input: title-relative playback time to query
+    int id;           // output: id of the still valid at `time`, changes
+                      //         when the shown still should change; -1 if none
+    bool has_stills;  // output: the current title has stills at all (used
+                      //         to decide whether to expose a video track)
+    uint8_t *data;    // output: MPEG-2 video ES; owned by the stream and
+    int data_size;    //         valid until the next STREAM_CTRL_GET_STILL call
+};
+
+// Fetch a BGRA snapshot of the disc-menu overlay (used for Blu-ray HDMV).
+struct stream_nav_overlay_req {
+    int w, h;             // input: caller's plane dimensions; output: actual
+    int stride;           // input: dest row stride in bytes
+    uint8_t *dst;         // input: dest buffer (caller-allocated, BGRA)
+    uint32_t change_id;   // output: latched change_id of the snapshot
+};
+
+// In-disc navigation (DVD/BD menu) actions, used with STREAM_CTRL_NAV_CMD.
+enum stream_nav_action {
+    STREAM_NAV_UP,
+    STREAM_NAV_DOWN,
+    STREAM_NAV_LEFT,
+    STREAM_NAV_RIGHT,
+    STREAM_NAV_SELECT,         // activate currently highlighted button
+    STREAM_NAV_MENU_ROOT,      // jump to the disc's root/title menu
+    STREAM_NAV_MENU_TITLE,     // jump to the current title's menu
+    STREAM_NAV_MENU_POPUP,     // BD popup menu (chapter menu on DVD)
+    STREAM_NAV_MENU_AUDIO,     // DVD audio menu
+    STREAM_NAV_MENU_SUBTITLE,  // DVD subpicture menu
+    STREAM_NAV_MENU_ANGLE,     // DVD angle menu
+    STREAM_NAV_GO_UP,          // DVD: move to the parent menu
+    STREAM_NAV_PREV_MENU,      // return to previous menu / leave still
+    STREAM_NAV_KEY_RED,        // BD color keys
+    STREAM_NAV_KEY_GREEN,
+    STREAM_NAV_KEY_YELLOW,
+    STREAM_NAV_KEY_BLUE,
+    STREAM_NAV_MOUSE_MOVE,     // mouse moved; .x,.y are video-space coords
+    STREAM_NAV_MOUSE_CLICK,    // mouse button activated at .x,.y
+};
+
+struct stream_nav_cmd {
+    enum stream_nav_action action;
+    int x, y; // for MOUSE_*
+};
+
+// Whether the action can activate a button / run a disc VM command.
+static inline bool stream_nav_action_activates(enum stream_nav_action a)
+{
+    switch (a) {
+    case STREAM_NAV_SELECT:
+    case STREAM_NAV_MOUSE_CLICK:
+    case STREAM_NAV_MENU_ROOT:
+    case STREAM_NAV_MENU_TITLE:
+    case STREAM_NAV_MENU_POPUP:
+    case STREAM_NAV_MENU_AUDIO:
+    case STREAM_NAV_MENU_SUBTITLE:
+    case STREAM_NAV_MENU_ANGLE:
+    case STREAM_NAV_GO_UP:
+    case STREAM_NAV_PREV_MENU:
+    case STREAM_NAV_KEY_RED:
+    case STREAM_NAV_KEY_GREEN:
+    case STREAM_NAV_KEY_YELLOW:
+    case STREAM_NAV_KEY_BLUE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A DVD subpicture button highlight.
+struct mp_dvdnav_highlight {
+    struct mp_rect rect;    // button rectangle in SPU/source coords
+    uint32_t palette[4];    // replacement colors for SPU pixel values 0..3
+};
+
+// Snapshot of the stream's menu state.
+struct stream_nav_state {
+    bool nav_active;         // interactive disc navigation is enabled
+    bool menu_active;        // a selectable menu/highlight is currently visible
+    bool still_active;       // holding an indefinite still frame
+    int  src_w, src_h;       // dimensions of the coordinate space mouse uses
+    struct mp_dvdnav_highlight hl; // focused button highlight (DVD only)
+    uint32_t change_id; // Bumped whenever any of the above changes
+    uint32_t discontinuity_id; // Bumped when the stream's source position jumps
+    bool drain_pending; // holding an EOF at a jump boundary, awaiting ACK
+
+    // Disc-driven track selection.
+    bool no_audio;      // the current playlist/domain has no audio
+    int active_audio_id;
+    int active_sub_id;
+    bool sub_visible;   // disc says subs should be displayed
+    int angle;          // 1-based current angle (0 if unknown)
+    int num_angles;     // total angle count (0 if unknown or always 1)
+};
+
+struct stream_name_req {
+    int index;      // 0-based, what to ask about
+    char *name;     // out, talloc allocated, only set when the disc names it
+};
+
+struct stream_track_req {
     int type;     // STREAM_AUDIO, STREAM_SUB
     int id;
     char name[50];
+    enum track_flags flags;
 };
 
 struct stream_dvd_info_req {
     unsigned int palette[16];
-    int num_subs;
+};
+
+// The presentation streams the disc declares for what it is playing (a DVD
+// program chain, a Blu-ray clip). The ids are the demuxer's (demuxer_id).
+struct stream_decl_stream {
+    int type;           // STREAM_VIDEO, STREAM_AUDIO, STREAM_SUB
+    int id;
+    const char *codec;  // static string, NULL when the disc does not say
+};
+struct stream_streams_req {
+    struct stream_decl_stream *streams; // out: talloc'd, the caller frees
+    int num;
+};
+
+struct stream_stream_id {
+    int type;
+    int id;
+};
+
+// One run of source data as the disc describes it (a DVD VOBU, a Blu-ray
+// clip): where it starts, how its in-stream timestamps map to playback time,
+// and which declared streams have data in it.
+struct stream_segment {
+    int64_t pos;        // stream position of its first byte
+    double raw_base;    // in-stream timestamp that plays at `time`, or
+                        // MP_NOPTS_VALUE: the first packet mapped into it
+    double time;        // playback time of raw_base
+    struct stream_stream_id *present;   // the declared streams with data in
+                                        // it, NULL when all of them have
+    int num_present;
+};
+struct stream_segments_req {
+    struct stream_segment *segs;    // out: the stream's talloc'd array, oldest
+                                    //      first, the present lists are its
+                                    //      children, the caller owns it
+    int num;
+};
+
+struct stream_seek_req {
+    double target;      // in: absolute playback time
+    int flags;          // in: SEEK_* flags (demux.h)
+    double skip_until;  // out: drop audio until this time (MP_NOPTS_VALUE otherwise)
 };
 
 // for STREAM_CTRL_AVSEEK
@@ -111,6 +282,8 @@ typedef struct stream_info_st {
     // Alternative to open(). Only either open() or open2() can be set.
     int (*open2)(struct stream *st, const struct stream_open_args *args);
     const char *const *protocols;
+    // Alternative to protocols. For stream_lavf.
+    char **(*get_protocols)(void);
     bool can_write;     // correctly checks for READ/WRITE modes
     bool local_fs;      // supports STREAM_LOCAL_FS_ONLY
     int stream_origin;  // 0 or set of STREAM_ORIGIN_*; if 0, the same origin
@@ -140,16 +313,22 @@ typedef struct stream {
     void *priv; // used for DVD, TV, RTSP etc
     char *url;  // filename/url (possibly including protocol prefix)
     char *path; // filename (url without protocol prefix)
+    char *effective_url; // url after redirects, if known
     char *mime_type; // when HTTP streaming is used
+    char *server_filename; // file name reported by the server, if any
     char *demuxer; // request demuxer to be used
     char *lavf_type; // name of expected demuxer type for lavf
     bool streaming : 1; // known to be a network stream if true
     bool seekable : 1; // presence of general byte seeking support
     bool fast_skip : 1; // consider stream fast enough to fw-seek by skipping
     bool is_network : 1; // I really don't know what this is for
-    bool is_local_file : 1; // from the filesystem
+    bool is_local_fs : 1; // from the filesystem
     bool is_directory : 1; // directory on the filesystem
+    bool is_regular : 1; // regular file
     bool access_references : 1; // open other streams
+    bool allow_partial_read : 1; // allows partial read with stream_read_file()
+    bool autoprobed : 1; // opened by the autoprobe loop, not explicitly
+                         // requested, failures should stay quiet
     struct mp_log *log;
     struct mpv_global *global;
 
@@ -215,6 +394,7 @@ int stream_read_partial(stream_t *s, void *buf, int buf_size);
 int stream_peek(stream_t *s, int forward_size);
 int stream_read_peek(stream_t *s, void *buf, int buf_size);
 void stream_drop_buffers(stream_t *s);
+void stream_rebase_position(stream_t *s);
 int64_t stream_get_size(stream_t *s);
 
 struct mpv_global;
@@ -223,6 +403,9 @@ struct bstr stream_read_complete(struct stream *s, void *talloc_ctx,
                                  int max_size);
 struct bstr stream_read_file(const char *filename, void *talloc_ctx,
                              struct mpv_global *global, int max_size);
+// Like stream_read_file(), but allows specifying flags like with stream_create().
+struct bstr stream_read_file2(const char *filename, void *talloc_ctx,
+                              int flags, struct mpv_global *global, int max_size);
 
 int stream_control(stream_t *s, int cmd, void *arg);
 void free_stream(stream_t *s);
@@ -242,6 +425,7 @@ struct stream *stream_create(const char *url, int flags,
 stream_t *open_output_stream(const char *filename, struct mpv_global *global);
 
 void mp_url_unescape_inplace(char *buf);
+char *mp_url_unescape(void *talloc_ctx, const char *url);
 char *mp_url_escape(void *talloc_ctx, const char *s, const char *ok);
 
 // stream_memory.c
@@ -263,7 +447,7 @@ void mp_setup_av_network_options(struct AVDictionary **dict,
                                  struct mp_log *log);
 
 void stream_print_proto_list(struct mp_log *log);
-char **stream_get_proto_list(void);
+char **stream_get_proto_list(bool safe_only);
 bool stream_has_proto(const char *proto);
 
 #endif /* MPLAYER_STREAM_H */

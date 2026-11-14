@@ -31,7 +31,10 @@
 #include <libavutil/bswap.h>
 #include <libavutil/mem.h>
 
+#include "config.h"
+
 #include "audio/aframe.h"
+#include "audio/chmap_avchannel.h"
 #include "audio/chmap_sel.h"
 #include "audio/fmt-conversion.h"
 #include "audio/format.h"
@@ -42,18 +45,19 @@
 #include "filters/filter_internal.h"
 #include "filters/user_filters.h"
 #include "options/m_option.h"
+#include "misc/lavc_compat.h"
 
 
 #define AC3_MAX_CHANNELS 6
 #define AC3_MAX_CODED_FRAME_SIZE 3840
 #define AC3_FRAME_SIZE (6  * 256)
-const uint16_t ac3_bitrate_tab[19] = {
+static const uint16_t ac3_bitrate_tab[19] = {
     32, 40, 48, 56, 64, 80, 96, 112, 128,
     160, 192, 224, 256, 320, 384, 448, 512, 576, 640
 };
 
 struct f_opts {
-    int add_iec61937_header;
+    bool add_iec61937_header;
     int bit_rate;
     int min_channel_num;
     char *encoder;
@@ -70,6 +74,7 @@ struct priv {
 
     const struct AVCodec  *lavc_acodec;
     struct AVCodecContext *lavc_actx;
+    AVPacket              *lavc_pkt;
     int bit_rate;
     int out_samples;    // upper bound on encoded output per AC3 frame
 };
@@ -99,12 +104,20 @@ static bool reinit(struct mp_filter *f)
     if (!bit_rate && chmap.num < AC3_MAX_CHANNELS + 1)
         bit_rate = default_bit_rate[chmap.num];
 
-    avcodec_close(s->lavc_actx);
+    avcodec_free_context(&s->lavc_actx);
+    s->lavc_actx = avcodec_alloc_context3(s->lavc_acodec);
+    if (!s->lavc_actx) {
+        MP_ERR(f, "Audio LAVC, couldn't reallocate context!\n");
+        return false;
+    }
+
+    if (mp_set_avopts(f->log, s->lavc_actx, s->opts->avopts) < 0)
+        return false;
 
     // Put sample parameters
     s->lavc_actx->sample_fmt = af_to_avformat(format);
-    s->lavc_actx->channels = chmap.num;
-    s->lavc_actx->channel_layout = mp_chmap_to_lavc(&chmap);
+
+    mp_chmap_to_av_layout(&s->lavc_actx->ch_layout, &chmap);
     s->lavc_actx->sample_rate = rate;
     s->lavc_actx->bit_rate = bit_rate;
 
@@ -122,18 +135,19 @@ static bool reinit(struct mp_filter *f)
     return true;
 }
 
-static void reset(struct mp_filter *f)
+static void af_lavcac3enc_reset(struct mp_filter *f)
 {
     struct priv *s = f->priv;
 
     TA_FREEP(&s->in_frame);
 }
 
-static void destroy(struct mp_filter *f)
+static void af_lavcac3enc_destroy(struct mp_filter *f)
 {
     struct priv *s = f->priv;
 
-    reset(f);
+    af_lavcac3enc_reset(f);
+    av_packet_free(&s->lavc_pkt);
     avcodec_free_context(&s->lavc_actx);
 }
 
@@ -143,7 +157,7 @@ static void swap_16(uint16_t *ptr, size_t size)
         ptr[n] = av_bswap16(ptr[n]);
 }
 
-static void process(struct mp_filter *f)
+static void af_lavcac3enc_process(struct mp_filter *f)
 {
     struct priv *s = f->priv;
 
@@ -152,57 +166,57 @@ static void process(struct mp_filter *f)
 
     bool err = true;
     struct mp_aframe *out = NULL;
-    AVPacket pkt = {0};
-    av_init_packet(&pkt);
+    AVPacket *pkt = s->lavc_pkt;
 
     // Send input as long as it wants.
     while (1) {
         if (avcodec_is_open(s->lavc_actx)) {
-            int lavc_ret = avcodec_receive_packet(s->lavc_actx, &pkt);
+            int lavc_ret = avcodec_receive_packet(s->lavc_actx, pkt);
             if (lavc_ret >= 0)
                 break;
             if (lavc_ret < 0 && lavc_ret != AVERROR(EAGAIN)) {
                 MP_FATAL(f, "Encode failed (receive).\n");
-                goto done;
+                goto error;
             }
         }
         AVFrame *frame = NULL;
         struct mp_frame input = mp_pin_out_read(s->in_pin);
         // The following code assumes no sample data buffering in the encoder.
-        if (input.type == MP_FRAME_EOF) {
+        switch (input.type) {
+        case MP_FRAME_NONE:
+            goto done; // no data yet
+        case MP_FRAME_EOF:
             mp_pin_in_write(f->ppins[1], input);
-            return;
-        } else if (input.type == MP_FRAME_AUDIO) {
+            goto done;
+        case MP_FRAME_AUDIO:
             TA_FREEP(&s->in_frame);
             s->in_frame = input.data;
-            frame = mp_frame_to_av(input, NULL);
-            if (!frame)
-                goto done;
             if (mp_aframe_get_channels(s->in_frame) < s->opts->min_channel_num) {
                 // Just pass it through.
                 s->in_frame = NULL;
                 mp_pin_in_write(f->ppins[1], input);
-                return;
+                goto done;
             }
             if (!mp_aframe_config_equals(s->in_frame, s->cur_format)) {
                 if (!reinit(f))
-                    goto done;
+                    goto error;
             }
-        } else if (input.type) {
-            goto done;
-        } else {
-            return; // no data yet
+            frame = mp_frame_to_av(input, NULL);
+            if (!frame)
+                goto error;
+            break;
+        default: goto error; // unexpected packet type
         }
         int lavc_ret = avcodec_send_frame(s->lavc_actx, frame);
         av_frame_free(&frame);
         if (lavc_ret < 0 && lavc_ret != AVERROR(EAGAIN)) {
             MP_FATAL(f, "Encode failed (send).\n");
-            goto done;
+            goto error;
         }
     }
 
     if (!s->in_frame)
-        goto done;
+        goto error;
 
     out = mp_aframe_create();
     mp_aframe_set_format(out, AF_FORMAT_S_AC3);
@@ -210,18 +224,18 @@ static void process(struct mp_filter *f)
     mp_aframe_set_rate(out, 48000);
 
     if (mp_aframe_pool_allocate(s->out_pool, out, s->out_samples) < 0)
-        goto done;
+        goto error;
 
     int sstride = mp_aframe_get_sstride(out);
 
     mp_aframe_copy_attributes(out, s->in_frame);
 
-    int frame_size = pkt.size;
+    int frame_size = pkt->size;
     int header_len = 0;
     char hdr[8];
 
-    if (s->opts->add_iec61937_header && pkt.size > 5) {
-        int bsmod = pkt.data[5] & 0x7;
+    if (s->opts->add_iec61937_header && pkt->size > 5) {
+        int bsmod = pkt->data[5] & 0x7;
         int len = frame_size;
 
         frame_size = AC3_FRAME_SIZE * 2 * 2;
@@ -239,20 +253,22 @@ static void process(struct mp_filter *f)
 
     uint8_t **planes = mp_aframe_get_data_rw(out);
     if (!planes)
-        goto done;
+        goto error;
     char *buf = planes[0];
     memcpy(buf, hdr, header_len);
-    memcpy(buf + header_len, pkt.data, pkt.size);
-    memset(buf + header_len + pkt.size, 0,
-           frame_size - (header_len + pkt.size));
-    swap_16((uint16_t *)(buf + header_len), pkt.size / 2);
+    memcpy(buf + header_len, pkt->data, pkt->size);
+    memset(buf + header_len + pkt->size, 0,
+           frame_size - (header_len + pkt->size));
+    swap_16((uint16_t *)(buf + header_len), pkt->size / 2);
     mp_aframe_set_size(out, frame_size / sstride);
     mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_AUDIO, out));
     out = NULL;
 
-    err = 0;
 done:
-    av_packet_unref(&pkt);
+    err = false;
+    // fall through
+error:
+    av_packet_unref(pkt);
     talloc_free(out);
     if (err)
         mp_filter_internal_mark_failed(f);
@@ -261,10 +277,36 @@ done:
 static const struct mp_filter_info af_lavcac3enc_filter = {
     .name = "lavcac3enc",
     .priv_size = sizeof(struct priv),
-    .process = process,
-    .reset = reset,
-    .destroy = destroy,
+    .process = af_lavcac3enc_process,
+    .reset = af_lavcac3enc_reset,
+    .destroy = af_lavcac3enc_destroy,
 };
+
+static void add_chmaps_to_autoconv(struct mp_filter *f,
+                                   struct mp_autoconvert *conv,
+                                   const AVCodecContext *avctx)
+{
+    const AVChannelLayout *lch;
+    int ret = mp_avcodec_get_supported_config(avctx, NULL,
+                                              AV_CODEC_CONFIG_CHANNEL_LAYOUT,
+                                              (const void **)&lch);
+
+    for (int n = 0; ret >= 0 && lch && lch[n].nb_channels; n++) {
+        struct mp_chmap chmap = {0};
+
+        if (!mp_chmap_from_av_layout(&chmap, &lch[n])) {
+            char layout[128] = {0};
+            MP_VERBOSE(f, "Skipping unsupported channel layout: %s\n",
+                       av_channel_layout_describe(&lch[n],
+                                                  layout, 128) < 0 ?
+                       "undefined" : layout);
+            continue;
+        }
+
+        if (mp_chmap_is_valid(&chmap))
+            mp_autoconvert_add_chmap(conv, &chmap);
+    }
+}
 
 static struct mp_filter *af_lavcac3enc_create(struct mp_filter *parent,
                                               void *options)
@@ -295,15 +337,27 @@ static struct mp_filter *af_lavcac3enc_create(struct mp_filter *parent,
         goto error;
     }
 
+    s->lavc_pkt = av_packet_alloc();
+    if (!s->lavc_pkt)
+        goto error;
+
     if (mp_set_avopts(f->log, s->lavc_actx, s->opts->avopts) < 0)
         goto error;
 
-    // For this one, we require the decoder to expert lists of all supported
+    const AVChannelLayout *ch_layouts;
+    int ret_ch = mp_avcodec_get_supported_config(s->lavc_actx, s->lavc_acodec,
+                                                 AV_CODEC_CONFIG_CHANNEL_LAYOUT,
+                                                 (const void **)&ch_layouts);
+
+    const enum AVSampleFormat *sample_fmts;
+    int ret_fmt = mp_avcodec_get_supported_config(s->lavc_actx, s->lavc_acodec,
+                                                  AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                                                  (const void **)&sample_fmts);
+
+    // For this one, we require the decoder to export lists of all supported
     // parameters. (Not all decoders do that, but the ones we're interested
     // in do.)
-    if (!s->lavc_acodec->sample_fmts ||
-        !s->lavc_acodec->channel_layouts)
-    {
+    if (ret_ch < 0 || !ch_layouts || ret_fmt < 0 || !sample_fmts) {
         MP_ERR(f, "Audio encoder doesn't list supported parameters.\n");
         goto error;
     }
@@ -327,20 +381,13 @@ static struct mp_filter *af_lavcac3enc_create(struct mp_filter *parent,
     if (!conv)
         abort();
 
-    const enum AVSampleFormat *lf = s->lavc_acodec->sample_fmts;
-    for (int i = 0; lf && lf[i] != AV_SAMPLE_FMT_NONE; i++) {
-        int mpfmt = af_from_avformat(lf[i]);
+    for (int i = 0; sample_fmts[i] != AV_SAMPLE_FMT_NONE; i++) {
+        int mpfmt = af_from_avformat(sample_fmts[i]);
         if (mpfmt)
             mp_autoconvert_add_afmt(conv, mpfmt);
     }
 
-    const uint64_t *lch = s->lavc_acodec->channel_layouts;
-    for (int n = 0; lch && lch[n]; n++) {
-        struct mp_chmap chmap = {0};
-        mp_chmap_from_lavc(&chmap, lch[n]);
-        if (mp_chmap_is_valid(&chmap))
-            mp_autoconvert_add_chmap(conv, &chmap);
-    }
+    add_chmaps_to_autoconv(f, conv, s->lavc_actx);
 
     // At least currently, the AC3 encoder doesn't export sample rates.
     mp_autoconvert_add_srate(conv, 48000);
@@ -357,6 +404,8 @@ static struct mp_filter *af_lavcac3enc_create(struct mp_filter *parent,
     return f;
 
 error:
+    av_packet_free(&s->lavc_pkt);
+    avcodec_free_context(&s->lavc_actx);
     talloc_free(f);
     return NULL;
 }
@@ -369,13 +418,13 @@ const struct mp_user_filter_entry af_lavcac3enc = {
         .name = "lavcac3enc",
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT) {
-            .add_iec61937_header = 1,
+            .add_iec61937_header = true,
             .bit_rate = 640,
             .min_channel_num = 3,
             .encoder = "ac3",
         },
         .options = (const struct m_option[]) {
-            {"tospdif", OPT_FLAG(add_iec61937_header)},
+            {"tospdif", OPT_BOOL(add_iec61937_header)},
             {"bitrate", OPT_CHOICE(bit_rate,
                 {"auto", 0}, {"default", 0}), M_RANGE(32, 640)},
             {"minch", OPT_INT(min_channel_num), M_RANGE(2, 6)},

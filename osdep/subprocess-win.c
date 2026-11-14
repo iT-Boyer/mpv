@@ -211,6 +211,7 @@ static wchar_t *convert_environ(void *ctx, char **env)
             abort();
         pos += count;
     }
+    ret[pos] = L'\0';
 
     return ret;
 }
@@ -252,6 +253,8 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
             .dwFlags = STARTF_USESTDHANDLES | STARTF_FORCEOFFFEEDBACK,
         },
     };
+
+    PROCESS_INFORMATION pi = {0};
 
     for (int n = 0; n < opts->num_fds; n++) {
         if (opts->fds[n].fd >= crt_fd_max) {
@@ -348,6 +351,7 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
                                             FILE_SHARE_READ | FILE_SHARE_WRITE,
                                             &sa, OPEN_EXISTING, 0, NULL);
             fd_data[n].handle_close = true;
+            share_hndls[share_hndl_count++] = fd_data[n].handle;
         }
 
         switch (opts->fds[n].fd) {
@@ -375,7 +379,8 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
     // Get pointers to the arrays in lpReserved2. This is an undocumented data
     // structure used by MSVCRT (and other frameworks and runtimes) to emulate
     // FD inheritance. The format is unofficially documented here:
-    // https://www.catch22.net/tuts/undocumented-createprocess
+    // <https://web.archive.org/web/20221014190010/
+    // https://www.catch22.net/tuts/undocumented-createprocess>
     si.StartupInfo.cbReserved2 = sizeof(int) + crt_fd_count * (1 + sizeof(intptr_t));
     si.StartupInfo.lpReserved2 = talloc_size(tmp, si.StartupInfo.cbReserved2);
     char *crt_buf_flags = si.StartupInfo.lpReserved2 + sizeof(int);
@@ -396,12 +401,12 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
     }
 
     DWORD flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
-    PROCESS_INFORMATION pi = {0};
 
     // Specify which handles are inherited by the subprocess. If this isn't
     // specified, the subprocess inherits all inheritable handles, which could
     // include handles created by other threads. See:
-    // http://blogs.msdn.com/b/oldnewthing/archive/2011/12/16/10248328.aspx
+    // <https://web.archive.org/web/20121127222200/
+    // http://blogs.msdn.com/b/oldnewthing/archive/2011/12/16/10248328.aspx>
     si.lpAttributeList = create_handle_list(tmp, share_hndls, share_hndl_count);
 
     // If we have a console, the subprocess will automatically attach to it so

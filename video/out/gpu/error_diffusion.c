@@ -15,6 +15,7 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <inttypes.h>
 #include <stdlib.h>
 
 #include "error_diffusion.h"
@@ -36,7 +37,7 @@ static int compute_rightmost_shifted_column(const struct error_diffusion_kernel 
 
                 // The shift mapping guarantees current column (or left of it)
                 // won't be affected by error diffusion.
-                assert(shifted_x > 0);
+                mp_assert(shifted_x > 0);
 
                 ret = MPMAX(ret, shifted_x);
             }
@@ -75,7 +76,7 @@ void pass_error_diffusion(struct gl_shader_cache *sc,
                           const struct error_diffusion_kernel *k,
                           int tex, int width, int height, int depth, int block_size)
 {
-    assert(block_size <= height);
+    mp_assert(block_size <= height);
 
     // The parallel error diffusion works by applying the shift mapping first.
     // Taking the Floyd and Steinberg algorithm for example. After applying
@@ -110,7 +111,7 @@ void pass_error_diffusion(struct gl_shader_cache *sc,
     // Initialize the ring buffer.
     GLSL("for (int i = int(gl_LocalInvocationIndex); i < %d; i += %d) ",
          ring_buffer_size, block_size);
-    GLSL("err_rgb8[i] = 0;\n");
+    GLSL("err_rgb8[i] = 0u;\n");
 
     GLSL("for (int block_id = 0; block_id < %d; ++block_id) {\n", blocks);
 
@@ -135,7 +136,7 @@ void pass_error_diffusion(struct gl_shader_cache *sc,
     GLSL("vec3 pix = texelFetch(texture%d, ivec2(x, y), 0).rgb;\n", tex);
 
     // The dithering will quantize pixel value into multiples of 1/dither_quant.
-    int dither_quant = (1 << depth) - 1;
+    uint32_t dither_quant = UINT32_MAX >> (32 - depth);
 
     // We encode errors in RGB components into a single 32-bit unsigned integer.
     // The error we propagate from the current pixel is in range of
@@ -165,17 +166,17 @@ void pass_error_diffusion(struct gl_shader_cache *sc,
     // in the buffer.
     GLSL("uint err_u32 = err_rgb8[idx] + %uu;\n",
          (128u << bitshift_r) | (128u << bitshift_g) | 128u);
-    GLSL("pix = pix * %d.0 + vec3("
+    GLSL("pix = pix * %" PRIu32 ".0 + vec3("
          "int((err_u32 >> %d) & 255u) - 128,"
          "int((err_u32 >> %d) & 255u) - 128,"
          "int( err_u32        & 255u) - 128"
          ") / %d.0;\n", dither_quant, bitshift_r, bitshift_g, uint8_mul);
-    GLSL("err_rgb8[idx] = 0;\n");
+    GLSL("err_rgb8[idx] = 0u;\n");
 
     // Write the dithered pixel.
     GLSL("vec3 dithered = round(pix);\n");
-    GLSL("imageStore(out_image, ivec2(x, y), vec4(dithered / %d.0, 0.0));\n",
-         dither_quant);
+    GLSL("imageStore(out_image, ivec2(x, y), "
+         "vec4(dithered / %" PRIu32 ".0, 0.0));\n", dither_quant);
 
     GLSL("vec3 err_divided = (pix - dithered) * %d.0 / %d.0;\n",
          uint8_mul, k->divisor);
@@ -227,7 +228,8 @@ void pass_error_diffusion(struct gl_shader_cache *sc,
 }
 
 // Different kernels for error diffusion.
-// Patterns are from http://www.efg2.com/Lab/Library/ImageProcessing/DHALF.TXT
+// Patterns are from <https://web.archive.org/web/20181031005427/
+// http://www.efg2.com/Lab/Library/ImageProcessing/DHALF.TXT>
 const struct error_diffusion_kernel mp_error_diffusion_kernels[] = {
     {
         .name = "simple",

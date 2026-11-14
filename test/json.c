@@ -1,7 +1,8 @@
-#include "common/common.h"
+#include <mpv/client.h>
+
 #include "misc/json.h"
 #include "misc/node.h"
-#include "tests.h"
+#include "test_utils.h"
 
 struct entry {
     const char *src;
@@ -25,11 +26,17 @@ struct entry {
     &(struct mpv_node_list) {                                               \
         .num = sizeof(VAL_LIST(__VA_ARGS__)) / sizeof(struct mpv_node),     \
         .values = VAL_LIST(__VA_ARGS__)}}}
+#define EMPTY_NODE_ARRAY {.format = MPV_FORMAT_NODE_ARRAY, .u = { .list =    \
+    &(struct mpv_node_list) {                                               \
+        .num = 0}}}
 #define NODE_MAP(k, v) {.format = MPV_FORMAT_NODE_MAP, .u = { .list =       \
     &(struct mpv_node_list) {                                               \
         .num = sizeof(VAL_LIST(v)) / sizeof(struct mpv_node),               \
         .values = VAL_LIST(v),                                              \
         .keys = (char**)(const char *[]){k}}}}
+#define EMPTY_NODE_MAP {.format = MPV_FORMAT_NODE_MAP, .u = { .list =       \
+    &(struct mpv_node_list) {                                               \
+        .num = 0}}}
 
 static const struct entry entries[] = {
     { "null", "null", NODE_NONE()},
@@ -43,12 +50,12 @@ static const struct entry entries[] = {
     { TEXT("a\u2c29"), TEXT("aⰩ"), NODE_STR("a\342\260\251")},
     { "[1,2,3]", "[1,2,3]",
         NODE_ARRAY(NODE_INT64(1), NODE_INT64(2), NODE_INT64(3))},
-    { "[ ]", "[]", NODE_ARRAY()},
+    { "[ ]", "[]", EMPTY_NODE_ARRAY},
     { "[1,,2]", .expect_fail = true},
     { "[,]", .expect_fail = true},
     { TEXT({"a":1, "b":2}), TEXT({"a":1,"b":2}),
         NODE_MAP(L("a", "b"), L(NODE_INT64(1), NODE_INT64(2)))},
-    { "{ }", "{}", NODE_MAP(L(), L())},
+    { "{ }", "{}", EMPTY_NODE_MAP},
     { TEXT({"a":b}), .expect_fail = true},
     { TEXT({1a:"b"}), .expect_fail = true},
 
@@ -64,9 +71,7 @@ static const struct entry entries[] = {
         NODE_MAP(L("_a12"), L(NODE_STR("b")))},
 };
 
-#define MAX_DEPTH 10
-
-static void run(struct test_ctx *ctx)
+int main(void)
 {
     for (int n = 0; n < MP_ARRAY_SIZE(entries); n++) {
         const struct entry *e = &entries[n];
@@ -74,7 +79,7 @@ static void run(struct test_ctx *ctx)
         char *s = talloc_strdup(tmp, e->src);
         json_skip_whitespace(&s);
         struct mpv_node res;
-        bool ok = json_parse(tmp, &res, &s, MAX_DEPTH) >= 0;
+        bool ok = json_parse(tmp, &res, &s, MAX_JSON_DEPTH) >= 0;
         assert_true(ok != e->expect_fail);
         if (!ok) {
             talloc_free(tmp);
@@ -86,9 +91,5 @@ static void run(struct test_ctx *ctx)
         assert_true(equal_mpv_node(&e->out_data, &res));
         talloc_free(tmp);
     }
+    return 0;
 }
-
-const struct unittest test_json = {
-    .name = "json",
-    .run = run,
-};

@@ -21,15 +21,24 @@
 #include <assert.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavutil/hdr_dynamic_metadata.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/intreadwrite.h>
-
-#include "config.h"
 
 #include "common/av_common.h"
 #include "common/common.h"
 #include "demux.h"
+#include "demux/ebml.h"
+#include "packet_pool.h"
 
 #include "packet.h"
+
+#define ITU_T_T35_COUNTRY_CODE_US        0xB5
+#define ITU_T_T35_PROVIDER_CODE_SAMSUNG  0x003C
+#define ITU_T_T35_PROVIDER_CODE_SMPTE    0x0090
+
+#define ITU_T_T35_COUNTRY_CODE_UK        0xB4
+#define ITU_T_T35_PROVIDER_CODE_VNOVA    0x5000
 
 // Free any refcounted data dp holds (but don't free dp itself). This does not
 // care about pointers that are _not_ refcounted (like demux_packet.codec).
@@ -38,12 +47,11 @@
 void demux_packet_unref_contents(struct demux_packet *dp)
 {
     if (dp->avpacket) {
-        assert(!dp->is_cached);
-        av_packet_unref(dp->avpacket);
-        talloc_free(dp->avpacket);
-        dp->avpacket = NULL;
+        mp_assert(!dp->is_cached);
+        av_packet_free(&dp->avpacket);
         dp->buffer = NULL;
         dp->len = 0;
+        dp->is_wrapped_avframe = false;
     }
 }
 
@@ -53,15 +61,8 @@ static void packet_destroy(void *ptr)
     demux_packet_unref_contents(dp);
 }
 
-// This actually preserves only data and side data, not PTS/DTS/pos/etc.
-// It also allows avpkt->data==NULL with avpkt->size!=0 - the libavcodec API
-// does not allow it, but we do it to simplify new_demux_packet().
-struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
+static void set_packet_defaults(struct demux_packet *dp)
 {
-    if (avpkt->size > 1000000000)
-        return NULL;
-    struct demux_packet *dp = talloc(NULL, struct demux_packet);
-    talloc_set_destructor(dp, packet_destroy);
     *dp = (struct demux_packet) {
         .pts = MP_NOPTS_VALUE,
         .dts = MP_NOPTS_VALUE,
@@ -70,9 +71,47 @@ struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
         .start = MP_NOPTS_VALUE,
         .end = MP_NOPTS_VALUE,
         .stream = -1,
-        .avpacket = talloc_zero(dp, AVPacket),
+        .animated = -1,
     };
-    av_init_packet(dp->avpacket);
+}
+
+// This frees a packet backing allocations, but does not free dp itself, or
+// AVPacket inside dp, which is restored to default state.
+void demux_packet_unref(struct demux_packet *dp)
+{
+    if (!dp)
+        return;
+    struct AVPacket *avpkt = dp->avpacket;
+    if (avpkt)
+        av_packet_unref(avpkt);
+    ta_free_children(dp);
+    set_packet_defaults(dp);
+    dp->avpacket = avpkt;
+}
+
+static struct demux_packet *packet_create(struct demux_packet_pool *pool)
+{
+    struct demux_packet *dp = pool ? demux_packet_pool_pop(pool) : NULL;
+    if (!dp) {
+        dp = talloc(NULL, struct demux_packet);
+        talloc_set_destructor(dp, packet_destroy);
+        set_packet_defaults(dp);
+    }
+    if (!dp->avpacket)
+        dp->avpacket = av_packet_alloc();
+    MP_HANDLE_OOM(dp->avpacket);
+    return dp;
+}
+
+// This actually preserves only data and side data, not PTS/DTS/pos/etc.
+// It also allows avpkt->data==NULL with avpkt->size!=0 - the libavcodec API
+// does not allow it, but we do it to simplify new_demux_packet().
+struct demux_packet *new_demux_packet_from_avpacket(struct demux_packet_pool *pool,
+                                                    struct AVPacket *avpkt)
+{
+    if (avpkt->size > 1000000000)
+        return NULL;
+    struct demux_packet *dp = packet_create(pool);
     int r = -1;
     if (avpkt->data) {
         // We hope that this function won't need/access AVPacket input padding,
@@ -82,7 +121,6 @@ struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
         r = av_new_packet(dp->avpacket, avpkt->size);
     }
     if (r < 0) {
-        *dp->avpacket = (AVPacket){0};
         talloc_free(dp);
         return NULL;
     }
@@ -92,38 +130,54 @@ struct demux_packet *new_demux_packet_from_avpacket(struct AVPacket *avpkt)
 }
 
 // (buf must include proper padding)
-struct demux_packet *new_demux_packet_from_buf(struct AVBufferRef *buf)
+struct demux_packet *new_demux_packet_from_buf(struct demux_packet_pool *pool,
+                                               struct AVBufferRef *buf)
 {
     if (!buf)
         return NULL;
-    AVPacket pkt = {
-        .size = buf->size,
-        .data = buf->data,
-        .buf = buf,
-    };
-    return new_demux_packet_from_avpacket(&pkt);
+    if (buf->size > 1000000000)
+        return NULL;
+
+    struct demux_packet *dp = packet_create(pool);
+    dp->avpacket->buf = av_buffer_ref(buf);
+    if (!dp->avpacket->buf) {
+        talloc_free(dp);
+        return NULL;
+    }
+    dp->avpacket->data = dp->buffer = buf->data;
+    dp->avpacket->size = dp->len = buf->size;
+    return dp;
 }
 
 // Input data doesn't need to be padded.
-struct demux_packet *new_demux_packet_from(void *data, size_t len)
+struct demux_packet *new_demux_packet_from(struct demux_packet_pool *pool, void *data, size_t len)
 {
-    if (len > INT_MAX)
+    struct demux_packet *dp = new_demux_packet(pool, len);
+    if (!dp)
         return NULL;
-    AVPacket pkt = { .data = data, .size = len };
-    return new_demux_packet_from_avpacket(&pkt);
+    memcpy(dp->avpacket->data, data, len);
+    return dp;
 }
 
-struct demux_packet *new_demux_packet(size_t len)
+struct demux_packet *new_demux_packet(struct demux_packet_pool *pool, size_t len)
 {
     if (len > INT_MAX)
         return NULL;
-    AVPacket pkt = { .data = NULL, .size = len };
-    return new_demux_packet_from_avpacket(&pkt);
+
+    struct demux_packet *dp = packet_create(pool);
+    int r = av_new_packet(dp->avpacket, len);
+    if (r < 0) {
+        talloc_free(dp);
+        return NULL;
+    }
+    dp->buffer = dp->avpacket->data;
+    dp->len = len;
+    return dp;
 }
 
 void demux_packet_shorten(struct demux_packet *dp, size_t len)
 {
-    assert(len <= dp->len);
+    mp_assert(len <= dp->len);
     if (dp->len) {
         dp->len = len;
         memset(dp->buffer + dp->len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
@@ -141,6 +195,7 @@ void demux_packet_copy_attribs(struct demux_packet *dst, struct demux_packet *sr
     dst->dts = src->dts;
     dst->duration = src->duration;
     dst->pos = src->pos;
+    dst->is_wrapped_avframe = src->is_wrapped_avframe;
     dst->segmented = src->segmented;
     dst->start = src->start;
     dst->end = src->end;
@@ -151,14 +206,14 @@ void demux_packet_copy_attribs(struct demux_packet *dst, struct demux_packet *sr
     dst->stream = src->stream;
 }
 
-struct demux_packet *demux_copy_packet(struct demux_packet *dp)
+struct demux_packet *demux_copy_packet(struct demux_packet_pool *pool, struct demux_packet *dp)
 {
     struct demux_packet *new = NULL;
     if (dp->avpacket) {
-        new = new_demux_packet_from_avpacket(dp->avpacket);
+        new = new_demux_packet_from_avpacket(pool, dp->avpacket);
     } else {
         // Some packets might be not created by new_demux_packet*().
-        new = new_demux_packet_from(dp->buffer, dp->len);
+        new = new_demux_packet_from(pool, dp->buffer, dp->len);
     }
     if (!new)
         return NULL;
@@ -182,8 +237,33 @@ size_t demux_packet_estimate_total_size(struct demux_packet *dp)
     size += 8 * sizeof(void *); // ta  overhead
     size += 10 * sizeof(void *); // additional estimate for ta_ext_header
     if (dp->avpacket) {
-        assert(!dp->is_cached);
+        mp_assert(!dp->is_cached);
         size += ROUND_ALLOC(dp->len);
+        if (dp->is_wrapped_avframe) {
+            mp_require(dp->buffer);
+
+            const AVFrame *frame = (AVFrame *)dp->buffer;
+            if (frame->hw_frames_ctx) {
+                const AVHWFramesContext *hwctx = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+                int r = av_image_get_buffer_size(hwctx->sw_format, hwctx->width, hwctx->height, 16);
+                mp_require(r >= 0);
+                size += ROUND_ALLOC(r);
+            }
+            for (int i = 0; i < MP_ARRAY_SIZE(frame->buf) && frame->buf[i]; ++i)
+                size += ROUND_ALLOC(frame->buf[i]->size);
+
+            size += ROUND_ALLOC(frame->nb_extended_buf * sizeof(frame->extended_buf[0]));
+            for (int i = 0; i < frame->nb_extended_buf; ++i) {
+                size += ROUND_ALLOC(sizeof(*frame->extended_buf[i]));
+                size += ROUND_ALLOC(frame->extended_buf[i]->size);
+            }
+
+            size += ROUND_ALLOC(frame->nb_side_data * sizeof(frame->side_data[0]));
+            for (int i = 0; i < frame->nb_side_data; ++i) {
+                size += ROUND_ALLOC(sizeof(*frame->side_data[i]));
+                size += ROUND_ALLOC(frame->side_data[i]->size);
+            }
+        }
         size += ROUND_ALLOC(sizeof(AVPacket));
         size += 8 * sizeof(void *); // ta  overhead
         size += ROUND_ALLOC(sizeof(AVBufferRef));
@@ -214,15 +294,129 @@ int demux_packet_set_padding(struct demux_packet *dp, int start, int end)
 int demux_packet_add_blockadditional(struct demux_packet *dp, uint64_t id,
                                      void *data, size_t size)
 {
+#define SKIP(n) do { p += (n); remaining -= (n); } while (0)
+
     if (!dp->avpacket)
         return -1;
-    uint8_t *sd =  av_packet_new_side_data(dp->avpacket,
-                                           AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
-                                           8 + size);
+
+    switch (id) {
+    case MATROSKA_BLOCK_ADD_ID_TYPE_ITU_T_T35: {
+        if (size < 1)
+            break;
+
+        uint8_t *p = data;
+        size_t remaining = size;
+
+        uint8_t country_code = AV_RB8(p);
+        SKIP(1);
+
+        switch (country_code) {
+        case ITU_T_T35_COUNTRY_CODE_US: {
+            if (remaining < 2)
+                break;
+
+            uint16_t provider_code = AV_RB16(p);
+            SKIP(2);
+
+            switch (provider_code) {
+            case ITU_T_T35_PROVIDER_CODE_SAMSUNG: {
+                if (remaining < 3)
+                    break;
+
+                uint16_t provider_oriented_code = AV_RB16(p);
+                SKIP(2);
+                uint8_t application_identifier = AV_RB8(p);
+                SKIP(1);
+
+                if (provider_oriented_code != 1 || application_identifier != 4)
+                    break;
+
+                size_t hdrplus_size;
+                AVDynamicHDRPlus *hdrplus = av_dynamic_hdr_plus_alloc(&hdrplus_size);
+                MP_HANDLE_OOM(hdrplus);
+
+                if (av_dynamic_hdr_plus_from_t35(hdrplus, p, remaining) < 0 ||
+                    av_packet_add_side_data(dp->avpacket, AV_PKT_DATA_DYNAMIC_HDR10_PLUS,
+                                            (uint8_t *)hdrplus, hdrplus_size) < 0)
+                {
+                    av_free(hdrplus);
+                    return -1;
+                }
+
+                return 0;
+            }
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(62, 30, 100)
+            case ITU_T_T35_PROVIDER_CODE_SMPTE: {
+                if (remaining < 2)
+                    break;
+
+                uint16_t provider_oriented_code = AV_RB16(p);
+                SKIP(2);
+
+                if (provider_oriented_code != 1)
+                    break;
+
+                size_t app5_size;
+                AVDynamicHDRSmpte2094App5 *app5 = av_dynamic_hdr_smpte2094_app5_alloc(&app5_size);
+                MP_HANDLE_OOM(app5);
+
+                if (av_dynamic_hdr_smpte2094_app5_from_t35(app5, p, remaining) < 0 ||
+                    av_packet_add_side_data(dp->avpacket, AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5,
+                        (uint8_t *)app5, app5_size) < 0)
+                {
+                    av_free(app5);
+                    return -1;
+                }
+
+                return 0;
+            }
+#endif
+            }
+            break;
+        }
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 17, 100)
+        case ITU_T_T35_COUNTRY_CODE_UK: {
+            if (remaining < 1)
+                break;
+            SKIP(1); // skip t35_uk_country_code_second_octet
+            if (remaining < 2)
+                break;
+
+            uint16_t provider_code = AV_RB16(p);
+            SKIP(2);
+
+            if (provider_code != ITU_T_T35_PROVIDER_CODE_VNOVA)
+                break;
+
+            if (remaining < 2)
+                break;
+
+            uint8_t *lcevc_data = av_packet_new_side_data(dp->avpacket,
+                                                          AV_PKT_DATA_LCEVC,
+                                                          remaining);
+            if (!lcevc_data)
+                return -1;
+            memcpy(lcevc_data, p, remaining);
+            return 0;
+        }
+#endif
+        }
+
+        break;
+    }
+    default:
+        break;
+    }
+
+    uint8_t *sd = av_packet_new_side_data(dp->avpacket,
+                                          AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+                                          8 + size);
     if (!sd)
         return -1;
     AV_WB64(sd, id);
     if (size > 0)
         memcpy(sd + 8, data, size);
     return 0;
+
+#undef SKIP
 }

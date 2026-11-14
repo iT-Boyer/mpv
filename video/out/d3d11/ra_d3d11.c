@@ -1,7 +1,6 @@
 #include <windows.h>
 #include <versionhelpers.h>
 #include <d3d11_1.h>
-#include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <spirv_cross_c.h>
@@ -13,6 +12,7 @@
 #include "osdep/windows_utils.h"
 #include "video/out/gpu/spirv.h"
 #include "video/out/gpu/utils.h"
+#include "video/out/gpu/d3d11_helpers.h"
 
 #include "ra_d3d11.h"
 
@@ -39,15 +39,17 @@ struct ra_d3d11 {
 
     struct dll_version d3d_compiler_ver;
 
-    // Debug interfaces (--gpu-debug)
-    ID3D11Debug *debug;
-    ID3D11InfoQueue *iqueue;
+    // Debug layer messages (--gpu-debug)
+    IDXGIInfoQueue *iqueue;
 
     // Device capabilities
     D3D_FEATURE_LEVEL fl;
     bool has_clear_view;
     bool has_timestamp_queries;
     int max_uavs;
+
+    // Rasterizer state, which is used for all draws
+    ID3D11RasterizerState *rstate;
 
     // Streaming dynamic vertex buffer, which is used for all renderpasses
     ID3D11Buffer *vbuf;
@@ -196,10 +198,22 @@ static bool dll_version_equal(struct dll_version a, struct dll_version b)
            a.revision == b.revision;
 }
 
-static DXGI_FORMAT fmt_to_dxgi(const struct ra_format *fmt)
+DXGI_FORMAT ra_d3d11_get_format(const struct ra_format *fmt)
 {
     struct d3d_fmt *d3d = fmt->priv;
     return d3d->fmt;
+}
+
+const struct ra_format *ra_d3d11_get_ra_format(struct ra *ra, DXGI_FORMAT fmt)
+{
+    for (int i = 0; i < ra->num_formats; i++) {
+        struct ra_format *ra_fmt = ra->formats[i];
+
+        if (ra_d3d11_get_format(ra_fmt) == fmt)
+            return ra_fmt;
+    }
+
+    return NULL;
 }
 
 static void setup_formats(struct ra *ra)
@@ -253,6 +267,18 @@ static void setup_formats(struct ra *ra)
         for (int j = 0; j < d3dfmt->components; j++)
             fmt->component_size[j] = fmt->component_depth[j] = d3dfmt->bits[j];
 
+        if (strcmp(fmt->name, "rgb10_a2") == 0) {
+            fmt->special_imgfmt = IMGFMT_X2BGR10;
+            struct ra_imgfmt_desc *desc = talloc_zero(fmt, struct ra_imgfmt_desc);
+            fmt->special_imgfmt_desc = desc;
+            desc->component_bits = 10;
+            desc->num_planes = 1;
+            desc->planes[0] = fmt;
+            for (int c = 0; c < 3; c++)
+                desc->components[0][c] = c + 1;
+            desc->chroma_w = desc->chroma_h = 1;
+        }
+
         fmt->glsl_format = ra_fmt_glsl_format(fmt);
 
         MP_TARRAY_APPEND(ra, ra->formats, ra->num_formats, fmt);
@@ -273,7 +299,7 @@ static bool tex_init(struct ra *ra, struct ra_tex *tex)
         // texture format for textures created with tex_create, but it can be
         // different for wrapped planar video textures.
         D3D11_SHADER_RESOURCE_VIEW_DESC srvdesc = {
-            .Format = fmt_to_dxgi(params->format),
+            .Format = ra_d3d11_get_format(params->format),
         };
         switch (params->dimensions) {
         case 1:
@@ -393,7 +419,7 @@ static struct ra_tex *tex_create(struct ra *ra,
     tex->params.initial_data = NULL;
 
     struct d3d_tex *tex_p = tex->priv = talloc_zero(tex, struct d3d_tex);
-    DXGI_FORMAT fmt = fmt_to_dxgi(params->format);
+    DXGI_FORMAT fmt = ra_d3d11_get_format(params->format);
 
     D3D11_SUBRESOURCE_DATA data;
     D3D11_SUBRESOURCE_DATA *pdata = NULL;
@@ -494,7 +520,7 @@ static struct ra_tex *tex_create(struct ra *ra,
         tex_p->res = (ID3D11Resource *)tex_p->tex3d;
         break;
     default:
-        abort();
+        MP_ASSERT_UNREACHABLE();
     }
 
     tex_p->array_slice = -1;
@@ -564,7 +590,7 @@ struct ra_tex *ra_d3d11_wrap_tex(struct ra *ra, ID3D11Resource *res)
     }
 
     for (int i = 0; i < ra->num_formats; i++) {
-        DXGI_FORMAT target_fmt = fmt_to_dxgi(ra->formats[i]);
+        DXGI_FORMAT target_fmt = ra_d3d11_get_format(ra->formats[i]);
         if (fmt == target_fmt) {
             params->format = ra->formats[i];
             break;
@@ -641,6 +667,17 @@ struct ra_tex *ra_d3d11_wrap_tex_video(struct ra *ra, ID3D11Texture2D *res,
 error:
     tex_destroy(ra, tex);
     return NULL;
+}
+
+ID3D11Resource *ra_d3d11_get_raw_tex(struct ra *ra, struct ra_tex *tex,
+                                     int *array_slice)
+{
+    struct d3d_tex *tex_p = tex->priv;
+
+    ID3D11Resource_AddRef(tex_p->res);
+    if (array_slice)
+        *array_slice = tex_p->array_slice;
+    return tex_p->res;
 }
 
 static bool tex_upload(struct ra *ra, const struct ra_tex_upload_params *params)
@@ -1002,6 +1039,7 @@ static void clear_rpass(struct ra *ra, struct ra_tex *tex, float color[4],
 
     ID3D11DeviceContext_VSSetShader(p->ctx, p->clear_vs, NULL, 0);
 
+    ID3D11DeviceContext_RSSetState(p->ctx, p->rstate);
     ID3D11DeviceContext_RSSetViewports(p->ctx, 1, (&(D3D11_VIEWPORT) {
         .Width = params->w,
         .Height = params->h,
@@ -1181,6 +1219,7 @@ static void blit_rpass(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
 
     ID3D11DeviceContext_VSSetShader(p->ctx, p->blit_vs, NULL, 0);
 
+    ID3D11DeviceContext_RSSetState(p->ctx, p->rstate);
     ID3D11DeviceContext_RSSetViewports(p->ctx, 1, (&(D3D11_VIEWPORT) {
         .TopLeftX = dst_rc->x0,
         .TopLeftY = dst_rc->y0,
@@ -1222,8 +1261,8 @@ static void blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
     struct mp_rect dst_rc = *dst_rc_ptr;
     struct mp_rect src_rc = *src_rc_ptr;
 
-    assert(dst->params.dimensions == 2);
-    assert(src->params.dimensions == 2);
+    mp_assert(dst->params.dimensions == 2);
+    mp_assert(src->params.dimensions == 2);
 
     // A zero-sized target rectangle is a no-op
     if (!mp_rect_w(dst_rc) || !mp_rect_h(dst_rc))
@@ -1295,13 +1334,13 @@ static bool compile_glsl(struct ra *ra, enum glsl_shader type,
         sc_shader_model = 40;
     }
 
-    int64_t start_us = mp_time_us();
+    int64_t start_ns = mp_time_ns();
 
     bstr spv_module;
     if (!spirv->fns->compile_glsl(spirv, ta_ctx, type, glsl, &spv_module))
         goto done;
 
-    int64_t shaderc_us = mp_time_us();
+    int64_t shaderc_ns = mp_time_ns();
 
     sc_res = spvc_context_create(&sc_ctx);
     if (sc_res != SPVC_SUCCESS)
@@ -1340,7 +1379,7 @@ static bool compile_glsl(struct ra *ra, enum glsl_shader type,
     if (sc_res != SPVC_SUCCESS)
         goto done;
 
-    int64_t cross_us = mp_time_us();
+    int64_t cross_ns = mp_time_ns();
 
     hr = p->D3DCompile(hlsl, strlen(hlsl), NULL, NULL, NULL, "main",
         get_shader_target(ra, type), D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, out,
@@ -1352,14 +1391,14 @@ static bool compile_glsl(struct ra *ra, enum glsl_shader type,
         goto done;
     }
 
-    int64_t d3dcompile_us = mp_time_us();
+    int64_t d3dcompile_ns = mp_time_ns();
 
-    MP_VERBOSE(ra, "Compiled a %s shader in %lldus\n", shader_type_name(type),
-               d3dcompile_us - start_us);
-    MP_VERBOSE(ra, "shaderc: %lldus, SPIRV-Cross: %lldus, D3DCompile: %lldus\n",
-               shaderc_us - start_us,
-               cross_us - shaderc_us,
-               d3dcompile_us - cross_us);
+    MP_VERBOSE(ra, "Compiled a %s shader in %lldns\n", shader_type_name(type),
+               d3dcompile_ns - start_ns);
+    MP_VERBOSE(ra, "shaderc: %lldns, SPIRV-Cross: %lldns, D3DCompile: %lldns\n",
+               shaderc_ns - start_ns,
+               cross_ns - shaderc_ns,
+               d3dcompile_ns - cross_ns);
 
     success = true;
 done:
@@ -1472,22 +1511,22 @@ static size_t vbuf_upload(struct ra *ra, void *data, size_t size)
     return offset;
 }
 
-static const char cache_magic[4] = "RD11";
-static const int cache_version = 3;
+static const char cache_magic[4] MP_NONSTRING = "RD11";
+static const uint32_t cache_version = 4;
 
 struct cache_header {
     char magic[sizeof(cache_magic)];
-    int cache_version;
+    uint32_t cache_version;
     char compiler[SPIRV_NAME_MAX_LEN];
-    int spv_compiler_version;
-    unsigned spvc_compiler_major;
-    unsigned spvc_compiler_minor;
-    unsigned spvc_compiler_patch;
+    int32_t spv_compiler_version;
+    uint32_t spvc_compiler_major;
+    uint32_t spvc_compiler_minor;
+    uint32_t spvc_compiler_patch;
     struct dll_version d3d_compiler_version;
-    int feature_level;
-    size_t vert_bytecode_len;
-    size_t frag_bytecode_len;
-    size_t comp_bytecode_len;
+    int32_t feature_level;
+    uint32_t vert_bytecode_len;
+    uint32_t frag_bytecode_len;
+    uint32_t comp_bytecode_len;
 };
 
 static void load_cached_program(struct ra *ra,
@@ -1570,7 +1609,7 @@ static void save_cached_program(struct ra *ra, struct ra_renderpass *pass,
         .frag_bytecode_len = frag_bc.len,
         .comp_bytecode_len = comp_bc.len,
     };
-    strncpy(header.magic, cache_magic, sizeof(header.magic));
+    memcpy(header.magic, cache_magic, sizeof(header.magic));
     strncpy(header.compiler, spirv->name, sizeof(header.compiler));
 
     struct bstr *prog = &pass->params.cached_program;
@@ -1791,6 +1830,7 @@ static void renderpass_run_raster(struct ra *ra,
 
     ID3D11DeviceContext_VSSetShader(p->ctx, pass_p->vs, NULL, 0);
 
+    ID3D11DeviceContext_RSSetState(p->ctx, p->rstate);
     ID3D11DeviceContext_RSSetViewports(p->ctx, 1, (&(D3D11_VIEWPORT) {
         .TopLeftX = params->viewport.x0,
         .TopLeftY = params->viewport.y0,
@@ -1903,7 +1943,7 @@ static void renderpass_run(struct ra *ra,
         int binding = pass->params.inputs[val->index].binding;
         switch (pass->params.inputs[val->index].type) {
         case RA_VARTYPE_BUF_RO:
-            if (binding > MP_ARRAY_SIZE(ubos)) {
+            if (binding >= MP_ARRAY_SIZE(ubos)) {
                 MP_ERR(ra, "Too many constant buffers in pass\n");
                 return;
             }
@@ -1925,7 +1965,7 @@ static void renderpass_run(struct ra *ra,
             uavs_len = MPMAX(uavs_len, binding + 1);
             break;
         case RA_VARTYPE_TEX:
-            if (binding > MP_ARRAY_SIZE(samplers)) {
+            if (binding >= MP_ARRAY_SIZE(samplers)) {
                 MP_ERR(ra, "Too many textures in pass\n");
                 return;
             }
@@ -1994,7 +2034,7 @@ static ra_timer *timer_create(struct ra *ra)
 
     // Measuring duration in D3D11 requires three queries: start and end
     // timestamps, and a disjoint query containing a flag which says whether
-    // the timestamps are usable or if a discontinuity occured between them,
+    // the timestamps are usable or if a discontinuity occurred between them,
     // like a change in power state or clock speed. The disjoint query also
     // contains the timer frequency, so the timestamps are useless without it.
     hr = ID3D11Device_CreateQuery(p->dev,
@@ -2067,67 +2107,16 @@ static uint64_t timer_stop(struct ra *ra, ra_timer *ratimer)
     return timer->result;
 }
 
-static int map_msg_severity(D3D11_MESSAGE_SEVERITY sev)
-{
-    switch (sev) {
-    case D3D11_MESSAGE_SEVERITY_CORRUPTION:
-        return MSGL_FATAL;
-    case D3D11_MESSAGE_SEVERITY_ERROR:
-        return MSGL_ERR;
-    case D3D11_MESSAGE_SEVERITY_WARNING:
-        return MSGL_WARN;
-    default:
-    case D3D11_MESSAGE_SEVERITY_INFO:
-    case D3D11_MESSAGE_SEVERITY_MESSAGE:
-        return MSGL_DEBUG;
-    }
-}
-
 static void debug_marker(struct ra *ra, const char *msg)
 {
     struct ra_d3d11 *p = ra->priv;
-    void *talloc_ctx = talloc_new(NULL);
-    HRESULT hr;
-
-    if (!p->iqueue)
-        goto done;
-
-    // Copy debug-layer messages to mpv's log output
-    bool printed_header = false;
-    uint64_t messages = ID3D11InfoQueue_GetNumStoredMessages(p->iqueue);
-    for (uint64_t i = 0; i < messages; i++) {
-        size_t len;
-        hr = ID3D11InfoQueue_GetMessage(p->iqueue, i, NULL, &len);
-        if (FAILED(hr) || !len)
-            goto done;
-
-        D3D11_MESSAGE *d3dmsg = talloc_size(talloc_ctx, len);
-        hr = ID3D11InfoQueue_GetMessage(p->iqueue, i, d3dmsg, &len);
-        if (FAILED(hr))
-            goto done;
-
-        int msgl = map_msg_severity(d3dmsg->Severity);
-        if (mp_msg_test(ra->log, msgl)) {
-            if (!printed_header)
-                MP_INFO(ra, "%s:\n", msg);
-            printed_header = true;
-
-            MP_MSG(ra, msgl, "%d: %.*s\n", (int)d3dmsg->ID,
-                (int)d3dmsg->DescriptionByteLength, d3dmsg->pDescription);
-            talloc_free(d3dmsg);
-        }
-    }
-
-    ID3D11InfoQueue_ClearStoredMessages(p->iqueue);
-done:
-    talloc_free(talloc_ctx);
+    mp_d3d11_debug_marker(ra->log, p->iqueue, msg);
 }
 
 static void destroy(struct ra *ra)
 {
     struct ra_d3d11 *p = ra->priv;
 
-    // Release everything except the interfaces needed to perform leak checking
     SAFE_RELEASE(p->clear_ps);
     SAFE_RELEASE(p->clear_vs);
     SAFE_RELEASE(p->clear_layout);
@@ -2139,33 +2128,24 @@ static void destroy(struct ra *ra)
     SAFE_RELEASE(p->blit_vbuf);
     SAFE_RELEASE(p->blit_sampler);
     SAFE_RELEASE(p->vbuf);
+    SAFE_RELEASE(p->rstate);
     SAFE_RELEASE(p->ctx1);
     SAFE_RELEASE(p->dev1);
     SAFE_RELEASE(p->dev);
 
-    if (p->debug && p->ctx) {
+    if (p->ctx) {
         // Destroy the device context synchronously so referenced objects don't
         // show up in the leak check
         ID3D11DeviceContext_ClearState(p->ctx);
         ID3D11DeviceContext_Flush(p->ctx);
     }
     SAFE_RELEASE(p->ctx);
-
-    if (p->debug) {
-        // Report any leaked objects
-        debug_marker(ra, "after destroy");
-        ID3D11Debug_ReportLiveDeviceObjects(p->debug, D3D11_RLDO_DETAIL);
-        debug_marker(ra, "after leak check");
-        ID3D11Debug_ReportLiveDeviceObjects(p->debug, D3D11_RLDO_SUMMARY);
-        debug_marker(ra, "after leak summary");
-    }
-    SAFE_RELEASE(p->debug);
     SAFE_RELEASE(p->iqueue);
 
     talloc_free(ra);
 }
 
-static struct ra_fns ra_fns_d3d11 = {
+static const struct ra_fns ra_fns_d3d11 = {
     .destroy            = destroy,
     .tex_create         = tex_create,
     .tex_destroy        = tex_destroy,
@@ -2194,57 +2174,13 @@ void ra_d3d11_flush(struct ra *ra)
     ID3D11DeviceContext_Flush(p->ctx);
 }
 
-static void init_debug_layer(struct ra *ra)
-{
-    struct ra_d3d11 *p = ra->priv;
-    HRESULT hr;
-
-    hr = ID3D11Device_QueryInterface(p->dev, &IID_ID3D11Debug,
-                                     (void**)&p->debug);
-    if (FAILED(hr)) {
-        MP_ERR(ra, "Failed to get debug device: %s\n", mp_HRESULT_to_str(hr));
-        return;
-    }
-
-    hr = ID3D11Device_QueryInterface(p->dev, &IID_ID3D11InfoQueue,
-                                     (void**)&p->iqueue);
-    if (FAILED(hr)) {
-        MP_ERR(ra, "Failed to get info queue: %s\n", mp_HRESULT_to_str(hr));
-        return;
-    }
-
-    // Store an unlimited amount of messages in the buffer. This is fine
-    // because we flush stored messages regularly (in debug_marker.)
-    ID3D11InfoQueue_SetMessageCountLimit(p->iqueue, -1);
-
-    // Filter some annoying messages
-    D3D11_MESSAGE_ID deny_ids[] = {
-        // This error occurs during context creation when we try to figure out
-        // the real maximum texture size by attempting to create a texture
-        // larger than the current feature level allows.
-        D3D11_MESSAGE_ID_CREATETEXTURE2D_INVALIDDIMENSIONS,
-
-        // These are normal. The RA timer queue habitually reuses timer objects
-        // without retrieving the results.
-        D3D11_MESSAGE_ID_QUERY_BEGIN_ABANDONING_PREVIOUS_RESULTS,
-        D3D11_MESSAGE_ID_QUERY_END_ABANDONING_PREVIOUS_RESULTS,
-    };
-    D3D11_INFO_QUEUE_FILTER filter = {
-        .DenyList = {
-            .NumIDs = MP_ARRAY_SIZE(deny_ids),
-            .pIDList = deny_ids,
-        },
-    };
-    ID3D11InfoQueue_PushStorageFilter(p->iqueue, &filter);
-}
-
 static struct dll_version get_dll_version(HMODULE dll)
 {
     void *ctx = talloc_new(NULL);
     struct dll_version ret = { 0 };
 
     HRSRC rsrc = FindResourceW(dll, MAKEINTRESOURCEW(VS_VERSION_INFO),
-                               MAKEINTRESOURCEW(VS_FILE_INFO));
+                               VS_FILE_INFO);
     if (!rsrc)
         goto done;
     DWORD size = SizeofResource(dll, rsrc);
@@ -2386,6 +2322,8 @@ struct ra *ra_d3d11_create(ID3D11Device *dev, struct mp_log *log,
     if (p->fl >= D3D_FEATURE_LEVEL_11_0) {
         ra->caps |= RA_CAP_COMPUTE | RA_CAP_BUF_RW;
         ra->max_shmem = 32 * 1024;
+        ra->max_compute_group_threads =
+            D3D11_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP;
     }
 
     if (p->fl >= D3D_FEATURE_LEVEL_11_1) {
@@ -2395,17 +2333,24 @@ struct ra *ra_d3d11_create(ID3D11Device *dev, struct mp_log *log,
     }
 
     if (ID3D11Device_GetCreationFlags(p->dev) & D3D11_CREATE_DEVICE_DEBUG)
-        init_debug_layer(ra);
+        mp_d3d11_get_debug_interfaces(ra->log, NULL, &p->iqueue);
 
     // Some level 9_x devices don't have timestamp queries
     hr = ID3D11Device_CreateQuery(p->dev,
         &(D3D11_QUERY_DESC) { D3D11_QUERY_TIMESTAMP }, NULL);
     p->has_timestamp_queries = SUCCEEDED(hr);
 
+    debug_marker(ra, "before maximum Texture2D size lookup");
+
     // According to MSDN, the above texture sizes are just minimums and drivers
     // may support larger textures. See:
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476874.aspx
     find_max_texture_dimension(ra);
+
+    // Ignore any messages during find_max_texture_dimension
+    if (p->iqueue)
+        IDXGIInfoQueue_ClearStoredMessages(p->iqueue, DXGI_DEBUG_ALL);
+
     MP_VERBOSE(ra, "Maximum Texture2D size: %dx%d\n", ra->max_texture_wh,
                ra->max_texture_wh);
 
@@ -2420,8 +2365,6 @@ struct ra *ra_d3d11_create(ID3D11Device *dev, struct mp_log *log,
 
     setup_formats(ra);
 
-    // The rasterizer state never changes, so set it up here
-    ID3D11RasterizerState *rstate;
     D3D11_RASTERIZER_DESC rdesc = {
         .FillMode = D3D11_FILL_SOLID,
         .CullMode = D3D11_CULL_NONE,
@@ -2429,13 +2372,11 @@ struct ra *ra_d3d11_create(ID3D11Device *dev, struct mp_log *log,
         .DepthClipEnable = TRUE, // Required for 10level9
         .ScissorEnable = TRUE,
     };
-    hr = ID3D11Device_CreateRasterizerState(p->dev, &rdesc, &rstate);
+    hr = ID3D11Device_CreateRasterizerState(p->dev, &rdesc, &p->rstate);
     if (FAILED(hr)) {
         MP_ERR(ra, "Failed to create rasterizer state: %s\n", mp_HRESULT_to_str(hr));
         goto error;
     }
-    ID3D11DeviceContext_RSSetState(p->ctx, rstate);
-    SAFE_RELEASE(rstate);
 
     // If the device doesn't support ClearView, we have to set up a
     // shader-based clear() implementation

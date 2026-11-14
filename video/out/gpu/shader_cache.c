@@ -11,6 +11,8 @@
 #include "osdep/io.h"
 
 #include "common/common.h"
+#include "misc/hash.h"
+#include "misc/io_utils.h"
 #include "options/path.h"
 #include "stream/stream.h"
 #include "shader_cache.h"
@@ -185,8 +187,6 @@ void gl_sc_enable_extension(struct gl_shader_cache *sc, char *name)
     MP_TARRAY_APPEND(sc, sc->exts, sc->num_exts, talloc_strdup(sc, name));
 }
 
-#define bstr_xappend0(sc, b, s) bstr_xappend(sc, b, bstr0(s))
-
 void gl_sc_add(struct gl_shader_cache *sc, const char *text)
 {
     bstr_xappend0(sc, &sc->text, text);
@@ -227,7 +227,7 @@ void gl_sc_paddf(struct gl_shader_cache *sc, const char *textf, ...)
 }
 
 static struct sc_uniform *find_uniform(struct gl_shader_cache *sc,
-                                       const char *name)
+                                       struct bstr name)
 {
     struct sc_uniform new = {
         .input = {
@@ -238,7 +238,7 @@ static struct sc_uniform *find_uniform(struct gl_shader_cache *sc,
 
     for (int n = 0; n < sc->num_uniforms; n++) {
         struct sc_uniform *u = &sc->uniforms[n];
-        if (strcmp(u->input.name, name) == 0) {
+        if (bstrcmp(bstr0(u->input.name), name) == 0) {
             const char *allocname = u->input.name;
             *u = new;
             u->input.name = allocname;
@@ -247,7 +247,7 @@ static struct sc_uniform *find_uniform(struct gl_shader_cache *sc,
     }
 
     // not found -> add it
-    new.input.name = talloc_strdup(NULL, name);
+    new.input.name = bstrdup0(NULL, name);
     MP_TARRAY_APPEND(sc, sc->uniforms, sc->num_uniforms, new);
     return &sc->uniforms[sc->num_uniforms - 1];
 }
@@ -305,7 +305,7 @@ static void update_uniform_params(struct gl_shader_cache *sc, struct sc_uniform 
     }
 
     // If all else fails, use global uniforms
-    assert(sc->ra->caps & RA_CAP_GLOBAL_UNIFORM);
+    mp_assert(sc->ra->caps & RA_CAP_GLOBAL_UNIFORM);
     u->type = SC_UNIFORM_TYPE_GLOBAL;
 }
 
@@ -325,7 +325,7 @@ void gl_sc_uniform_texture(struct gl_shader_cache *sc, char *name,
         glsl_type = sc->ra->glsl_es ? "highp usampler2D" : "usampler2D";
     }
 
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_TEX;
     u->glsl_type = glsl_type;
     u->input.binding = gl_sc_next_binding(sc, u->input.type);
@@ -337,9 +337,9 @@ void gl_sc_uniform_image2D_wo(struct gl_shader_cache *sc, const char *name,
 {
     gl_sc_enable_extension(sc, "GL_ARB_shader_image_load_store");
 
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_IMG_W;
-    u->glsl_type = "writeonly image2D";
+    u->glsl_type = sc->ra->glsl_es ? "writeonly highp image2D" : "writeonly image2D";
     u->input.binding = gl_sc_next_binding(sc, u->input.type);
     u->v.tex = tex;
 }
@@ -347,10 +347,10 @@ void gl_sc_uniform_image2D_wo(struct gl_shader_cache *sc, const char *name,
 void gl_sc_ssbo(struct gl_shader_cache *sc, char *name, struct ra_buf *buf,
                 char *format, ...)
 {
-    assert(sc->ra->caps & RA_CAP_BUF_RW);
+    mp_assert(sc->ra->caps & RA_CAP_BUF_RW);
     gl_sc_enable_extension(sc, "GL_ARB_shader_storage_buffer_object");
 
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_BUF_RW;
     u->glsl_type = "";
     u->input.binding = gl_sc_next_binding(sc, u->input.type);
@@ -362,7 +362,7 @@ void gl_sc_ssbo(struct gl_shader_cache *sc, char *name, struct ra_buf *buf,
     va_end(ap);
 }
 
-void gl_sc_uniform_f(struct gl_shader_cache *sc, char *name, float f)
+void gl_sc_uniform_f_bstr(struct gl_shader_cache *sc, struct bstr name, float f)
 {
     struct sc_uniform *u = find_uniform(sc, name);
     u->input.type = RA_VARTYPE_FLOAT;
@@ -371,7 +371,7 @@ void gl_sc_uniform_f(struct gl_shader_cache *sc, char *name, float f)
     u->v.f[0] = f;
 }
 
-void gl_sc_uniform_i(struct gl_shader_cache *sc, char *name, int i)
+void gl_sc_uniform_i_bstr(struct gl_shader_cache *sc, struct bstr name, int i)
 {
     struct sc_uniform *u = find_uniform(sc, name);
     u->input.type = RA_VARTYPE_INT;
@@ -380,9 +380,19 @@ void gl_sc_uniform_i(struct gl_shader_cache *sc, char *name, int i)
     u->v.i[0] = i;
 }
 
+void gl_sc_uniform_f(struct gl_shader_cache *sc, char *name, float f)
+{
+    gl_sc_uniform_f_bstr(sc, bstr0(name), f);
+}
+
+void gl_sc_uniform_i(struct gl_shader_cache *sc, char *name, int i)
+{
+    gl_sc_uniform_i_bstr(sc, bstr0(name), i);
+}
+
 void gl_sc_uniform_vec2(struct gl_shader_cache *sc, char *name, float f[2])
 {
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_FLOAT;
     u->input.dim_v = 2;
     u->glsl_type = "vec2";
@@ -393,7 +403,7 @@ void gl_sc_uniform_vec2(struct gl_shader_cache *sc, char *name, float f[2])
 
 void gl_sc_uniform_vec3(struct gl_shader_cache *sc, char *name, float f[3])
 {
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_FLOAT;
     u->input.dim_v = 3;
     u->glsl_type = "vec3";
@@ -411,7 +421,7 @@ static void transpose2x2(float r[2 * 2])
 void gl_sc_uniform_mat2(struct gl_shader_cache *sc, char *name,
                         bool transpose, float *v)
 {
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_FLOAT;
     u->input.dim_v = 2;
     u->input.dim_m = 2;
@@ -433,7 +443,7 @@ static void transpose3x3(float r[3 * 3])
 void gl_sc_uniform_mat3(struct gl_shader_cache *sc, char *name,
                         bool transpose, float *v)
 {
-    struct sc_uniform *u = find_uniform(sc, name);
+    struct sc_uniform *u = find_uniform(sc, bstr0(name));
     u->input.type = RA_VARTYPE_FLOAT;
     u->input.dim_v = 3;
     u->input.dim_m = 3;
@@ -474,7 +484,7 @@ const char *gl_sc_bvec(struct gl_shader_cache *sc, int dims)
         [4] = "vec4",
     };
 
-    assert(dims > 0 && dims < MP_ARRAY_SIZE(bvecs));
+    mp_assert(dims > 0 && dims < MP_ARRAY_SIZE(bvecs));
     return sc->ra->glsl_version >= 130 ? bvecs[dims] : vecs[dims];
 }
 
@@ -486,7 +496,7 @@ static const char *vao_glsl_type(const struct ra_renderpass_input *e)
     case 2: return "vec2";
     case 3: return "vec3";
     case 4: return "vec4";
-    default: abort();
+    default: MP_ASSERT_UNREACHABLE();
     }
 }
 
@@ -546,21 +556,27 @@ static void update_uniform(struct gl_shader_cache *sc, struct sc_entry *e,
         break;
     }
     case SC_UNIFORM_TYPE_UBO:
-        assert(e->ubo);
+        mp_assert(e->ubo);
         update_ubo(sc->ra, e->ubo, u);
         break;
     case SC_UNIFORM_TYPE_PUSHC:
-        assert(e->pushc);
+        mp_assert(e->pushc);
         update_pushc(sc->ra, e->pushc, u);
         break;
-    default: abort();
+    default: MP_ASSERT_UNREACHABLE();
     }
 }
 
-void gl_sc_set_cache_dir(struct gl_shader_cache *sc, const char *dir)
+void gl_sc_set_cache_dir(struct gl_shader_cache *sc, char *dir)
 {
     talloc_free(sc->cache_dir);
+    if (dir && dir[0]) {
+        dir = mp_get_user_path(NULL, sc->global, dir);
+    } else {
+        dir = mp_find_user_file(NULL, sc->global, "cache", "");
+    }
     sc->cache_dir = talloc_strdup(sc, dir);
+    talloc_free(dir);
 }
 
 static bool create_pass(struct gl_shader_cache *sc, struct sc_entry *entry)
@@ -578,21 +594,8 @@ static bool create_pass(struct gl_shader_cache *sc, struct sc_entry *entry)
         // Try to load it from a disk cache.
         cache_dir = mp_get_user_path(tmp, sc->global, sc->cache_dir);
 
-        struct AVSHA *sha = av_sha_alloc();
-        if (!sha)
-            abort();
-        av_sha_init(sha, 256);
-        av_sha_update(sha, entry->total.start, entry->total.len);
-
-        uint8_t hash[256 / 8];
-        av_sha_final(sha, hash);
-        av_free(sha);
-
-        char hashstr[256 / 8 * 2 + 1];
-        for (int n = 0; n < 256 / 8; n++)
-            snprintf(hashstr + n * 2, sizeof(hashstr) - n * 2, "%02X", hash[n]);
-
-        cache_filename = mp_path_join(tmp, cache_dir, hashstr);
+        bstr hashstr = mp_hash_to_bstr(tmp, entry->total.start, entry->total.len, "SHA256");
+        cache_filename = mp_path_join_bstr(tmp, bstr0(cache_dir), hashstr);
         if (stat(cache_filename, &(struct stat){0}) == 0) {
             MP_DBG(sc, "Trying to load shader from disk...\n");
             struct bstr cachedata =
@@ -645,12 +648,10 @@ static bool create_pass(struct gl_shader_cache *sc, struct sc_entry *entry)
             mp_mkdirp(cache_dir);
 
             MP_DBG(sc, "Writing shader cache file: %s\n", cache_filename);
-            FILE *out = fopen(cache_filename, "wb");
-            if (out) {
-                fwrite(cache_header, strlen(cache_header), 1, out);
-                fwrite(nc.start, nc.len, 1, out);
-                fclose(out);
-            }
+            bstr out = {0};
+            bstr_xappend0(tmp, &out, cache_header);
+            bstr_xappend(tmp, &out, nc);
+            mp_save_to_file(cache_filename, out.start, out.len);
         }
     }
 
@@ -699,8 +700,8 @@ static void add_uniforms(struct gl_shader_cache *sc, bstr *dst)
         switch (u->input.type) {
         case RA_VARTYPE_INT:
         case RA_VARTYPE_FLOAT:
-            assert(sc->ra->caps & RA_CAP_GLOBAL_UNIFORM);
-            // fall through
+            mp_assert(sc->ra->caps & RA_CAP_GLOBAL_UNIFORM);
+            MP_FALLTHROUGH;
         case RA_VARTYPE_TEX:
             // Vulkan requires explicitly assigning the bindings in the shader
             // source. For OpenGL it's optional, but requires higher GL version
@@ -760,7 +761,7 @@ static void gl_sc_generate(struct gl_shader_cache *sc,
 
     // gl_sc_reset() must be called after ending the previous render process,
     // and before starting a new one.
-    assert(!sc->needs_reset);
+    mp_assert(!sc->needs_reset);
     sc->needs_reset = true;
 
     // If using a UBO, pick a binding (needed for shader generation)
@@ -786,7 +787,7 @@ static void gl_sc_generate(struct gl_shader_cache *sc,
         ADD(header, "#else\n");
         ADD(header, "precision mediump float;\n");
         ADD(header, "#endif\n");
-        
+
         ADD(header, "precision mediump sampler2D;\n");
         if (sc->ra->caps & RA_CAP_TEX_3D)
             ADD(header, "precision mediump sampler3D;\n");
@@ -827,7 +828,7 @@ static void gl_sc_generate(struct gl_shader_cache *sc,
                 snprintf(loc, sizeof(loc), "layout(location=%d) ", n);
             if (strcmp(e->name, "position") == 0) {
                 // setting raster pos. requires setting gl_Position magic variable
-                assert(e->dim_v == 2 && e->type == RA_VARTYPE_FLOAT);
+                mp_assert(e->dim_v == 2 && e->type == RA_VARTYPE_FLOAT);
                 ADD(vert_head, "%s%s vec2 vertex_position;\n", loc, vert_in);
                 ADD(vert_body, "gl_Position = vec4(vertex_position, 1.0, 1.0);\n");
             } else {
@@ -867,7 +868,7 @@ static void gl_sc_generate(struct gl_shader_cache *sc,
 
         // We need to fix the format of the render dst at renderpass creation
         // time
-        assert(target_format);
+        mp_assert(target_format);
         sc->params.target_format = target_format;
     }
 
@@ -965,7 +966,7 @@ static void gl_sc_generate(struct gl_shader_cache *sc,
         return;
     }
 
-    assert(sc->num_uniforms == entry->num_cached_uniforms);
+    mp_assert(sc->num_uniforms == entry->num_cached_uniforms);
 
     sc->num_values = 0;
     for (int n = 0; n < sc->num_uniforms; n++)

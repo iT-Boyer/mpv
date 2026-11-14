@@ -36,12 +36,17 @@ struct demux_seek_range {
     double start, end;
 };
 
+struct demux_ctrl_ts_info {
+    double duration;
+    double reader; // approx. timestamp of decoder position
+    double end;    // approx. timestamp of end of buffered range
+};
+
 struct demux_reader_state {
     bool eof, underrun, idle;
     bool bof_cached, eof_cached;
-    double ts_duration;
-    double ts_reader; // approx. timerstamp of decoder position
-    double ts_end; // approx. timestamp of end of buffered range
+    struct demux_ctrl_ts_info ts_info;
+    struct demux_ctrl_ts_info ts_per_stream[STREAM_TYPE_COUNT];
     int64_t total_bytes;
     int64_t fw_bytes;
     int64_t file_cache_bytes;
@@ -56,14 +61,43 @@ struct demux_reader_state {
     struct demux_seek_range seek_ranges[MAX_SEEK_RANGES];
 };
 
+extern const struct m_sub_options demux_conf;
+
+struct demux_opts {
+    int enable_cache;
+    bool disk_cache;
+    int64_t max_bytes;
+    int64_t max_bytes_bw;
+    bool donate_fw;
+    double min_secs;
+    double hyst_secs;
+    int64_t hyst_bytes;
+    bool force_seekable;
+    double min_secs_cache;
+    bool access_references;
+    int seekable_cache;
+    int index_mode;
+    double mf_fps;
+    char *mf_type;
+    bool create_ccs;
+    char *record_file;
+    int video_back_preroll;
+    int audio_back_preroll;
+    int back_batch[STREAM_TYPE_COUNT];
+    double back_seek_size;
+    char *meta_cp;
+    bool force_retry_eof;
+    char **directory_filter;
+    int autocreate_playlist;
+};
+
 #define SEEK_FACTOR   (1 << 1)      // argument is in range [0,1]
 #define SEEK_FORWARD  (1 << 2)      // prefer later time if not exact
                                     // (if unset, prefer earlier time)
 #define SEEK_CACHED   (1 << 3)      // allow packet cache seeks only
 #define SEEK_SATAN    (1 << 4)      // enable backward demuxing
 #define SEEK_HR       (1 << 5)      // hr-seek (this is a weak hint only)
-#define SEEK_FORCE    (1 << 6)      // ignore unseekable flag
-#define SEEK_BLOCK    (1 << 7)      // upon successfully queued seek, block readers
+#define SEEK_BLOCK    (1 << 6)      // upon successfully queued seek, block readers
                                     // (simplifies syncing multiple reader threads)
 
 // Strictness of the demuxer open format check.
@@ -87,6 +121,8 @@ enum demux_event {
     DEMUX_EVENT_STREAMS = 1 << 1,   // a stream was added
     DEMUX_EVENT_METADATA = 1 << 2,  // metadata or stream_metadata changed
     DEMUX_EVENT_DURATION = 1 << 3,  // duration updated
+    DEMUX_EVENT_LISTS = 1 << 4,     // chapters / editions list changed
+    DEMUX_EVENT_CODEC = 1 << 5,     // codec params of a stream replaced
     DEMUX_EVENT_ALL = 0xFFFF,
 };
 
@@ -111,6 +147,9 @@ typedef struct demuxer_desc {
     // If *pkt is NULL (the value when this function is called), the call
     // will be repeated.
     bool (*read_packet)(struct demuxer *demuxer, struct demux_packet **pkt);
+    void (*drop_buffers)(struct demuxer *demuxer);
+    // Optional. Re-queue retained sticky packets (DVD menu subpicture).
+    void (*nav_refresh)(struct demuxer *demuxer);
     void (*close)(struct demuxer *demuxer);
     void (*seek)(struct demuxer *demuxer, double rel_seek_secs, int flags);
     void (*switched_tracks)(struct demuxer *demuxer);
@@ -167,6 +206,8 @@ typedef struct demux_attachment
 
 struct demuxer_params {
     bool is_top_level; // if true, it's not a sub-demuxer (enables cache etc.)
+    int depth;         // depth of the demuxer tree, 0 for top-level, each
+                       // nested demuxer increases depth by 1
     char *force_format;
     int matroska_num_wanted_uids;
     struct matroska_segment_uid *matroska_wanted_uids;
@@ -179,6 +220,7 @@ struct demuxer_params {
     bool stream_record; // if true, enable stream recording if option is set
     int stream_flags;
     struct stream *external_stream; // if set, use this, don't open or close streams
+    bool allow_playlist_create;
     // result
     bool demuxer_failed;
 };
@@ -189,12 +231,17 @@ typedef struct demuxer {
     int64_t filepos;  // input stream current pos.
     int64_t filesize;
     char *filename;  // same as stream->url
+    char *server_filename; // same as stream->server_filename
     bool seekable;
     bool partially_seekable; // true if _maybe_ seekable; implies seekable=true
     double start_time;
     double duration;  // -1 if unknown
     // File format allows PTS resets (even if the current file is without)
     bool ts_resets_possible;
+    // The underlying source can switch to different content at any time, and
+    // timestamps restart per title, so cached packet ranges become stale
+    // without notice and must never be used to satisfy seeks.
+    bool no_cache_seeking;
     // The file data was fully read, and there is no need to keep the stream
     // open, keep the cache active, or to run the demuxer thread. Generating
     // packets is not slow either (unlike e.g. libavdevice pseudo-demuxers).
@@ -204,6 +251,10 @@ typedef struct demuxer {
     bool is_streaming; // implies a "slow" input, such as network or FUSE
     int stream_origin; // any STREAM_ORIGIN_* (set from source stream)
     bool access_references; // allow opening other files/URLs
+    int depth; // demuxer depth, 0 for top-level
+
+    struct demux_opts *opts;
+    struct m_config_cache *opts_cache;
 
     // Bitmask of DEMUX_EVENT_*
     int events;
@@ -211,6 +262,7 @@ typedef struct demuxer {
     struct demux_edition *editions;
     int num_editions;
     int edition;
+    bool edition_is_track_mapping;
 
     struct demux_chapter *chapters;
     int num_chapters;
@@ -228,6 +280,7 @@ typedef struct demuxer {
     void *priv;   // demuxer-specific internal data
     struct mpv_global *global;
     struct mp_log *log, *glog;
+    struct demux_packet_pool *packet_pool;
     struct demuxer_params *params;
 
     // internal to demux.c
@@ -256,9 +309,12 @@ int demux_read_packet_async(struct sh_stream *sh, struct demux_packet **out_pkt)
 int demux_read_packet_async_until(struct sh_stream *sh, double min_pts,
                                   struct demux_packet **out_pkt);
 bool demux_stream_is_selected(struct sh_stream *stream);
+bool demux_stream_eof_is_lazy(struct sh_stream *stream);
+bool demux_stream_has_packets(struct sh_stream *stream);
 void demux_set_stream_wakeup_cb(struct sh_stream *sh,
                                 void (*cb)(void *ctx), void *ctx);
-struct demux_packet *demux_read_any_packet(struct demuxer *demuxer);
+struct demux_packet *demux_read_any_packet(struct demuxer *demuxer,
+                                           bool *new_streams);
 
 struct sh_stream *demux_get_stream(struct demuxer *demuxer, int index);
 int demux_get_num_stream(struct demuxer *demuxer);
@@ -276,8 +332,17 @@ void demux_start_thread(struct demuxer *demuxer);
 void demux_stop_thread(struct demuxer *demuxer);
 void demux_set_wakeup_cb(struct demuxer *demuxer, void (*cb)(void *ctx), void *ctx);
 void demux_start_prefetch(struct demuxer *demuxer);
+void demux_drive_nav(struct demuxer *demuxer);
+void demux_nav_refresh(struct demuxer *demuxer);
+void demux_set_stream_absent(struct demuxer *demuxer, struct sh_stream *sh,
+                             bool absent);
+void demux_set_stream_group(struct demuxer *demuxer,
+                            struct sh_stream_group *group);
+void demux_set_stream_codec(struct demuxer *demuxer, struct sh_stream *sh,
+                            struct mp_codec_params *codec);
 
 bool demux_cancel_test(struct demuxer *demuxer);
+bool demux_read_interrupted(struct demuxer *demuxer);
 
 void demux_flush(struct demuxer *demuxer);
 int demux_seek(struct demuxer *demuxer, double rel_seek_secs, int flags);
@@ -304,6 +369,9 @@ void demux_stream_tags_changed(struct demuxer *demuxer, struct sh_stream *sh,
 void demux_close_stream(struct demuxer *demuxer);
 
 void demux_metadata_changed(demuxer_t *demuxer);
+void demux_set_duration(demuxer_t *demuxer, double duration);
+void demux_set_nav_active(demuxer_t *demuxer, bool active);
+void demux_lists_changed(demuxer_t *demuxer);
 void demux_update(demuxer_t *demuxer, double playback_pts);
 
 bool demux_cache_dump_set(struct demuxer *demuxer, double start, double end,
@@ -327,5 +395,19 @@ bool demux_matroska_uid_cmp(struct matroska_segment_uid *a,
                             struct matroska_segment_uid *b);
 
 const char *stream_type_name(enum stream_type type);
+
+// Append a codec descriptor for stream `sh` to output string `dst`
+// Fields that are unset are skipped. If `skip_dup` is non-NULL, fields whose
+// formatted value already appears in it are skipped too.
+void demux_append_codec_desc(void *ta_ctx, bstr *dst, struct sh_stream *sh,
+                             const char *skip_dup);
+
+// Compose a descriptive edition title. Walks the demuxer's streams matching
+// `program_id`, and when exactly one video / one audio stream is present,
+// appends a parenthesized codec descriptor for it. When multiple tracks of a
+// a type are present, no descriptor is appended. Returns NULL if
+// nothing useful would be produced; otherwise a talloc'd string.
+char *demux_compose_edition_title(void *ta_ctx, struct demuxer *demuxer,
+                                  int program_id, const char *prefix);
 
 #endif /* MPLAYER_DEMUXER_H */

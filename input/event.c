@@ -18,40 +18,6 @@
 #include "event.h"
 #include "input.h"
 #include "common/msg.h"
-#include "player/external_files.h"
-
-void mp_event_drop_files(struct input_ctx *ictx, int num_files, char **files,
-                         enum mp_dnd_action action)
-{
-    bool all_sub = true;
-    for (int i = 0; i < num_files; i++)
-        all_sub &= mp_might_be_subtitle_file(files[i]);
-
-    if (all_sub) {
-        for (int i = 0; i < num_files; i++) {
-            const char *cmd[] = {
-                "osd-auto",
-                "sub-add",
-                files[i],
-                NULL
-            };
-            mp_input_run_cmd(ictx, cmd);
-        }
-    } else {
-        for (int i = 0; i < num_files; i++) {
-            const char *cmd[] = {
-                "osd-auto",
-                "loadfile",
-                files[i],
-                /* Either start playing the dropped files right away
-                   or add them to the end of the current playlist */
-                (i == 0 && action == DND_REPLACE) ? "replace" : "append-play",
-                NULL
-            };
-            mp_input_run_cmd(ictx, cmd);
-        }
-    }
-}
 
 int mp_event_drop_mime_data(struct input_ctx *ictx, const char *mime_type,
                             bstr data, enum mp_dnd_action action)
@@ -69,7 +35,7 @@ int mp_event_drop_mime_data(struct input_ctx *ictx, const char *mime_type,
             char *s = bstrto0(tmp, line);
             MP_TARRAY_APPEND(tmp, files, num_files, s);
         }
-        mp_event_drop_files(ictx, num_files, files, action);
+        mp_input_drop_files(ictx, num_files, files, action);
         talloc_free(tmp);
         return num_files > 0;
     } else {

@@ -20,7 +20,8 @@
 
 #include <stdbool.h>
 
-#include "libmpv/client.h"
+#include "mpv/client.h"
+#include "osdep/compiler.h"
 
 struct MPContext;
 struct mp_cmd;
@@ -65,21 +66,29 @@ struct mp_cmd_ctx {
     void *on_completion_priv; // for free use by on_completion callback
 };
 
+struct mp_option_callback {
+    struct m_config_option *co;
+    uint64_t flags;
+};
+
 void run_command(struct MPContext *mpctx, struct mp_cmd *cmd,
                  struct mp_abort_entry *abort,
                  void (*on_completion)(struct mp_cmd_ctx *cmd),
                  void *on_completion_priv);
+void run_command_opts(struct MPContext *mpctx);
 void mp_cmd_ctx_complete(struct mp_cmd_ctx *cmd);
-PRINTF_ATTRIBUTE(3, 4)
+MP_PRINTF_ATTRIBUTE(3, 4)
 void mp_cmd_msg(struct mp_cmd_ctx *cmd, int status, const char *msg, ...);
 char *mp_property_expand_string(struct MPContext *mpctx, const char *str);
 char *mp_property_expand_escaped_string(struct MPContext *mpctx, const char *str);
+char *mp_expand_term_status_msg(struct MPContext *mpctx);
 void property_print_help(struct MPContext *mpctx);
 int mp_property_do(const char* name, int action, void* val,
                    struct MPContext *mpctx);
 
-void mp_option_change_callback(void *ctx, struct m_config_option *co, int flags,
+void mp_option_change_callback(void *ctx, struct m_config_option *co, uint64_t flags,
                                bool self_update);
+void mp_option_run_callback(struct MPContext *mpctx, struct mp_option_callback *callback);
 
 void mp_notify(struct MPContext *mpctx, int event, void *arg);
 void mp_notify_property(struct MPContext *mpctx, const char *property);
@@ -99,10 +108,15 @@ enum {
     MP_EVENT_WIN_STATE,
     MP_EVENT_WIN_STATE2,
     MP_EVENT_FOCUS,
+    MP_EVENT_AMBIENT_LIGHTING_CHANGED,
     MP_EVENT_CHANGE_PLAYLIST,
     MP_EVENT_CORE_IDLE,
     MP_EVENT_DURATION_UPDATE,
     MP_EVENT_INPUT_PROCESSED,
+    MP_EVENT_TRACKS_CHANGED,
+    MP_EVENT_TRACK_SWITCHED,
+    MP_EVENT_METADATA_UPDATE,
+    MP_EVENT_CHAPTER_CHANGE,
 };
 
 bool mp_hook_test_completion(struct MPContext *mpctx, char *type);

@@ -12,7 +12,7 @@ It also provides a bunch of convenience macros and debugging facilities.
 
 The TA functions are documented in the implementation files (ta.c, ta_utils.c).
 
-TA is intended to be useable as library independent from mpv. It doesn't
+TA is intended to be usable as library independent from mpv. It doesn't
 depend on anything mpv specific.
 
 Note:
@@ -31,7 +31,7 @@ will be replaced with TA calls, and the talloc wrapper will be removed.
 
 Documentation for the talloc API is here:
 
-    http://talloc.samba.org/talloc/doc/html/modules.html
+    https://talloc.samba.org/talloc/doc/html/group__talloc.html
 
 There are some minor differences with mpv's talloc bridge. mpv calls abort()
 on allocation failures, and the talloc_set_destructor() signature is slightly

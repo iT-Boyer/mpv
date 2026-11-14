@@ -10,6 +10,8 @@ struct mpv_global {
     struct mp_client_api *client_api;
     char *configdir;
     struct stats_base *stats;
+    struct demux_packet_pool *packet_pool;
+    struct curl_ctx *curl;
 };
 
 #endif

@@ -1,13 +1,20 @@
 #!/bin/sh
 set -e
 
-python3 ./waf configure \
-  --enable-cdda          \
-  --enable-dvbin         \
-  --enable-dvdnav        \
-  --enable-libarchive    \
-  --enable-libmpv-shared \
-  --enable-manpage-build \
-  --enable-shaderc       \
-  --enable-vulkan
-python3 ./waf build --verbose
+. ./ci/build-common.sh
+
+meson setup build $common_args $@ \
+  -Db_sanitize=address,undefined \
+  -Dcdda=enabled \
+  -Ddvbin=enabled \
+  -Ddvda=enabled \
+  -Ddvdnav=enabled \
+  -Dlibarchive=enabled \
+  -Dmanpage-build=enabled \
+  -Dpipewire=enabled \
+  -Dsixel=enabled \
+  -Dsubrandr=enabled \
+  -Dvapoursynth=enabled \
+  -Dvulkan=enabled
+meson compile -C build
+./build/mpv -v --no-config

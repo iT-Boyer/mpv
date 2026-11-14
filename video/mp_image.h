@@ -43,15 +43,29 @@
 // usually copy the whole struct, so that fields added later will be preserved.
 struct mp_image_params {
     enum mp_imgfmt imgfmt;      // pixel format
+    const char *imgfmt_name;    // pixel format name
     enum mp_imgfmt hw_subfmt;   // underlying format for some hwaccel pixfmts
     int w, h;                   // image dimensions
     int p_w, p_h;               // define pixel aspect ratio (undefined: 0/0)
-    struct mp_colorspace color;
-    enum mp_chroma_location chroma_location;
+    bool force_window;          // fake image created by handle_force_window
+    struct pl_color_space color;
+    struct pl_color_repr repr;
+    // Original values before Dolby Vision metadata mapping
+    enum pl_color_primaries primaries_orig;
+    enum pl_color_transfer transfer_orig;
+    enum pl_color_system sys_orig;
+
+    enum mp_csp_light light;
+    enum pl_chroma_location chroma_location;
+    // The image should be flipped vertically before rotating
+    bool vflip;
     // The image should be rotated clockwise (0-359 degrees).
     int rotate;
     enum mp_stereo3d_mode stereo3d; // image is encoded with this mode
-    enum mp_alpha_type alpha;   // usually auto; only set if explicitly known
+    struct mp_rect crop;        // crop applied on image
+    // Flags for f_enhancement_pair.c to not inherit flags from EL.
+    bool no_dovi;
+    bool no_enhancement_layer;
 };
 
 /* Memory management:
@@ -108,9 +122,15 @@ typedef struct mp_image {
     struct AVBufferRef *icc_profile;
     // Closed captions packet, if any (only after decoder)
     struct AVBufferRef *a53_cc;
+    // Dolby Vision metadata, if any
+    struct AVBufferRef *dovi;
+    // Film grain data, if any
+    struct AVBufferRef *film_grain;
     // Other side data we don't care about.
     struct mp_ff_side_data *ff_side_data;
     int num_ff_side_data;
+    // Optional decoded enhancement-layer frame
+    struct mp_image *enhancement_layer;
 } mp_image_t;
 
 struct mp_ff_side_data {
@@ -147,7 +167,8 @@ void mp_image_set_size(struct mp_image *mpi, int w, int h);
 int mp_image_plane_w(struct mp_image *mpi, int plane);
 int mp_image_plane_h(struct mp_image *mpi, int plane);
 
-void mp_image_setfmt(mp_image_t* mpi, int out_fmt);
+void mp_image_sethwfmt(mp_image_t *mpi, enum mp_imgfmt hw_fmt, enum mp_imgfmt sw_fmt);
+void mp_image_setfmt(mp_image_t* mpi, enum mp_imgfmt out_fmt);
 void mp_image_steal_data(struct mp_image *dst, struct mp_image *src);
 void mp_image_unref_data(struct mp_image *img);
 
@@ -163,9 +184,16 @@ char *mp_image_params_to_str_buf(char *b, size_t bs,
                                  const struct mp_image_params *p);
 #define mp_image_params_to_str(p) mp_image_params_to_str_buf((char[256]){0}, 256, p)
 
+bool mp_image_crop_valid(const struct mp_image_params *p);
 bool mp_image_params_valid(const struct mp_image_params *p);
 bool mp_image_params_equal(const struct mp_image_params *p1,
                            const struct mp_image_params *p2);
+bool mp_image_params_static_equal(const struct mp_image_params *p1,
+                                  const struct mp_image_params *p2);
+void mp_image_params_update_dynamic(struct mp_image_params *dst,
+                                    const struct mp_image_params *src,
+                                    bool has_peak_detect_values);
+void mp_image_params_restore_dovi_mapping(struct mp_image_params *params);
 
 void mp_image_params_get_dsize(const struct mp_image_params *p,
                                int *d_w, int *d_h);

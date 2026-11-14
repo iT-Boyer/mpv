@@ -25,6 +25,8 @@
 #include "timeline.h"
 #include "stheader.h"
 #include "stream/stream.h"
+#include "options/m_config_core.h"
+#include "options/options.h"
 
 struct segment {
     int index; // index into virtual_source.segments[] (and timeline.parts[])
@@ -32,6 +34,7 @@ struct segment {
     double d_start;
     char *url;
     bool lazy;
+    bool load_failed;
     struct demuxer *d;
     // stream_map[sh_stream.index] = virtual_stream, where sh_stream is a stream
     // from the source d, and virtual_stream is a streamexported by the
@@ -57,6 +60,7 @@ struct virtual_source {
     struct timeline_par *tl;
 
     bool dash, no_clip, delay_open;
+    bool rebase;
 
     struct segment **segments;
     int num_segments;
@@ -207,24 +211,25 @@ static void close_lazy_segments(struct demuxer *demuxer,
 static void reopen_lazy_segments(struct demuxer *demuxer,
                                  struct virtual_source *src)
 {
-    if (src->current->d)
+    if (src->current->d || src->current->load_failed)
         return;
 
-    // Note: in delay_open mode, we must _not_ close segments during demuxing,
+    // Note: we must _not_ close segments during demuxing,
     // because demuxed packets have demux_packet.codec set to objects owned
     // by the segments. Closing them would create dangling pointers.
-    if (!src->delay_open)
-        close_lazy_segments(demuxer, src);
 
     struct demuxer_params params = {
         .init_fragment = src->tl->init_fragment,
         .skip_lavf_probing = src->tl->dash,
         .stream_flags = demuxer->stream_origin,
+        .depth = demuxer->depth + 1,
     };
     src->current->d = demux_open_url(src->current->url, &params,
                                      demuxer->cancel, demuxer->global);
-    if (!src->current->d && !demux_cancel_test(demuxer))
+    if (!src->current->d && !demux_cancel_test(demuxer)) {
         MP_ERR(demuxer, "failed to load segment\n");
+        src->current->load_failed = true;
+    }
     if (src->current->d)
         update_slave_stats(demuxer, src->current->d);
     associate_streams(demuxer, src, src->current);
@@ -249,6 +254,8 @@ static void switch_segment(struct demuxer *demuxer, struct virtual_source *src,
     reselect_streams(demuxer);
     if (!src->no_clip)
         demux_set_ts_offset(new->d, new->start - new->d_start);
+    else if (src->rebase)
+        demux_set_ts_offset(new->d, new->start - new->d->start_time);
     if (!src->no_clip || !init)
         demux_seek(new->d, start_pts, flags);
 
@@ -273,7 +280,7 @@ static void do_read_next_packet(struct demuxer *demuxer,
         return;
     }
 
-    struct demux_packet *pkt = demux_read_any_packet(seg->d);
+    struct demux_packet *pkt = demux_read_any_packet(seg->d, NULL);
     if (!pkt || (!src->no_clip && pkt->pts >= seg->end))
         src->eos_packets += 1;
 
@@ -522,9 +529,12 @@ static void apply_meta(struct sh_stream *dst, struct sh_stream *src)
     dst->forced_track = src->forced_track;
     if (src->hls_bitrate)
         dst->hls_bitrate = src->hls_bitrate;
+    for (int i = 0; i < src->num_program_ids; i++)
+        MP_TARRAY_APPEND(dst, dst->program_ids, dst->num_program_ids, src->program_ids[i]);
     dst->missing_timestamps = src->missing_timestamps;
     if (src->attached_picture)
         dst->attached_picture = src->attached_picture;
+    dst->image = src->image;
 }
 
 // This is mostly for EDL user-defined metadata.
@@ -542,6 +552,7 @@ static bool add_tl(struct demuxer *demuxer, struct timeline_par *tl)
 {
     struct priv *p = demuxer->priv;
 
+    struct MPOpts *mp_opts = mp_get_config_group(NULL, demuxer->global, &mp_opt_root);
     struct virtual_source *src = talloc_ptrtype(p, src);
     *src = (struct virtual_source){
         .tl = tl,
@@ -549,7 +560,9 @@ static bool add_tl(struct demuxer *demuxer, struct timeline_par *tl)
         .delay_open = tl->delay_open,
         .no_clip = tl->no_clip || tl->dash,
         .dts = MP_NOPTS_VALUE,
+        .rebase = tl->delay_open && mp_opts->rebase_start_time,
     };
+    TA_FREEP(&mp_opts);
 
     if (!tl->num_parts)
         return false;
@@ -594,7 +607,7 @@ static bool add_tl(struct demuxer *demuxer, struct timeline_par *tl)
             .sh = new,
         };
         MP_TARRAY_APPEND(p, p->streams, p->num_streams, vs);
-        assert(demux_get_stream(demuxer, p->num_streams - 1) == new);
+        mp_assert(demux_get_stream(demuxer, p->num_streams - 1) == new);
         MP_TARRAY_APPEND(src, src->streams, src->num_streams, vs);
     }
 
@@ -609,7 +622,7 @@ static bool add_tl(struct demuxer *demuxer, struct timeline_par *tl)
         }
 
         if (!part->source)
-            assert(tl->dash || tl->delay_open);
+            mp_assert(tl->dash || tl->delay_open);
 
         struct segment *seg = talloc_ptrtype(src, seg);
         *seg = (struct segment){
@@ -632,6 +645,126 @@ static bool add_tl(struct demuxer *demuxer, struct timeline_par *tl)
         demuxer->is_streaming |= tl->track_layout->is_streaming;
     }
     return true;
+}
+
+static int find_edition(struct demuxer *demuxer, uint64_t demuxer_id)
+{
+    for (int e = 0; e < demuxer->num_editions; e++) {
+        if (demuxer->editions[e].demuxer_id == demuxer_id)
+            return e;
+    }
+    return -1;
+}
+
+static void build_editions(struct demuxer *demuxer)
+{
+    // Don't override editions from the underlying demuxer.
+    if (demuxer->num_editions > 0)
+        return;
+
+    struct MPOpts *mp_opts = mp_get_config_group(NULL, demuxer->global, &mp_opt_root);
+    int hls_bitrate = mp_opts->hls_bitrate;
+    int edition_id = mp_opts->edition_id;
+    bool flatten_editions = mp_opts->flatten_editions;
+    TA_FREEP(&mp_opts);
+    if (flatten_editions) {
+        MP_VERBOSE(demuxer, "Flattening track-based editions.\n");
+        return;
+    }
+
+    int num_streams = demux_get_num_stream(demuxer);
+    for (int n = 0; n < num_streams; n++) {
+        struct sh_stream *sh = demux_get_stream(demuxer, n);
+        for (int pi = 0; pi < sh->num_program_ids; pi++) {
+            int program_id = sh->program_ids[pi];
+            if (find_edition(demuxer, program_id) >= 0)
+                continue;
+
+            struct demux_edition ed = {
+                .demuxer_id = program_id,
+                .metadata = talloc_zero(demuxer, struct mp_tags),
+            };
+
+            const char *prefix = NULL;
+            bool prefix_is_video = false;
+            for (int i = 0; i < num_streams; i++) {
+                struct sh_stream *s = demux_get_stream(demuxer, i);
+                if (!sh_stream_has_program(s, program_id) || !s->title)
+                    continue;
+                if (!prefix || (!prefix_is_video && s->type == STREAM_VIDEO)) {
+                    prefix = s->title;
+                    prefix_is_video = s->type == STREAM_VIDEO;
+                }
+            }
+            char *title = demux_compose_edition_title(demuxer, demuxer,
+                                                      program_id, prefix);
+            if (title)
+                mp_tags_set_str(ed.metadata, "title", title);
+
+            MP_TARRAY_APPEND(demuxer, demuxer->editions, demuxer->num_editions, ed);
+        }
+    }
+
+    if (demuxer->num_editions <= 1) {
+        demuxer->num_editions = 0;
+        return;
+    }
+
+    demuxer->edition_is_track_mapping = true;
+
+    int selected = -1;
+    if (edition_id >= 0 && edition_id < demuxer->num_editions)
+        selected = edition_id;
+
+    // Select initial edition by best variant bitrate, preferring editions
+    // whose video stream is marked as default. Audio streams are considered
+    // too so that audio-only variants (e.g. HLS/DASH audio-only renditions)
+    // still get picked, but video always wins over audio.
+    if (selected < 0) {
+        int best = -1;
+        int best_bitrate = 0;
+        bool best_ok = false;
+        bool best_default = false;
+        bool best_video = false;
+        for (int n = 0; n < num_streams; n++) {
+            struct sh_stream *sh = demux_get_stream(demuxer, n);
+            if (sh->type != STREAM_VIDEO && sh->type != STREAM_AUDIO)
+                continue;
+            if (!sh->default_track && (hls_bitrate < 0 || sh->hls_bitrate <= 0))
+                continue;
+            for (int pi = 0; pi < sh->num_program_ids; pi++) {
+                int e = find_edition(demuxer, sh->program_ids[pi]);
+                if (e < 0)
+                    continue;
+                bool ok = hls_bitrate < 0 || sh->hls_bitrate <= hls_bitrate;
+                bool is_video = sh->type == STREAM_VIDEO;
+                bool better;
+                if (best < 0) {
+                    better = true;
+                } else if (is_video != best_video) {
+                    better = is_video;
+                } else if (sh->default_track != best_default) {
+                    better = sh->default_track;
+                } else if (ok != best_ok) {
+                    better = ok;
+                } else {
+                    better = ok ? sh->hls_bitrate > best_bitrate
+                                : sh->hls_bitrate < best_bitrate;
+                }
+                if (better) {
+                    best = e;
+                    best_bitrate = sh->hls_bitrate;
+                    best_ok = ok;
+                    best_default = sh->default_track;
+                    best_video = is_video;
+                }
+            }
+        }
+        if (best >= 0)
+            selected = best;
+    }
+
+    demuxer->edition = selected >= 0 ? selected : 0;
 }
 
 static int d_open(struct demuxer *demuxer, enum demux_check check)
@@ -661,6 +794,8 @@ static int d_open(struct demuxer *demuxer, enum demux_check check)
 
     if (!p->num_sources)
         return -1;
+
+    build_editions(demuxer);
 
     demuxer->is_network |= p->tl->is_network;
     demuxer->is_streaming |= p->tl->is_streaming;

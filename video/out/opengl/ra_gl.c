@@ -4,7 +4,7 @@
 #include "utils.h"
 #include "ra_gl.h"
 
-static struct ra_fns ra_fns_gl;
+static const struct ra_fns ra_fns_gl;
 
 // For ra.priv
 struct ra_gl {
@@ -70,7 +70,7 @@ static void probe_real_size(GL *gl, struct ra_format *fmt)
             GL_TEXTURE_ALPHA_SIZE,
         };
         int comp = is_la ? i + 4 : i;
-        assert(comp < MP_ARRAY_SIZE(pnames));
+        mp_assert(comp < MP_ARRAY_SIZE(pnames));
         GLint param = -1;
         gl->GetTexLevelParameteriv(GL_TEXTURE_2D, 0, pnames[comp], &param);
         fmt->component_depth[i] = param > 0 ? param : 0;
@@ -103,6 +103,7 @@ static int ra_init_gl(struct ra *ra, GL *gl)
         {RA_CAP_COMPUTE,            MPGL_CAP_COMPUTE_SHADER},
         {RA_CAP_NUM_GROUPS,         MPGL_CAP_COMPUTE_SHADER},
         {RA_CAP_NESTED_ARRAY,       MPGL_CAP_NESTED_ARRAY},
+        {RA_CAP_SLOW_DR,            MPGL_CAP_SLOW_DR},
     };
 
     for (int i = 0; i < MP_ARRAY_SIZE(caps_map); i++) {
@@ -117,8 +118,8 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             ra->caps |= RA_CAP_BUF_RW;
     }
 
-    // textureGather is only supported in GLSL 400+
-    if (ra->glsl_version >= 400)
+    // textureGather is only supported in GLSL 400+ / ES 310+
+    if (ra->glsl_version >= (ra->glsl_es ? 310 : 400))
         ra->caps |= RA_CAP_GATHER;
 
     if (gl->BlitFramebuffer)
@@ -127,7 +128,14 @@ static int ra_init_gl(struct ra *ra, GL *gl)
     // Disable compute shaders for GLSL < 420. This work-around is needed since
     // some buggy OpenGL drivers expose compute shaders for lower GLSL versions,
     // despite the spec requiring 420+.
-    if (ra->glsl_version < 420)
+    if (ra->glsl_version < (ra->glsl_es ? 310 : 420)) {
+        ra->caps &= ~RA_CAP_COMPUTE;
+    }
+
+    // While we can handle compute shaders on GLES the spec (intentionally)
+    // does not support binding textures for writing, which all uses inside mpv
+    // would require. So disable it unconditionally anyway.
+    if (ra->glsl_es)
         ra->caps &= ~RA_CAP_COMPUTE;
 
     int gl_fmt_features = gl_format_feature_flags(gl);
@@ -183,7 +191,7 @@ static int ra_init_gl(struct ra *ra, GL *gl)
             desc->chroma_w = desc->chroma_h = 1;
         }
         if (strcmp(fmt->name, "rgb10_a2") == 0) {
-            fmt->special_imgfmt = IMGFMT_RGB30;
+            fmt->special_imgfmt = IMGFMT_X2RGB10;
             struct ra_imgfmt_desc *desc = talloc_zero(fmt, struct ra_imgfmt_desc);
             fmt->special_imgfmt_desc = desc;
             desc->component_bits = 10;
@@ -217,6 +225,8 @@ static int ra_init_gl(struct ra *ra, GL *gl)
     if (ra->caps & RA_CAP_COMPUTE) {
         gl->GetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &ival);
         ra->max_shmem = ival;
+        gl->GetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &ival);
+        ra->max_compute_group_threads = ival;
     }
 
     gl->Disable(GL_DITHER);
@@ -286,14 +296,14 @@ static struct ra_tex *gl_tex_create_blank(struct ra *ra,
     case 1: tex_gl->target = GL_TEXTURE_1D; break;
     case 2: tex_gl->target = GL_TEXTURE_2D; break;
     case 3: tex_gl->target = GL_TEXTURE_3D; break;
-    default: abort();
+    default: MP_ASSERT_UNREACHABLE();
     }
     if (params->non_normalized) {
-        assert(params->dimensions == 2);
+        mp_assert(params->dimensions == 2);
         tex_gl->target = GL_TEXTURE_RECTANGLE;
     }
     if (params->external_oes) {
-        assert(params->dimensions == 2 && !params->non_normalized);
+        mp_assert(params->dimensions == 2 && !params->non_normalized);
         tex_gl->target = GL_TEXTURE_EXTERNAL_OES;
     }
 
@@ -311,7 +321,7 @@ static struct ra_tex *gl_tex_create(struct ra *ra,
                                     const struct ra_tex_params *params)
 {
     GL *gl = ra_gl_get(ra);
-    assert(!params->format->dummy_format);
+    mp_assert(!params->format->dummy_format);
 
     struct ra_tex *tex = gl_tex_create_blank(ra, params);
     if (!tex)
@@ -368,7 +378,7 @@ static struct ra_tex *gl_tex_create(struct ra *ra,
             return NULL;
         }
 
-        assert(gl->mpgl_caps & MPGL_CAP_FB);
+        mp_assert(gl->mpgl_caps & MPGL_CAP_FB);
 
         gl->GenFramebuffers(1, &tex_gl->fbo);
         gl->BindFramebuffer(GL_FRAMEBUFFER, tex_gl->fbo);
@@ -487,8 +497,8 @@ static bool gl_tex_upload(struct ra *ra,
     struct ra_buf *buf = params->buf;
     struct ra_tex_gl *tex_gl = tex->priv;
     struct ra_buf_gl *buf_gl = buf ? buf->priv : NULL;
-    assert(tex->params.host_mutable);
-    assert(!params->buf || !params->src);
+    mp_assert(tex->params.host_mutable);
+    mp_assert(!params->buf || !params->src);
 
     if (ra->use_pbo && !params->buf)
         return ra_tex_upload_pbo(ra, &tex_gl->pbo, params);
@@ -581,7 +591,7 @@ static struct ra_buf *gl_buf_create(struct ra *ra,
 {
     GL *gl = ra_gl_get(ra);
 
-    if (params->host_mapped && gl->version < 440)
+    if (params->host_mapped && !gl->BufferStorage)
         return NULL;
 
     struct ra_buf *buf = talloc_zero(NULL, struct ra_buf);
@@ -622,7 +632,7 @@ static struct ra_buf *gl_buf_create(struct ra *ra,
         case RA_BUF_TYPE_TEX_UPLOAD:     hint = GL_STREAM_DRAW; break;
         case RA_BUF_TYPE_SHADER_STORAGE: hint = GL_STREAM_COPY; break;
         case RA_BUF_TYPE_UNIFORM:        hint = GL_STATIC_DRAW; break;
-        default: abort();
+        default: MP_ASSERT_UNREACHABLE();
         }
 
         gl->BufferData(buf_gl->target, params->size, params->initial_data, hint);
@@ -637,7 +647,7 @@ static void gl_buf_update(struct ra *ra, struct ra_buf *buf, ptrdiff_t offset,
 {
     GL *gl = ra_gl_get(ra);
     struct ra_buf_gl *buf_gl = buf->priv;
-    assert(buf->params.host_mutable);
+    mp_assert(buf->params.host_mutable);
 
     gl->BindBuffer(buf_gl->target, buf_gl->buffer);
     gl->BufferSubData(buf_gl->target, offset, size, data);
@@ -670,7 +680,7 @@ static void gl_clear(struct ra *ra, struct ra_tex *dst, float color[4],
 {
     GL *gl = ra_gl_get(ra);
 
-    assert(dst->params.render_dst);
+    mp_assert(dst->params.render_dst);
     struct ra_tex_gl *dst_gl = dst->priv;
 
     gl->BindFramebuffer(GL_FRAMEBUFFER, dst_gl->fbo);
@@ -692,8 +702,8 @@ static void gl_blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
 {
     GL *gl = ra_gl_get(ra);
 
-    assert(src->params.blit_src);
-    assert(dst->params.blit_dst);
+    mp_assert(src->params.blit_src);
+    mp_assert(dst->params.blit_dst);
 
     struct ra_tex_gl *src_gl = src->priv;
     struct ra_tex_gl *dst_gl = dst->priv;
@@ -729,7 +739,7 @@ static const char *shader_typestr(GLenum type)
     case GL_VERTEX_SHADER:   return "vertex";
     case GL_FRAGMENT_SHADER: return "fragment";
     case GL_COMPUTE_SHADER:  return "compute";
-    default: abort();
+    default: MP_ASSERT_UNREACHABLE();
     }
 }
 
@@ -767,6 +777,7 @@ static void compile_attach_shader(struct ra *ra, GLuint program,
             gl->GetTranslatedShaderSourceANGLE(shader, len, NULL, sstr);
             MP_DBG(ra, "Translated shader:\n");
             mp_log_source(ra->log, MSGL_DEBUG, sstr);
+            talloc_free(sstr);
         }
     }
 
@@ -934,12 +945,12 @@ static void update_uniform(struct ra *ra, struct ra_renderpass *pass,
     struct ra_renderpass_gl *pass_gl = pass->priv;
 
     struct ra_renderpass_input *input = &pass->params.inputs[val->index];
-    assert(val->index >= 0 && val->index < pass_gl->num_uniform_loc);
+    mp_assert(val->index >= 0 && val->index < pass_gl->num_uniform_loc);
     GLint loc = pass_gl->uniform_loc[val->index];
 
     switch (input->type) {
     case RA_VARTYPE_INT: {
-        assert(input->dim_v * input->dim_m == 1);
+        mp_assert(input->dim_v * input->dim_m == 1);
         if (loc < 0)
             break;
         gl->Uniform1i(loc, *(int *)val->data);
@@ -955,21 +966,21 @@ static void update_uniform(struct ra *ra, struct ra_renderpass *pass,
             case 2: gl->Uniform2f(loc, f[0], f[1]); break;
             case 3: gl->Uniform3f(loc, f[0], f[1], f[2]); break;
             case 4: gl->Uniform4f(loc, f[0], f[1], f[2], f[3]); break;
-            default: abort();
+            default: MP_ASSERT_UNREACHABLE();
             }
         } else if (input->dim_v == 2 && input->dim_m == 2) {
             gl->UniformMatrix2fv(loc, 1, GL_FALSE, f);
         } else if (input->dim_v == 3 && input->dim_m == 3) {
             gl->UniformMatrix3fv(loc, 1, GL_FALSE, f);
         } else {
-            abort();
+            MP_ASSERT_UNREACHABLE();
         }
         break;
     }
     case RA_VARTYPE_IMG_W: {
         struct ra_tex *tex = *(struct ra_tex **)val->data;
         struct ra_tex_gl *tex_gl = tex->priv;
-        assert(tex->params.storage_dst);
+        mp_assert(tex->params.storage_dst);
         gl->BindImageTexture(input->binding, tex_gl->texture, 0, GL_FALSE, 0,
                              GL_WRITE_ONLY, tex_gl->internal_format);
         break;
@@ -977,7 +988,7 @@ static void update_uniform(struct ra *ra, struct ra_renderpass *pass,
     case RA_VARTYPE_TEX: {
         struct ra_tex *tex = *(struct ra_tex **)val->data;
         struct ra_tex_gl *tex_gl = tex->priv;
-        assert(tex->params.render_src);
+        mp_assert(tex->params.render_src);
         gl->ActiveTexture(GL_TEXTURE0 + input->binding);
         gl->BindTexture(tex_gl->target, tex_gl->texture);
         break;
@@ -989,11 +1000,11 @@ static void update_uniform(struct ra *ra, struct ra_renderpass *pass,
         gl->BindBufferBase(buf_gl->target, input->binding, buf_gl->buffer);
         // SSBOs are not implicitly coherent in OpengL
         if (input->type == RA_VARTYPE_BUF_RW)
-            gl->MemoryBarrier(buf_gl->target);
+            gl->MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         break;
     }
     default:
-        abort();
+        MP_ASSERT_UNREACHABLE();
     }
 }
 
@@ -1009,7 +1020,7 @@ static void disable_binding(struct ra *ra, struct ra_renderpass *pass,
     case RA_VARTYPE_TEX: {
         struct ra_tex *tex = *(struct ra_tex **)val->data;
         struct ra_tex_gl *tex_gl = tex->priv;
-        assert(tex->params.render_src);
+        mp_assert(tex->params.render_src);
         if (input->type == RA_VARTYPE_TEX) {
             gl->ActiveTexture(GL_TEXTURE0 + input->binding);
             gl->BindTexture(tex_gl->target, 0);
@@ -1041,8 +1052,8 @@ static void gl_renderpass_run(struct ra *ra,
     switch (pass->params.type) {
     case RA_RENDERPASS_TYPE_RASTER: {
         struct ra_tex_gl *target_gl = params->target->priv;
-        assert(params->target->params.render_dst);
-        assert(params->target->params.format == pass->params.target_format);
+        mp_assert(params->target->params.render_dst);
+        mp_assert(params->target->params.format == pass->params.target_format);
         gl->BindFramebuffer(GL_FRAMEBUFFER, target_gl->fbo);
         if (pass->params.invalidate_target && gl->InvalidateFramebuffer) {
             GLenum fb = target_gl->fbo ? GL_COLOR_ATTACHMENT0 : GL_COLOR;
@@ -1077,7 +1088,7 @@ static void gl_renderpass_run(struct ra *ra,
         gl->MemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
         break;
     }
-    default: abort();
+    default: MP_ASSERT_UNREACHABLE();
     }
 
     for (int n = 0; n < params->num_values; n++)
@@ -1173,7 +1184,7 @@ static void gl_debug_marker(struct ra *ra, const char *msg)
         gl_check_error(p->gl, ra->log, msg);
 }
 
-static struct ra_fns ra_fns_gl = {
+static const struct ra_fns ra_fns_gl = {
     .destroy                = gl_destroy,
     .tex_create             = gl_tex_create,
     .tex_destroy            = gl_tex_destroy,

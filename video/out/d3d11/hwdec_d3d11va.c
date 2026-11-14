@@ -19,29 +19,58 @@
 #include <d3d11.h>
 #include <d3d11_1.h>
 
-#include "config.h"
+#include <libavutil/pixfmt.h>
 
 #include "common/common.h"
 #include "options/m_config.h"
 #include "osdep/windows_utils.h"
+#include "video/fmt-conversion.h"
+#include "video/img_format.h"
 #include "video/hwdec.h"
 #include "video/d3d.h"
 #include "video/out/d3d11/ra_d3d11.h"
 #include "video/out/gpu/hwdec.h"
 
+static const struct d3d11_format {
+    enum AVPixelFormat pixfmt;
+    DXGI_FORMAT dxfmt;
+    const char *planes[4];
+} d3d11_formats[] = {
+    {AV_PIX_FMT_NV12,    DXGI_FORMAT_NV12,               {"r8", "rg8"}},
+    {AV_PIX_FMT_P010,    DXGI_FORMAT_P010,               {"r16", "rg16"}},
+    {AV_PIX_FMT_P012,    DXGI_FORMAT_P016,               {"r16", "rg16"}},
+    {AV_PIX_FMT_P016,    DXGI_FORMAT_P016,               {"r16", "rg16"}},
+    {AV_PIX_FMT_VUYX,    DXGI_FORMAT_AYUV,               {"rgba8"}},
+    {AV_PIX_FMT_XV30,    DXGI_FORMAT_Y410,               {"rgb10_a2"}},
+    {AV_PIX_FMT_XV36,    DXGI_FORMAT_Y416,               {"rgba16"}},
+#ifdef AV_PIX_FMT_XV48 // Added in 8.0
+    {AV_PIX_FMT_XV48,    DXGI_FORMAT_Y416,               {"rgba16"}},
+#endif
+    {AV_PIX_FMT_BGRA,    DXGI_FORMAT_B8G8R8A8_UNORM,     {"bgra8"}},
+    {AV_PIX_FMT_X2BGR10, DXGI_FORMAT_R10G10B10A2_UNORM,  {"rgb10_a2"}},
+    {AV_PIX_FMT_RGBAF16, DXGI_FORMAT_R16G16B16A16_FLOAT, {"rgba16hf"}},
+};
+
+static const struct d3d11_format *d3d11_format_for_imgfmt(int imgfmt)
+{
+    for (int i = 0; i < MP_ARRAY_SIZE(d3d11_formats); i++) {
+        if (pixfmt2imgfmt(d3d11_formats[i].pixfmt) == imgfmt)
+            return &d3d11_formats[i];
+    }
+    return NULL;
+}
+
 struct d3d11va_opts {
-    int zero_copy;
+    bool zero_copy;
 };
 
 #define OPT_BASE_STRUCT struct d3d11va_opts
 const struct m_sub_options d3d11va_conf = {
     .opts = (const struct m_option[]) {
-        {"d3d11va-zero-copy", OPT_FLAG(zero_copy)},
+        {"d3d11va-zero-copy", OPT_BOOL(zero_copy)},
         {0}
     },
-    .defaults = &(const struct d3d11va_opts) {
-        .zero_copy = 0,
-    },
+    .defaults = &(const struct d3d11va_opts) {0},
     .size = sizeof(struct d3d11va_opts)
 };
 
@@ -51,6 +80,8 @@ struct priv_owner {
     struct mp_hwdec_ctx hwctx;
     ID3D11Device *device;
     ID3D11Device1 *device1;
+
+    int supported_fmts[MP_ARRAY_SIZE(d3d11_formats) + 1];
 };
 
 struct priv {
@@ -67,6 +98,7 @@ static void uninit(struct ra_hwdec *hw)
 {
     struct priv_owner *p = hw->priv;
     hwdec_devices_remove(hw->devs, &p->hwctx);
+    av_buffer_unref(&p->hwctx.av_device_ref);
     SAFE_RELEASE(p->device);
     SAFE_RELEASE(p->device1);
 }
@@ -76,9 +108,9 @@ static int init(struct ra_hwdec *hw)
     struct priv_owner *p = hw->priv;
     HRESULT hr;
 
-    if (!ra_is_d3d11(hw->ra))
+    if (!ra_is_d3d11(hw->ra_ctx->ra))
         return -1;
-    p->device = ra_d3d11_get_device(hw->ra);
+    p->device = ra_d3d11_get_device(hw->ra_ctx->ra);
     if (!p->device)
         return -1;
 
@@ -104,13 +136,28 @@ static int init(struct ra_hwdec *hw)
     ID3D10Multithread_SetMultithreadProtected(multithread, TRUE);
     ID3D10Multithread_Release(multithread);
 
-    static const int subfmts[] = {IMGFMT_NV12, IMGFMT_P010, 0};
+    int num_fmts = 0;
+    for (int i = 0; i < MP_ARRAY_SIZE(d3d11_formats); i++) {
+        UINT support = 0;
+        hr = ID3D11Device_CheckFormatSupport(p->device, d3d11_formats[i].dxfmt,
+                                             &support);
+        if (SUCCEEDED(hr) && (support & D3D11_FORMAT_SUPPORT_TEXTURE2D))
+            p->supported_fmts[num_fmts++] = pixfmt2imgfmt(d3d11_formats[i].pixfmt);
+    }
+    p->supported_fmts[num_fmts] = 0;
+
     p->hwctx = (struct mp_hwdec_ctx){
         .driver_name = hw->driver->name,
         .av_device_ref = d3d11_wrap_device_ref(p->device),
-        .supported_formats = subfmts,
+        .supported_formats = p->supported_fmts,
         .hw_imgfmt = IMGFMT_D3D11,
     };
+
+    if (!p->hwctx.av_device_ref) {
+        MP_VERBOSE(hw, "Failed to create hwdevice_ctx\n");
+        return -1;
+    }
+
     hwdec_devices_add(hw->devs, &p->hwctx);
     return 0;
 }
@@ -134,57 +181,64 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     mapper->dst_params.imgfmt = mapper->src_params.hw_subfmt;
     mapper->dst_params.hw_subfmt = 0;
 
-    struct ra_imgfmt_desc desc = {0};
-
-    if (!ra_get_imgfmt_desc(mapper->ra, mapper->dst_params.imgfmt, &desc))
+    const struct d3d11_format *fmt =
+        d3d11_format_for_imgfmt(mapper->dst_params.imgfmt);
+    if (!fmt) {
+        MP_ERR(mapper, "Unsupported surface format: %s\n",
+               mp_imgfmt_to_name(mapper->dst_params.imgfmt));
         return -1;
+    }
 
-    if (o->opts->zero_copy) {
-        // In the zero-copy path, we create the ra_tex objects in the map
-        // operation, so we just need to store the format of each plane
-        p->num_planes = desc.num_planes;
-        for (int i = 0; i < desc.num_planes; i++)
-            p->fmt[i] = desc.planes[i];
-    } else {
-        struct mp_image layout = {0};
-        mp_image_set_params(&layout, &mapper->dst_params);
-
-        DXGI_FORMAT copy_fmt;
-        switch (mapper->dst_params.imgfmt) {
-        case IMGFMT_NV12: copy_fmt = DXGI_FORMAT_NV12; break;
-        case IMGFMT_P010: copy_fmt = DXGI_FORMAT_P010; break;
-        default: return -1;
-        }
-
-        D3D11_TEXTURE2D_DESC copy_desc = {
-            .Width = mapper->dst_params.w,
-            .Height = mapper->dst_params.h,
-            .MipLevels = 1,
-            .ArraySize = 1,
-            .SampleDesc.Count = 1,
-            .Format = copy_fmt,
-            .BindFlags = D3D11_BIND_SHADER_RESOURCE,
-        };
-        hr = ID3D11Device_CreateTexture2D(o->device, &copy_desc, NULL,
-                                          &p->copy_tex);
-        if (FAILED(hr)) {
-            MP_FATAL(mapper, "Could not create shader resource texture\n");
+    p->num_planes = 0;
+    for (int i = 0; i < MP_ARRAY_SIZE(fmt->planes) && fmt->planes[i]; i++) {
+        p->fmt[i] = ra_find_named_format(mapper->ra, fmt->planes[i]);
+        if (!p->fmt[i]) {
+            MP_ERR(mapper, "Could not find RA format '%s'\n", fmt->planes[i]);
             return -1;
         }
-
-        for (int i = 0; i < desc.num_planes; i++) {
-            mapper->tex[i] = ra_d3d11_wrap_tex_video(mapper->ra, p->copy_tex,
-                mp_image_plane_w(&layout, i), mp_image_plane_h(&layout, i), 0,
-                desc.planes[i]);
-            if (!mapper->tex[i]) {
-                MP_FATAL(mapper, "Could not create RA texture view\n");
-                return -1;
-            }
-        }
-
-        // A ref to the immediate context is needed for CopySubresourceRegion
-        ID3D11Device1_GetImmediateContext1(o->device1, &p->ctx);
+        p->num_planes++;
     }
+
+    // In the zero-copy path, we create the ra_tex objects in the map operation,
+    // so storing the per-plane formats above is all that's needed.
+    if (o->opts->zero_copy)
+        return 0;
+
+    // Minimal alignment requirement for NV12 and P010
+    mapper->dst_params.w = MP_ALIGN_UP(mapper->dst_params.w, 2);
+    mapper->dst_params.h = MP_ALIGN_UP(mapper->dst_params.h, 2);
+
+    struct mp_image layout = {0};
+    mp_image_set_params(&layout, &mapper->dst_params);
+
+    D3D11_TEXTURE2D_DESC copy_desc = {
+        .Width = mapper->dst_params.w,
+        .Height = mapper->dst_params.h,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .SampleDesc.Count = 1,
+        .Format = fmt->dxfmt,
+        .BindFlags = D3D11_BIND_SHADER_RESOURCE,
+    };
+    hr = ID3D11Device_CreateTexture2D(o->device, &copy_desc, NULL,
+                                      &p->copy_tex);
+    if (FAILED(hr)) {
+        MP_FATAL(mapper, "Could not create shader resource texture\n");
+        return -1;
+    }
+
+    for (int i = 0; i < p->num_planes; i++) {
+        mapper->tex[i] = ra_d3d11_wrap_tex_video(mapper->ra, p->copy_tex,
+            mp_image_plane_w(&layout, i), mp_image_plane_h(&layout, i), 0,
+            p->fmt[i]);
+        if (!mapper->tex[i]) {
+            MP_FATAL(mapper, "Could not create RA texture view\n");
+            return -1;
+        }
+    }
+
+    // A ref to the immediate context is needed for CopySubresourceRegion
+    ID3D11Device1_GetImmediateContext1(o->device1, &p->ctx);
 
     return 0;
 }
@@ -194,8 +248,12 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     struct priv *p = mapper->priv;
     ID3D11Texture2D *tex = (void *)mapper->src->planes[0];
     int subresource = (intptr_t)mapper->src->planes[1];
+    D3D11_TEXTURE2D_DESC desc2d;
+    ID3D11Texture2D_GetDesc(tex, &desc2d);
 
     if (p->copy_tex) {
+        mp_require(desc2d.Width >= mapper->dst_params.w &&
+                   desc2d.Height >= mapper->dst_params.h);
         ID3D11DeviceContext1_CopySubresourceRegion1(p->ctx,
             (ID3D11Resource *)p->copy_tex, 0, 0, 0, 0,
             (ID3D11Resource *)tex, subresource, (&(D3D11_BOX) {
@@ -206,10 +264,10 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
                 .bottom = mapper->dst_params.h,
                 .back = 1,
             }), D3D11_COPY_DISCARD);
-    } else {
-        D3D11_TEXTURE2D_DESC desc2d;
-        ID3D11Texture2D_GetDesc(tex, &desc2d);
 
+        // We no longer need the original texture after copying it.
+        mp_image_unrefp(&mapper->src);
+    } else {
         for (int i = 0; i < p->num_planes; i++) {
             // The video decode texture may include padding, so the size of the
             // ra_tex needs to be determined by the actual size of the Tex2D
@@ -240,6 +298,7 @@ const struct ra_hwdec_driver ra_hwdec_d3d11va = {
     .name = "d3d11va",
     .priv_size = sizeof(struct priv_owner),
     .imgfmts = {IMGFMT_D3D11, 0},
+    .device_type = AV_HWDEVICE_TYPE_D3D11VA,
     .init = init,
     .uninit = uninit,
     .mapper = &(const struct ra_hwdec_mapper_driver){

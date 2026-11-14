@@ -24,11 +24,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <pthread.h>
 
 #include <pulse/pulseaudio.h>
 
-#include "config.h"
 #include "audio/format.h"
 #include "common/msg.h"
 #include "options/m_option.h"
@@ -55,10 +53,13 @@ struct priv {
     bool playing;
     bool underrun_signalled;
 
+    bool have_sink_map;
+    pa_channel_map sink_map;
+
     char *cfg_host;
     int cfg_buffer;
-    int cfg_latency_hacks;
-    int cfg_allow_suspended;
+    bool cfg_latency_hacks;
+    bool cfg_allow_suspended;
 };
 
 #define GENERIC_ERR_MSG(str) \
@@ -82,7 +83,7 @@ static void subscribe_cb(pa_context *c, pa_subscription_event_type_t t,
                          uint32_t idx, void *userdata)
 {
     struct ao *ao = userdata;
-    int type = t & PA_SUBSCRIPTION_MASK_SINK;
+    int type = t & PA_SUBSCRIPTION_EVENT_TYPE_MASK;
     int fac = t & PA_SUBSCRIPTION_EVENT_FACILITY_MASK;
     if ((type == PA_SUBSCRIPTION_EVENT_NEW || type == PA_SUBSCRIPTION_EVENT_REMOVE)
         && fac == PA_SUBSCRIPTION_EVENT_SINK)
@@ -120,7 +121,7 @@ static void stream_request_cb(pa_stream *s, size_t length, void *userdata)
 {
     struct ao *ao = userdata;
     struct priv *priv = ao->priv;
-    ao_wakeup_playthread(ao);
+    ao_wakeup(ao);
     pa_threaded_mainloop_signal(priv->mainloop, 0);
 }
 
@@ -137,7 +138,7 @@ static void underflow_cb(pa_stream *s, void *userdata)
     struct priv *priv = ao->priv;
     priv->playing = false;
     priv->underrun_signalled = true;
-    ao_wakeup_playthread(ao);
+    ao_wakeup(ao);
     pa_threaded_mainloop_signal(priv->mainloop, 0);
 }
 
@@ -211,25 +212,25 @@ static pa_encoding_t map_digital_format(int format)
 }
 
 static const int speaker_map[][2] = {
-  {PA_CHANNEL_POSITION_FRONT_LEFT,              MP_SPEAKER_ID_FL},
-  {PA_CHANNEL_POSITION_FRONT_RIGHT,             MP_SPEAKER_ID_FR},
-  {PA_CHANNEL_POSITION_FRONT_CENTER,            MP_SPEAKER_ID_FC},
-  {PA_CHANNEL_POSITION_REAR_CENTER,             MP_SPEAKER_ID_BC},
-  {PA_CHANNEL_POSITION_REAR_LEFT,               MP_SPEAKER_ID_BL},
-  {PA_CHANNEL_POSITION_REAR_RIGHT,              MP_SPEAKER_ID_BR},
-  {PA_CHANNEL_POSITION_LFE,                     MP_SPEAKER_ID_LFE},
-  {PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER,    MP_SPEAKER_ID_FLC},
-  {PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER,   MP_SPEAKER_ID_FRC},
-  {PA_CHANNEL_POSITION_SIDE_LEFT,               MP_SPEAKER_ID_SL},
-  {PA_CHANNEL_POSITION_SIDE_RIGHT,              MP_SPEAKER_ID_SR},
-  {PA_CHANNEL_POSITION_TOP_CENTER,              MP_SPEAKER_ID_TC},
-  {PA_CHANNEL_POSITION_TOP_FRONT_LEFT,          MP_SPEAKER_ID_TFL},
-  {PA_CHANNEL_POSITION_TOP_FRONT_RIGHT,         MP_SPEAKER_ID_TFR},
-  {PA_CHANNEL_POSITION_TOP_FRONT_CENTER,        MP_SPEAKER_ID_TFC},
-  {PA_CHANNEL_POSITION_TOP_REAR_LEFT,           MP_SPEAKER_ID_TBL},
-  {PA_CHANNEL_POSITION_TOP_REAR_RIGHT,          MP_SPEAKER_ID_TBR},
-  {PA_CHANNEL_POSITION_TOP_REAR_CENTER,         MP_SPEAKER_ID_TBC},
-  {PA_CHANNEL_POSITION_INVALID,                 -1}
+    {PA_CHANNEL_POSITION_FRONT_LEFT,              MP_SPEAKER_ID_FL},
+    {PA_CHANNEL_POSITION_FRONT_RIGHT,             MP_SPEAKER_ID_FR},
+    {PA_CHANNEL_POSITION_FRONT_CENTER,            MP_SPEAKER_ID_FC},
+    {PA_CHANNEL_POSITION_REAR_CENTER,             MP_SPEAKER_ID_BC},
+    {PA_CHANNEL_POSITION_REAR_LEFT,               MP_SPEAKER_ID_BL},
+    {PA_CHANNEL_POSITION_REAR_RIGHT,              MP_SPEAKER_ID_BR},
+    {PA_CHANNEL_POSITION_LFE,                     MP_SPEAKER_ID_LFE},
+    {PA_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER,    MP_SPEAKER_ID_FLC},
+    {PA_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER,   MP_SPEAKER_ID_FRC},
+    {PA_CHANNEL_POSITION_SIDE_LEFT,               MP_SPEAKER_ID_SL},
+    {PA_CHANNEL_POSITION_SIDE_RIGHT,              MP_SPEAKER_ID_SR},
+    {PA_CHANNEL_POSITION_TOP_CENTER,              MP_SPEAKER_ID_TC},
+    {PA_CHANNEL_POSITION_TOP_FRONT_LEFT,          MP_SPEAKER_ID_TFL},
+    {PA_CHANNEL_POSITION_TOP_FRONT_RIGHT,         MP_SPEAKER_ID_TFR},
+    {PA_CHANNEL_POSITION_TOP_FRONT_CENTER,        MP_SPEAKER_ID_TFC},
+    {PA_CHANNEL_POSITION_TOP_REAR_LEFT,           MP_SPEAKER_ID_TBL},
+    {PA_CHANNEL_POSITION_TOP_REAR_RIGHT,          MP_SPEAKER_ID_TBR},
+    {PA_CHANNEL_POSITION_TOP_REAR_CENTER,         MP_SPEAKER_ID_TBC},
+    {PA_CHANNEL_POSITION_INVALID,                 -1}
 };
 
 static bool chmap_pa_from_mp(pa_channel_map *dst, struct mp_chmap *src)
@@ -257,8 +258,57 @@ static bool chmap_pa_from_mp(pa_channel_map *dst, struct mp_chmap *src)
     return true;
 }
 
+static void sink_map_cb(pa_context *c, const pa_sink_info *i, int eol, void *ud)
+{
+    struct ao *ao = ud;
+    struct priv *priv = ao->priv;
+
+    if (eol) {
+        pa_threaded_mainloop_signal(priv->mainloop, 0); // wakeup waitop()
+        return;
+    }
+
+    priv->sink_map = i->channel_map;
+    priv->have_sink_map = true;
+}
+
+// Must be called with the mainloop locked.
+static void query_sink_map(struct ao *ao, const char *sink)
+{
+    struct priv *priv = ao->priv;
+
+    priv->have_sink_map = false;
+    if (!waitop_no_unlock(priv, pa_context_get_sink_info_by_name(priv->context, sink,
+                                                                 sink_map_cb, ao)))
+    {
+        MP_VERBOSE(ao, "Could not get the sink's channel map.\n");
+    }
+}
+
 static bool select_chmap(struct ao *ao, pa_channel_map *dst)
 {
+    struct priv *priv = ao->priv;
+
+    if (mp_chmap_is_unknown(&ao->channels) && priv->have_sink_map &&
+        ao->channels.num <= PA_CHANNELS_MAX)
+    {
+        // Channels without positions take the sink's positions in order, so
+        // the server maps them by index. Extra channels get AUX positions the
+        // sink does not use.
+        int aux = 0;
+        dst->channels = ao->channels.num;
+        for (int n = 0; n < dst->channels; n++) {
+            if (n < priv->sink_map.channels) {
+                dst->map[n] = priv->sink_map.map[n];
+                continue;
+            }
+            while (pa_channel_map_has_position(&priv->sink_map, PA_CHANNEL_POSITION_AUX0 + aux))
+                aux++;
+            dst->map[n] = PA_CHANNEL_POSITION_AUX0 + aux++;
+        }
+        return true;
+    }
+
     struct mp_chmap_sel sel = {0};
     for (int n = 0; speaker_map[n][1] != -1; n++)
         mp_chmap_sel_add_speaker(&sel, speaker_map[n][1]);
@@ -316,10 +366,8 @@ static int pa_init_boilerplate(struct ao *ao)
     }
 
     MP_VERBOSE(ao, "Library version: %s\n", pa_get_library_version());
-    MP_VERBOSE(ao, "Proto: %lu\n",
-        (long)pa_context_get_protocol_version(priv->context));
-    MP_VERBOSE(ao, "Server proto: %lu\n",
-        (long)pa_context_get_server_protocol_version(priv->context));
+    MP_VERBOSE(ao, "Proto: %" PRIu32 "\n",
+               pa_context_get_protocol_version(priv->context));
 
     pa_context_set_state_callback(priv->context, context_state_cb, ao);
     pa_context_set_subscribe_callback(priv->context, subscribe_cb, ao);
@@ -336,6 +384,9 @@ static int pa_init_boilerplate(struct ao *ao)
             goto fail;
         pa_threaded_mainloop_wait(priv->mainloop);
     }
+
+    MP_VERBOSE(ao, "Server proto: %" PRIu32 "\n",
+               pa_context_get_server_protocol_version(priv->context));
 
     pa_threaded_mainloop_unlock(priv->mainloop);
     return 0;
@@ -406,8 +457,16 @@ static int init(struct ao *ao)
     }
     (void)pa_proplist_sets(proplist, PA_PROP_MEDIA_ICON_NAME, ao->client_name);
 
+    if (ao->set_media_role)
+        (void)pa_proplist_sets(proplist, PA_PROP_MEDIA_ROLE,
+                               ao->init_flags & AO_INIT_MEDIA_ROLE_MUSIC
+                               ? "music" : "video");
+
     if (!(format = pa_format_info_new()))
         goto unlock_and_fail;
+
+    if (mp_chmap_is_unknown(&ao->channels))
+        query_sink_map(ao, sink);
 
     if (!set_format(ao, format)) {
         ao->channels = (struct mp_chmap) MP_CHMAP_INIT_STEREO;
@@ -680,14 +739,8 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
         // we naively copied the struct, without updating pointers etc.
         // Pointers might point to invalid data, accessors might fail.
         if (cmd == AOCONTROL_GET_VOLUME) {
-            ao_control_vol_t *vol = arg;
-            if (priv->pi.volume.channels != 2)
-                vol->left = vol->right =
-                    VOL_PA2MP(pa_cvolume_avg(&priv->pi.volume));
-            else {
-                vol->left = VOL_PA2MP(priv->pi.volume.values[0]);
-                vol->right = VOL_PA2MP(priv->pi.volume.values[1]);
-            }
+            float *vol = arg;
+            *vol = VOL_PA2MP(pa_cvolume_avg(&priv->pi.volume));
         } else if (cmd == AOCONTROL_GET_MUTE) {
             bool *mute = arg;
             *mute = priv->pi.mute;
@@ -701,16 +754,11 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
         priv->retval = 0;
         uint32_t stream_index = pa_stream_get_index(priv->stream);
         if (cmd == AOCONTROL_SET_VOLUME) {
-            const ao_control_vol_t *vol = arg;
+            const float *vol = arg;
             struct pa_cvolume volume;
 
             pa_cvolume_reset(&volume, ao->channels.num);
-            if (volume.channels != 2)
-                pa_cvolume_set(&volume, volume.channels, VOL_MP2PA(vol->left));
-            else {
-                volume.values[0] = VOL_MP2PA(vol->left);
-                volume.values[1] = VOL_MP2PA(vol->right);
-            }
+            pa_cvolume_set(&volume, volume.channels, VOL_MP2PA(*vol));
             if (!waitop(priv, pa_context_set_sink_input_volume(priv->context,
                                                                stream_index,
                                                                &volume,
@@ -729,8 +777,9 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
                 GENERIC_ERR_MSG("pa_context_set_sink_input_mute() failed");
                 return CONTROL_ERROR;
             }
-        } else
-            abort();
+        } else {
+            MP_ASSERT_UNREACHABLE();
+        }
         return CONTROL_OK;
     }
 
@@ -816,13 +865,14 @@ const struct ao_driver audio_out_pulse = {
     .priv_size = sizeof(struct priv),
     .priv_defaults = &(const struct priv) {
         .cfg_buffer = 100,
+        .cfg_latency_hacks = true,
     },
     .options = (const struct m_option[]) {
         {"host", OPT_STRING(cfg_host)},
         {"buffer", OPT_CHOICE(cfg_buffer, {"native", 0}),
             M_RANGE(1, 2000)},
-        {"latency-hacks", OPT_FLAG(cfg_latency_hacks)},
-        {"allow-suspended", OPT_FLAG(cfg_allow_suspended)},
+        {"latency-hacks", OPT_BOOL(cfg_latency_hacks)},
+        {"allow-suspended", OPT_BOOL(cfg_allow_suspended)},
         {0}
     },
     .options_prefix = "pulse",

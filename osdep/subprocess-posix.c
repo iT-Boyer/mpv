@@ -16,7 +16,6 @@
  */
 
 #include <poll.h>
-#include <pthread.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -33,6 +32,16 @@
 
 extern char **environ;
 
+#if HAVE_CLONE
+#include <sched.h>
+#endif
+
+#ifdef SIGRTMAX
+#define SIGNAL_MAX SIGRTMAX
+#else
+#define SIGNAL_MAX 31
+#endif
+
 #define SAFE_CLOSE(fd) do { if ((fd) >= 0) close((fd)); (fd) = -1; } while (0)
 
 // Async-signal-safe execvpe(). POSIX does not list it as async-signal-safe
@@ -48,34 +57,121 @@ static int as_execvpe(const char *path, const char *file, char *const argv[],
         return execve(file, argv, envp);
 
     size_t flen = strlen(file);
-    while (path && path[0]) {
+    while (path) {
         size_t plen = strcspn(path, ":");
         // Ignore paths that are too long.
         char fn[PATH_MAX];
         if (plen + 1 + flen + 1 < sizeof(fn)) {
             memcpy(fn, path, plen);
             fn[plen] = '/';
-            memcpy(fn + plen + 1, file, flen + 1);
+            memcpy(fn + plen + (plen > 0), file, flen + 1);
             execve(fn, argv, envp);
             if (errno != EACCES && errno != ENOENT && errno != ENOTDIR)
                 break;
         }
-        path += plen + (path[plen] == ':' ? 1 : 0);
+        path = path[plen] ? path + plen + 1 : NULL;
     }
     return -1;
 }
 
-// Returns 0 on any error, valid PID on success.
-// This function must be async-signal-safe, as it may be called from a fork().
-static pid_t spawn_process(const char *path, struct mp_subprocess_opts *opts,
-                           int src_fds[])
+// In the child process, resets the signal mask to defaults. Also clears any
+// signal handlers first so nothing funny happens.
+static void reset_signals_child(void)
 {
-    int p[2] = {-1, -1};
-    pid_t fres = 0;
-    sigset_t sigmask, oldmask;
-    sigfillset(&sigmask);
-    pthread_sigmask(SIG_BLOCK, &sigmask, &oldmask);
+    struct sigaction sa = { 0 };
+    sigset_t sigmask;
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sigmask);
 
+    for (int nr = 1; nr <= SIGNAL_MAX; nr++)
+        sigaction(nr, &sa, NULL);
+    sigprocmask(SIG_SETMASK, &sigmask, NULL);
+}
+
+struct child_args {
+    const char *path;
+    struct mp_subprocess_opts *opts;
+    int *src_fds;
+    void *child_stack;
+    int pipe_end;
+    bool failed;
+    bool detach;
+};
+
+static pid_t spawn_process_inner(const char *path, struct mp_subprocess_opts *opts,
+                                 int src_fds[], bool detach, void *stacks[]);
+
+// This function is called from a clone(CLONE_VM)/rfork_thread context where
+// the child shares the parent's address space.
+static int child_main(void* args)
+{
+    struct child_args *child_args = args;
+    const char *path = child_args->path;
+    struct mp_subprocess_opts *opts = child_args->opts;
+    int *src_fds = child_args->src_fds;
+    void *child_stack = child_args->child_stack;
+    int pipe_end = child_args->pipe_end;
+    bool detach = child_args->detach;
+
+    if (detach) {
+        setsid();
+        if (!spawn_process_inner(path, opts, src_fds, false, &child_stack))
+            goto child_failed;
+        return 0;
+    }
+
+    reset_signals_child();
+
+    for (int n = 0; n < opts->num_fds; n++) {
+        if (src_fds[n] == opts->fds[n].fd) {
+            int flags = fcntl(opts->fds[n].fd, F_GETFD);
+            if (flags == -1)
+                goto child_failed;
+            flags &= ~(unsigned)FD_CLOEXEC;
+            if (fcntl(opts->fds[n].fd, F_SETFD, flags) == -1)
+                goto child_failed;
+        } else if (dup2(src_fds[n], opts->fds[n].fd) < 0) {
+            goto child_failed;
+        }
+    }
+
+    as_execvpe(path, opts->exe, opts->args, opts->env ? opts->env : environ);
+
+child_failed:
+    child_args->failed = true;
+    if (pipe_end >= 0)
+        (void)write(pipe_end, &(char){1}, 1); // shouldn't be able to fail
+    return 1;
+}
+
+static pid_t spawn_process_inner(const char *path, struct mp_subprocess_opts *opts,
+                                 int src_fds[], bool detach, void *stacks[])
+{
+    pid_t fres = 0;
+    int r = 0;
+
+    struct child_args child_args = {
+        .path = path,
+        .opts = opts,
+        .src_fds = src_fds,
+        .child_stack = detach ? stacks[1] : NULL,
+        .pipe_end = -1,
+        .failed = false,
+        .detach = detach,
+    };
+
+    int p[2] = {-1, -1};
+
+#if HAVE_RFORK
+    fres = rfork_thread(RFSPAWN, stacks[0], child_main, &child_args);
+    // On other architectures than amd64 and i386, FreeBSD's rfork_thread()
+    // cannot switch stacks and fails with EOPNOTSUPP when given one. With NULL
+    // it runs the child on our stack.
+    if (fres < 0 && errno == EOPNOTSUPP)
+        fres = rfork_thread(RFSPAWN, NULL, child_main, &child_args);
+#elif HAVE_CLONE
+    fres = clone(child_main, stacks[0], CLONE_VM | CLONE_VFORK | SIGCHLD, &child_args);
+#else
     // We setup a communication pipe to signal failure. Since the child calls
     // exec() and becomes the calling process, we don't know if or when the
     // child process successfully ran exec() just from the PID.
@@ -88,52 +184,79 @@ static pid_t spawn_process(const char *path, struct mp_subprocess_opts *opts,
     int p_flags = fcntl(p[0], F_GETFD);
     if (p_flags == -1 || !FD_CLOEXEC || !(p_flags & FD_CLOEXEC))
         goto done; // require CLOEXEC; unknown if fallback would be worth it
+    child_args.pipe_end = p[1];
 
     fres = fork();
+#endif
+
     if (fres < 0) {
         fres = 0;
         goto done;
     }
+
+#if !HAVE_CLONE && !HAVE_RFORK
     if (fres == 0) {
-        // child
-
-        for (int n = 0; n < opts->num_fds; n++) {
-            if (src_fds[n] == opts->fds[n].fd) {
-                int flags = fcntl(opts->fds[n].fd, F_GETFD);
-                if (flags == -1)
-                    goto child_failed;
-                flags &= ~(unsigned)FD_CLOEXEC;
-                if (fcntl(opts->fds[n].fd, F_SETFD, flags) == -1)
-                    goto child_failed;
-            } else if (dup2(src_fds[n], opts->fds[n].fd) < 0) {
-                goto child_failed;
-            }
-        }
-
-        as_execvpe(path, opts->exe, opts->args, opts->env ? opts->env : environ);
-
-    child_failed:
-        write(p[1], &(char){1}, 1); // shouldn't be able to fail
-        _exit(1);
+        _exit(child_main(&child_args));
     }
 
     SAFE_CLOSE(p[1]);
 
-    int r;
     do {
         r = read(p[0], &(char){0}, 1);
     } while (r < 0 && errno == EINTR);
+#endif
 
     // If exec()ing child failed, collect it immediately.
-    if (r != 0) {
-        while (waitpid(fres, &(int){0}, 0) < 0 && errno == EINTR) {}
-        fres = 0;
+    if (detach || child_args.failed || r != 0) {
+        int child_status = 0;
+        while (waitpid(fres, &child_status, 0) < 0 && errno == EINTR) {}
+        if (r != 0 || !WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)
+            fres = 0;
     }
 
 done:
-    pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
     SAFE_CLOSE(p[0]);
     SAFE_CLOSE(p[1]);
+
+    return fres;
+}
+
+// Returns 0 on any error, valid PID on success.
+static pid_t spawn_process(const char *path, struct mp_subprocess_opts *opts,
+                           int src_fds[])
+{
+    bool detach = opts->detach;
+    void *stacks[2] = {0};
+    void *ctx = NULL;
+
+#if HAVE_CLONE || HAVE_RFORK
+    // Pre-allocate stacks so spawn_process_inner() remains async-signal-safe.
+    // The child only runs a few async-signal-safe calls before execve(), so a
+    // fixed 32 KiB stack is sufficient; we forgo mmap(MAP_STACK) (and thus the
+    // auto-growth / guard-page behavior it enables on FreeBSD) in favor of
+    // plain talloc, which is simpler and async-signal-safe at this call site.
+    const size_t stack_size = 0x8000;
+    ctx = talloc_new(NULL);
+    // stack should be aligned to 16 bytes, which is guaranteed by malloc
+    stacks[0] = (char *)talloc_size(ctx, stack_size) + stack_size;
+    if (detach)
+        stacks[1] = (char *)talloc_size(ctx, stack_size) + stack_size;
+#endif
+
+#if !HAVE_RFORK
+    sigset_t sigmask, oldmask;
+
+    sigfillset(&sigmask);
+    pthread_sigmask(SIG_BLOCK, &sigmask, &oldmask);
+#endif
+
+    pid_t fres = spawn_process_inner(path, opts, src_fds, detach, stacks);
+
+#if !HAVE_RFORK
+    pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
+#endif
+
+    talloc_free(ctx);
 
     return fres;
 }
@@ -150,8 +273,6 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
     bool killed_by_us = false;
     int cancel_fd = -1;
     char *path = getenv("PATH");
-    if (!path)
-        path = ""; // failure, who cares
 
     *res = (struct mp_subprocess_result){0};
 
@@ -165,16 +286,21 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
     }
 
     for (int n = 0; n < opts->num_fds; n++) {
-        assert(!(opts->fds[n].on_read && opts->fds[n].on_write));
+        mp_assert(!(opts->fds[n].on_read && opts->fds[n].on_write));
 
         if (opts->fds[n].on_read && mp_make_cloexec_pipe(comm_pipe[n]) < 0)
             goto done;
 
         if (opts->fds[n].on_write || opts->fds[n].write_buf) {
-            assert(opts->fds[n].on_write && opts->fds[n].write_buf);
+            mp_assert(opts->fds[n].on_write && opts->fds[n].write_buf);
             if (mp_make_cloexec_pipe(comm_pipe[n]) < 0)
                 goto done;
             MPSWAP(int, comm_pipe[n][0], comm_pipe[n][1]);
+            int flags = fcntl(comm_pipe[n][0], F_GETFL);
+            if (flags == -1)
+                goto done;
+            if (fcntl(comm_pipe[n][0], F_SETFL, flags | O_NONBLOCK) == -1)
+                goto done;
 
             struct sigaction sa = {.sa_handler = SIG_IGN, .sa_flags = SA_RESTART};
             sigfillset(&sa.sa_mask);
@@ -196,33 +322,11 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
         src_fds[n] = src_fd;
     }
 
-    if (opts->detach) {
-        // If we run it detached, we fork a child to start the process; then
-        // it exits immediately, letting PID 1 inherit it. So we don't need
-        // anything else to collect these child PIDs.
-        sigset_t sigmask, oldmask;
-        sigfillset(&sigmask);
-        pthread_sigmask(SIG_BLOCK, &sigmask, &oldmask);
-        pid_t fres = fork();
-        if (fres < 0)
-            goto done;
-        if (fres == 0) {
-            // child
-            setsid();
-            if (!spawn_process(path, opts, src_fds))
-                _exit(1);
-            _exit(0);
-        }
-        pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
-        int child_status = 0;
-        while (waitpid(fres, &child_status, 0) < 0 && errno == EINTR) {}
-        if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0)
-            goto done;
-    } else {
-        pid = spawn_process(path, opts, src_fds);
-        if (!pid)
-            goto done;
-    }
+    pid = spawn_process(path, opts, src_fds);
+    if (!pid)
+        goto done;
+    if (opts->detach)
+        pid = 0;
 
     spawned = true;
 
@@ -261,7 +365,7 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
                     if (pid)
                         kill(pid, SIGKILL);
                     killed_by_us = true;
-                    break;
+                    goto break_poll;
                 }
                 struct mp_subprocess_fd *fd = &opts->fds[n];
                 if (fd->on_read) {
@@ -282,7 +386,7 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
                     }
                     ssize_t r = write(comm_pipe[n][0], fd->write_buf->start,
                                       fd->write_buf->len);
-                    if (r < 0 && errno == EINTR)
+                    if (r < 0 && (errno == EINTR || errno == EAGAIN))
                         continue;
                     if (r < 0) {
                         // Let's not signal an error for now - caller can check
@@ -295,6 +399,8 @@ void mp_subprocess2(struct mp_subprocess_opts *opts,
             }
         }
     }
+
+break_poll:
 
     // Note: it can happen that a child process closes the pipe, but does not
     //       terminate yet. In this case, we would have to run waitpid() in

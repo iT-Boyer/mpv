@@ -37,6 +37,9 @@
 #include <windows.h>
 #endif
 
+// Collision with <winnt.h>
+#undef MemoryBarrier
+
 struct GL;
 typedef struct GL GL;
 
@@ -59,6 +62,7 @@ enum {
     MPGL_CAP_COMPUTE_SHADER     = (1 << 23),    // GL_ARB_compute_shader & GL_ARB_shader_image_load_store
     MPGL_CAP_NESTED_ARRAY       = (1 << 24),    // GL_ARB_arrays_of_arrays
 
+    MPGL_CAP_SLOW_DR            = (1 << 29),    // direct rendering is assumed to be slow
     MPGL_CAP_SW                 = (1 << 30),    // indirect or sw renderer
 };
 
@@ -70,8 +74,6 @@ enum {
 
 #define MPGL_VER_P(ver) MPGL_VER_GET_MAJOR(ver), MPGL_VER_GET_MINOR(ver)
 
-void mpgl_check_version(GL *gl, void *(*get_fn)(void *ctx, const char *n),
-                        void *fn_ctx);
 void mpgl_load_functions(GL *gl, void *(*getProcAddress)(const GLubyte *),
                          const char *ext2, struct mp_log *log);
 void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
@@ -88,6 +90,16 @@ struct GL {
     char *extensions;           // Equivalent to GL_EXTENSIONS
     int mpgl_caps;              // Bitfield of MPGL_CAP_* constants
     bool debug_context;         // use of e.g. GLX_CONTEXT_DEBUG_BIT_ARB
+
+    // Set to false if the implementation follows normal GL semantics, which is
+    // upside down. Set to true if it does *not*, i.e. if rendering is right
+    // side up
+    bool flipped;
+
+    // Copy of function pointer used to load GL.
+    // Caution: Not necessarily valid to use after VO init has completed!
+    void *(*get_fn)(void *ctx, const char *n);
+    void *fn_ctx;
 
     void (GLAPIENTRY *Viewport)(GLint, GLint, GLsizei, GLsizei);
     void (GLAPIENTRY *Clear)(GLbitfield);
@@ -113,6 +125,7 @@ struct GL {
     void (GLAPIENTRY *ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum,
                                   GLenum, GLvoid *);
     void (GLAPIENTRY *ReadBuffer)(GLenum);
+    void (GLAPIENTRY *DrawBuffer)(GLenum);
     void (GLAPIENTRY *DrawArrays)(GLenum, GLint, GLsizei);
     GLenum (GLAPIENTRY *GetError)(void);
     void (GLAPIENTRY *GetTexLevelParameteriv)(GLenum, GLint, GLenum, GLint *);
@@ -243,8 +256,6 @@ struct GL {
 
     void (GLAPIENTRY *DebugMessageCallback)(MP_GLDEBUGPROC callback,
                                             const void *userParam);
-
-    void *(GLAPIENTRY *MPGetNativeDisplay)(const char *name);
 };
 
 #endif /* MPLAYER_GL_COMMON_H */

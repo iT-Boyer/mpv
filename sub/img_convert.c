@@ -31,7 +31,8 @@
 void mp_blur_rgba_sub_bitmap(struct sub_bitmap *d, double gblur)
 {
     struct mp_image *tmp1 = mp_image_alloc(IMGFMT_BGRA, d->w, d->h);
-    if (tmp1) { // on OOM, skip region
+    MP_HANDLE_OOM(tmp1);
+    {
         struct mp_image s = {0};
         mp_image_setfmt(&s, IMGFMT_BGRA);
         mp_image_set_size(&s, d->w, d->h);
@@ -105,7 +106,10 @@ int mp_get_sub_bb_list(struct sub_bitmaps *sbs, struct mp_rect *out_rc_list,
     int num_rc = 0;
     for (int n = 0; n < sbs->num_parts; n++) {
         struct sub_bitmap *sb = &sbs->parts[n];
-        struct mp_rect bb = {sb->x, sb->y, sb->x + sb->dw, sb->y + sb->dh};
+        struct mp_rect bb = {sb->x,
+                             sb->y,
+                             sb->x + sb->dw,
+                             sb->y + sb->dh};
         bool intersects = false;
         for (int r = 0; r < num_rc; r++) {
             struct mp_rect *rc = &out_rc_list[r];

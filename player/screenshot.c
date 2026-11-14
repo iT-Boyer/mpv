@@ -19,7 +19,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "config.h"
+#include <libavcodec/avcodec.h>
 
 #include "osdep/io.h"
 
@@ -33,6 +33,7 @@
 #include "misc/node.h"
 #include "misc/thread_tools.h"
 #include "common/msg.h"
+#include "demux/demux.h"
 #include "options/path.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
@@ -40,14 +41,17 @@
 #include "video/image_writer.h"
 #include "video/sws_utils.h"
 #include "sub/osd.h"
+#include "stream/stream.h"
 
 #include "video/csputils.h"
 
-#define MODE_FULL_WINDOW 1
+#define MODE_SCALED 1
 #define MODE_SUBTITLES 2
+#define MODE_OSD 4
 
 typedef struct screenshot_ctx {
     struct MPContext *mpctx;
+    struct mp_log *log;
 
     // Command to repeat in each-frame mode.
     struct mp_cmd *each_frame;
@@ -62,19 +66,13 @@ void screenshot_init(struct MPContext *mpctx)
     *mpctx->screenshot_ctx = (screenshot_ctx) {
         .mpctx = mpctx,
         .frameno = 1,
+        .log = mp_log_new(mpctx, mpctx->log, "screenshot")
     };
 }
 
-static char *stripext(void *talloc_ctx, const char *s)
-{
-    const char *end = strrchr(s, '.');
-    if (!end)
-        end = s + strlen(s);
-    return talloc_asprintf(talloc_ctx, "%.*s", (int)(end - s), s);
-}
-
 static bool write_screenshot(struct mp_cmd_ctx *cmd, struct mp_image *img,
-                             const char *filename, struct image_writer_opts *opts)
+                             const char *filename, struct image_writer_opts *opts,
+                             bool overwrite)
 {
     struct MPContext *mpctx = cmd->mpctx;
     struct image_writer_opts *gopts = mpctx->opts->screenshot_image_opts;
@@ -85,7 +83,7 @@ static bool write_screenshot(struct mp_cmd_ctx *cmd, struct mp_image *img,
     mp_core_unlock(mpctx);
 
     bool ok = img && write_image(img, &opts_copy, filename, mpctx->global,
-                                 mpctx->log);
+                                 mpctx->screenshot_ctx->log, overwrite);
 
     mp_core_lock(mpctx);
 
@@ -163,7 +161,7 @@ static char *create_fname(struct MPContext *mpctx, char *template,
                 goto error_exit;
             char fmtstr[] = {'%', '0', digits, 'd', '\0'};
             res = talloc_asprintf_append(res, fmtstr, *frameno);
-            if (*frameno < 100000 - 1) {
+            if (*frameno < INT_MAX - 1) {
                 (*frameno) += 1;
                 (*sequence) += 1;
             }
@@ -171,16 +169,23 @@ static char *create_fname(struct MPContext *mpctx, char *template,
         }
         case 'f':
         case 'F': {
-            char *video_file = NULL;
-            if (mpctx->filename)
-                video_file = mp_basename(mpctx->filename);
+            const char *name;
+            if (!mpctx->filename) {
+                name = "NO_FILE";
+            } else if (mpctx->demuxer && mpctx->demuxer->server_filename) {
+                name = mpctx->demuxer->server_filename;
+            } else {
+                if (bstr_endswith0(bstr0(mpctx->filename), "/")) {
+                    name = mpctx->filename;
+                } else {
+                    name = mp_basename(mpctx->filename);
+                }
+                if (mp_is_url(bstr0(mpctx->filename)))
+                    name = mp_url_unescape(res, name);
+            }
 
-            if (!video_file)
-                video_file = "NO_FILE";
-
-            char *name = video_file;
             if (fmt == 'F')
-                name = stripext(res, video_file);
+                name = bstrto0(res, mp_strip_ext(bstr0(name)));
             append_filename(&res, name);
             break;
         }
@@ -227,13 +232,20 @@ static char *create_fname(struct MPContext *mpctx, char *template,
         }
         case 't': {
             char tfmt = *template;
-            if (!tfmt)
+            // Translate common extensions to the closest alternative.
+            size_t i = strcspn("sklPaAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%", (char[]){tfmt, '\0'});
+            tfmt =             "sHIpaAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%"[i];
+            if (!tfmt || !local_time)
                 goto error_exit;
             template++;
-            char fmtstr[] = {'%', tfmt, '\0'};
             char buffer[80];
-            if (strftime(buffer, sizeof(buffer), fmtstr, local_time) == 0)
-                buffer[0] = '\0';
+            if (tfmt == 's') {
+                snprintf(buffer, sizeof(buffer), "%"PRId64, (int64_t)raw_time);
+            } else {
+                char fmtstr[] = {'%', tfmt, '\0'};
+                if (strftime(buffer, sizeof(buffer), fmtstr, local_time) == 0)
+                    buffer[0] = '\0';
+            }
             append_filename(&res, buffer);
             break;
         }
@@ -291,21 +303,16 @@ static char *gen_fname(struct mp_cmd_ctx *cmd, const char *file_ext)
             return NULL;
         }
 
-        char *dir = ctx->mpctx->opts->screenshot_directory;
+        char *dir = ctx->mpctx->opts->screenshot_dir;
         if (dir && dir[0]) {
             void *t = fname;
             dir = mp_get_user_path(t, ctx->mpctx->global, dir);
             fname = mp_path_join(NULL, dir, fname);
-
-            mp_mkdirp(dir);
-
             talloc_free(t);
         }
 
         char *full_dir = bstrto0(fname, mp_dirname(fname));
-        if (!mp_path_exists(full_dir)) {
-            mp_mkdirp(full_dir);
-        }
+        mp_mkdirp(full_dir);
 
         if (!mp_path_exists(fname))
             return fname;
@@ -321,54 +328,104 @@ static char *gen_fname(struct mp_cmd_ctx *cmd, const char *file_ext)
     }
 }
 
-static void add_subs(struct MPContext *mpctx, struct mp_image *image)
+static void add_osd(struct MPContext *mpctx, struct mp_image *image, int mode)
 {
-    struct mp_osd_res res = osd_res_from_image_params(&image->params);
-    osd_draw_on_image(mpctx->osd, res, mpctx->video_pts,
-                      OSD_DRAW_SUB_ONLY, image);
+    struct mp_osd_res res = (mode & MODE_SCALED) ? osd_get_vo_res(mpctx->video_out->osd) :
+                            osd_res_from_image_params(&image->params);
+    if (mode & MODE_SUBTITLES) {
+        osd_draw_on_image(mpctx->osd, res, mpctx->video_pts,
+                          OSD_DRAW_SUB_ONLY, image);
+    }
+    if (mode & MODE_OSD) {
+        osd_draw_on_image(mpctx->osd, res, mpctx->video_pts,
+                          OSD_DRAW_OSD_ONLY, image);
+    }
 }
 
 static struct mp_image *screenshot_get(struct MPContext *mpctx, int mode,
                                        bool high_depth)
 {
     struct mp_image *image = NULL;
-    if (mode == MODE_SUBTITLES && osd_get_render_subs_in_filter(mpctx->osd))
-        mode = 0;
-    bool need_add_subs = mode == MODE_SUBTITLES;
+    const struct image_writer_opts *imgopts = mpctx->opts->screenshot_image_opts;
+    if ((mode & MODE_SUBTITLES) && osd_get_render_subs_in_filter(mpctx->osd))
+        mode &= ~MODE_SUBTITLES;
 
-    if (mpctx->video_out && mpctx->video_out->config_ok) {
-        vo_wait_frame(mpctx->video_out); // important for each-frame mode
+    if (!mpctx->video_out || !mpctx->video_out->config_ok)
+        return NULL;
 
-        struct voctrl_screenshot ctrl = {
-            .scaled = mode == MODE_FULL_WINDOW,
-            .subs = mode != 0,
-            .osd = mode == MODE_FULL_WINDOW,
-            .high_bit_depth = high_depth &&
-                              mpctx->opts->screenshot_image_opts->high_bit_depth,
-        };
-        if (!mpctx->opts->screenshot_sw)
-            vo_control(mpctx->video_out, VOCTRL_SCREENSHOT, &ctrl);
-        image = ctrl.res;
-        if (image)
-            need_add_subs = false;
+    vo_wait_frame(mpctx->video_out); // important for each-frame mode
 
-        if (!image && mode != MODE_FULL_WINDOW)
-            image = vo_get_current_frame(mpctx->video_out);
-        if (!image) {
-            vo_control(mpctx->video_out, VOCTRL_SCREENSHOT_WIN, &image);
-            mode = MODE_FULL_WINDOW;
-        }
+    bool use_sw = mpctx->opts->screenshot_sw;
+    bool scaled = mode & MODE_SCALED;
+    bool subs = mode & MODE_SUBTITLES;
+    bool osd = mode & MODE_OSD;
+    struct voctrl_screenshot ctrl = {
+        .scaled = scaled,
+        .subs = subs,
+        .osd = osd,
+        .high_bit_depth = high_depth && imgopts->high_bit_depth,
+        .native_csp = image_writer_flexible_csp(imgopts),
+    };
+    if (!use_sw)
+        vo_control(mpctx->video_out, VOCTRL_SCREENSHOT, &ctrl);
+    image = ctrl.res;
+
+    // VOCTRL_SCREENSHOT_WIN gets the complete rendered image so it's only
+    // usable for scaled+sub+osd screenshots.
+    if (!use_sw && !image && scaled && subs && osd)
+        vo_control(mpctx->video_out, VOCTRL_SCREENSHOT_WIN, &image);
+
+    if (!image) {
+        use_sw = true;
+        MP_VERBOSE(mpctx->screenshot_ctx, "Falling back to software screenshot.\n");
+        image = vo_get_current_frame(mpctx->video_out);
     }
 
-    if (image && (image->fmt.flags & MP_IMGFLAG_HWACCEL)) {
+    // vo_get_current_frame() can return a hardware frame, which we have to download first.
+    if (image && IMGFMT_IS_HWACCEL(image->imgfmt)) {
         struct mp_image *nimage = mp_image_hw_download(image, NULL);
         talloc_free(image);
+        if (!nimage)
+            return NULL;
         image = nimage;
     }
 
-    if (image && need_add_subs)
-        add_subs(mpctx, image);
+    if (use_sw && image && scaled) {
+        if (mp_image_crop_valid(&image->params) &&
+            (mp_rect_w(image->params.crop) != image->w ||
+             mp_rect_h(image->params.crop) != image->h))
+        {
+            struct mp_image *nimage = mp_image_new_ref(image);
+            if (!nimage) {
+                MP_ERR(mpctx->screenshot_ctx, "mp_image_new_ref failed!\n");
+                return NULL;
+            }
+            mp_image_crop_rc(nimage, image->params.crop);
+            talloc_free(image);
+            image = nimage;
+        }
+        struct mp_osd_res res = osd_get_vo_res(mpctx->video_out->osd);
+        struct mp_osd_res image_res = osd_res_from_image_params(&image->params);
+        if (!osd_res_equals(res, image_res)) {
+            struct mp_image *nimage = mp_image_alloc(image->imgfmt, res.w, res.h);
+            if (!nimage) {
+                talloc_free(image);
+                return NULL;
+            }
+            struct mp_sws_context *sws = mp_sws_alloc(NULL);
+            mp_sws_scale(sws, nimage, image);
+            talloc_free(image);
+            talloc_free(sws);
+            image = nimage;
+        }
+    }
 
+    if (!image)
+        return NULL;
+
+    if (use_sw && mode != 0)
+        add_osd(mpctx, image, mode);
+    mp_image_params_guess_csp(&image->params);
     return image;
 }
 
@@ -416,12 +473,13 @@ struct mp_image *convert_image(struct mp_image *image, int destfmt,
 }
 
 // mode is the same as in screenshot_get()
-static struct mp_image *screenshot_get_rgb(struct MPContext *mpctx, int mode)
+static struct mp_image *screenshot_get_rgb(struct MPContext *mpctx, int mode,
+                                           bool high_depth, enum mp_imgfmt format)
 {
-    struct mp_image *mpi = screenshot_get(mpctx, mode, false);
+    struct mp_image *mpi = screenshot_get(mpctx, mode, high_depth);
     if (!mpi)
         return NULL;
-    struct mp_image *res = convert_image(mpi, IMGFMT_BGR0, mpctx->global,
+    struct mp_image *res = convert_image(mpi, format, mpctx->global,
                                          mpctx->log);
     talloc_free(mpi);
     return res;
@@ -435,8 +493,7 @@ void cmd_screenshot_to_file(void *p)
     int mode = cmd->args[1].v.i;
     struct image_writer_opts opts = *mpctx->opts->screenshot_image_opts;
 
-    char *ext = mp_splitext(filename, NULL);
-    int format = image_writer_format_from_ext(ext);
+    int format = image_writer_format_from_ext(mp_get_ext(bstr0(filename)));
     if (format)
         opts.format = format;
     bool high_depth = image_writer_high_depth(&opts);
@@ -446,22 +503,25 @@ void cmd_screenshot_to_file(void *p)
         cmd->success = false;
         return;
     }
-    cmd->success = write_screenshot(cmd, image, filename, &opts);
+    char *path = mp_get_user_path(NULL, mpctx->global, filename);
+    cmd->success = write_screenshot(cmd, image, path, &opts, true);
     talloc_free(image);
+    talloc_free(path);
 }
 
 void cmd_screenshot(void *p)
 {
     struct mp_cmd_ctx *cmd = p;
     struct MPContext *mpctx = cmd->mpctx;
-    int mode = cmd->args[0].v.i & 3;
+    struct mpv_node *res = &cmd->result;
+    int mode = cmd->args[0].v.i & 7;
     bool each_frame_toggle = (cmd->args[0].v.i | cmd->args[1].v.i) & 8;
     bool each_frame_mode = cmd->args[0].v.i & 16;
 
     screenshot_ctx *ctx = mpctx->screenshot_ctx;
 
-    if (mode == MODE_SUBTITLES && osd_get_render_subs_in_filter(mpctx->osd))
-        mode = 0;
+    if ((mode & MODE_SUBTITLES) && osd_get_render_subs_in_filter(mpctx->osd))
+        mode &= ~MODE_SUBTITLES;
 
     if (!each_frame_mode) {
         if (each_frame_toggle) {
@@ -485,8 +545,13 @@ void cmd_screenshot(void *p)
 
     if (image) {
         char *filename = gen_fname(cmd, image_writer_file_ext(opts));
-        if (filename)
-            cmd->success = write_screenshot(cmd, image, filename, NULL);
+        if (filename) {
+            cmd->success = write_screenshot(cmd, image, filename, NULL, false);
+            if (cmd->success) {
+                node_init(res, MPV_FORMAT_NODE_MAP, NULL);
+                node_map_add_string(res, "filename", filename);
+            }
+        }
         talloc_free(filename);
     } else {
         mp_cmd_msg(cmd, MSGL_ERR, "Taking screenshot failed.");
@@ -501,7 +566,14 @@ void cmd_screenshot_raw(void *p)
     struct MPContext *mpctx = cmd->mpctx;
     struct mpv_node *res = &cmd->result;
 
-    struct mp_image *img = screenshot_get_rgb(mpctx, cmd->args[0].v.i);
+    const enum mp_imgfmt formats[] = {IMGFMT_BGR0, IMGFMT_BGRA, IMGFMT_RGBA, IMGFMT_RGBA64};
+    const char *format_names[] = {"bgr0", "bgra", "rgba", "rgba64"};
+    int idx = cmd->args[1].v.i;
+    mp_assert(idx >= 0 && idx <= 3);
+
+    bool high_depth = formats[idx] == IMGFMT_RGBA64;
+    struct mp_image *img = screenshot_get_rgb(mpctx, cmd->args[0].v.i,
+                                              high_depth, formats[idx]);
     if (!img) {
         cmd->success = false;
         return;
@@ -511,7 +583,7 @@ void cmd_screenshot_raw(void *p)
     node_map_add_int64(res, "w", img->w);
     node_map_add_int64(res, "h", img->h);
     node_map_add_int64(res, "stride", img->stride[0]);
-    node_map_add_string(res, "format", "bgr0");
+    node_map_add_string(res, "format", format_names[idx]);
     struct mpv_byte_array *ba =
         node_map_add(res, "data", MPV_FORMAT_BYTE_ARRAY)->u.ba;
     *ba = (struct mpv_byte_array){

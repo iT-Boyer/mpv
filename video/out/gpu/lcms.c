@@ -25,6 +25,8 @@
 #include "stream/stream.h"
 #include "common/common.h"
 #include "misc/bstr.h"
+#include "misc/hash.h"
+#include "misc/io_utils.h"
 #include "common/msg.h"
 #include "options/m_option.h"
 #include "options/path.h"
@@ -46,58 +48,12 @@ struct gl_lcms {
     char *current_profile;
     bool using_memory_profile;
     bool changed;
-    enum mp_csp_prim current_prim;
-    enum mp_csp_trc current_trc;
+    enum pl_color_primaries current_prim;
+    enum pl_color_transfer current_trc;
 
     struct mp_log *log;
     struct mpv_global *global;
     struct mp_icc_opts *opts;
-};
-
-static bool parse_3dlut_size(const char *arg, int *p1, int *p2, int *p3)
-{
-    if (sscanf(arg, "%dx%dx%d", p1, p2, p3) != 3)
-        return false;
-    for (int n = 0; n < 3; n++) {
-        int s = ((int[]) { *p1, *p2, *p3 })[n];
-        if (s < 2 || s > 512)
-            return false;
-    }
-    return true;
-}
-
-static int validate_3dlut_size_opt(struct mp_log *log, const m_option_t *opt,
-                                   struct bstr name, const char **value)
-{
-    struct bstr param = bstr0(*value);
-    int p1, p2, p3;
-    char s[20];
-    snprintf(s, sizeof(s), "%.*s", BSTR_P(param));
-    return parse_3dlut_size(s, &p1, &p2, &p3);
-}
-
-#define OPT_BASE_STRUCT struct mp_icc_opts
-const struct m_sub_options mp_icc_conf = {
-    .opts = (const m_option_t[]) {
-        {"use-embedded-icc-profile", OPT_FLAG(use_embedded)},
-        {"icc-profile", OPT_STRING(profile), .flags = M_OPT_FILE},
-        {"icc-profile-auto", OPT_FLAG(profile_auto)},
-        {"icc-cache-dir", OPT_STRING(cache_dir), .flags = M_OPT_FILE},
-        {"icc-intent", OPT_INT(intent)},
-        {"icc-force-contrast", OPT_CHOICE(contrast, {"no", 0}, {"inf", -1}),
-            M_RANGE(0, 1000000)},
-        {"icc-3dlut-size", OPT_STRING_VALIDATE(size_str, validate_3dlut_size_opt)},
-        {"3dlut-size", OPT_REPLACED("icc-3dlut-size")},
-        {"icc-cache", OPT_REMOVED("see icc-cache-dir")},
-        {"icc-contrast", OPT_REMOVED("see icc-force-contrast")},
-        {0}
-    },
-    .size = sizeof(struct mp_icc_opts),
-    .defaults = &(const struct mp_icc_opts) {
-        .size_str = "64x64x64",
-        .intent = INTENT_RELATIVE_COLORIMETRIC,
-        .use_embedded = true,
-    },
 };
 
 static void lcms2_error_handler(cmsContext ctx, cmsUInt32Number code,
@@ -208,8 +164,8 @@ static bool vid_profile_eq(struct AVBufferRef *a, struct AVBufferRef *b)
 
 // Return whether the profile or config has changed since the last time it was
 // retrieved. If it has changed, gl_lcms_get_lut3d() should be called.
-bool gl_lcms_has_changed(struct gl_lcms *p, enum mp_csp_prim prim,
-                         enum mp_csp_trc trc, struct AVBufferRef *vid_profile)
+bool gl_lcms_has_changed(struct gl_lcms *p, enum pl_color_primaries prim,
+                         enum pl_color_transfer trc, struct AVBufferRef *vid_profile)
 {
     if (p->changed || p->current_prim != prim || p->current_trc != trc)
         return true;
@@ -226,7 +182,7 @@ bool gl_lcms_has_profile(struct gl_lcms *p)
 
 static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
                                    cmsHPROFILE disp_profile,
-                                   enum mp_csp_prim prim, enum mp_csp_trc trc)
+                                   enum pl_color_primaries prim, enum pl_color_transfer trc)
 {
     if (p->opts->use_embedded && p->vid_profile) {
         // Try using the embedded ICC profile
@@ -243,36 +199,41 @@ static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
 
     // The input profile for the transformation is dependent on the video
     // primaries and transfer characteristics
-    struct mp_csp_primaries csp = mp_get_csp_primaries(prim);
-    cmsCIExyY wp_xyY = {csp.white.x, csp.white.y, 1.0};
+    const struct pl_raw_primaries *csp = pl_raw_primaries_get(prim);
+    cmsCIExyY wp_xyY = {csp->white.x, csp->white.y, 1.0};
     cmsCIExyYTRIPLE prim_xyY = {
-        .Red   = {csp.red.x,   csp.red.y,   1.0},
-        .Green = {csp.green.x, csp.green.y, 1.0},
-        .Blue  = {csp.blue.x,  csp.blue.y,  1.0},
+        .Red   = {csp->red.x,   csp->red.y,   1.0},
+        .Green = {csp->green.x, csp->green.y, 1.0},
+        .Blue  = {csp->blue.x,  csp->blue.y,  1.0},
     };
 
     cmsToneCurve *tonecurve[3] = {0};
     switch (trc) {
-    case MP_CSP_TRC_LINEAR:  tonecurve[0] = cmsBuildGamma(cms, 1.0); break;
-    case MP_CSP_TRC_GAMMA18: tonecurve[0] = cmsBuildGamma(cms, 1.8); break;
-    case MP_CSP_TRC_GAMMA20: tonecurve[0] = cmsBuildGamma(cms, 2.0); break;
-    case MP_CSP_TRC_GAMMA22: tonecurve[0] = cmsBuildGamma(cms, 2.2); break;
-    case MP_CSP_TRC_GAMMA24: tonecurve[0] = cmsBuildGamma(cms, 2.4); break;
-    case MP_CSP_TRC_GAMMA26: tonecurve[0] = cmsBuildGamma(cms, 2.6); break;
-    case MP_CSP_TRC_GAMMA28: tonecurve[0] = cmsBuildGamma(cms, 2.8); break;
+    case PL_COLOR_TRC_LINEAR:  tonecurve[0] = cmsBuildGamma(cms, 1.0); break;
+    case PL_COLOR_TRC_GAMMA18: tonecurve[0] = cmsBuildGamma(cms, 1.8); break;
+    case PL_COLOR_TRC_GAMMA20: tonecurve[0] = cmsBuildGamma(cms, 2.0); break;
+    case PL_COLOR_TRC_GAMMA22: tonecurve[0] = cmsBuildGamma(cms, 2.2); break;
+    case PL_COLOR_TRC_GAMMA24: tonecurve[0] = cmsBuildGamma(cms, 2.4); break;
+    case PL_COLOR_TRC_GAMMA26: tonecurve[0] = cmsBuildGamma(cms, 2.6); break;
+    case PL_COLOR_TRC_GAMMA28: tonecurve[0] = cmsBuildGamma(cms, 2.8); break;
 
-    case MP_CSP_TRC_SRGB:
+    case PL_COLOR_TRC_ST428:
+        tonecurve[0] = cmsBuildParametricToneCurve(cms, 2,
+                (double[3]){2.6, pow(52.37/48.0, 1/2.6), 0.0});
+        break;
+
+    case PL_COLOR_TRC_SRGB:
         // Values copied from Little-CMS
         tonecurve[0] = cmsBuildParametricToneCurve(cms, 4,
                 (double[5]){2.40, 1/1.055, 0.055/1.055, 1/12.92, 0.04045});
         break;
 
-    case MP_CSP_TRC_PRO_PHOTO:
+    case PL_COLOR_TRC_PRO_PHOTO:
         tonecurve[0] = cmsBuildParametricToneCurve(cms, 4,
                 (double[5]){1.8, 1.0, 0.0, 1/16.0, 0.03125});
         break;
 
-    case MP_CSP_TRC_BT_1886: {
+    case PL_COLOR_TRC_BT_1886: {
         double src_black[3];
         if (p->opts->contrast < 0) {
             // User requested infinite contrast, return 2.4 profile
@@ -288,10 +249,10 @@ static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
             // function. Relative colorimetric is used since we want to
             // approximate the BT.1886 to the target device's actual black
             // point even in e.g. perceptual mode
-            const int intent = MP_INTENT_RELATIVE_COLORIMETRIC;
+            const int intent = PL_INTENT_RELATIVE_COLORIMETRIC;
             cmsCIEXYZ bp_XYZ;
             if (!cmsDetectBlackPoint(&bp_XYZ, disp_profile, intent, 0))
-                return false;
+                return NULL;
 
             // Map this XYZ value back into the (linear) source space
             cmsHPROFILE rev_profile;
@@ -301,12 +262,12 @@ static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
             cmsHPROFILE xyz_profile = cmsCreateXYZProfile();
             cmsHTRANSFORM xyz2src = cmsCreateTransformTHR(cms,
                     xyz_profile, TYPE_XYZ_DBL, rev_profile, TYPE_RGB_DBL,
-                    intent, 0);
+                    intent, cmsFLAGS_NOCACHE | cmsFLAGS_NOOPTIMIZE);
             cmsFreeToneCurve(linear);
             cmsCloseProfile(rev_profile);
             cmsCloseProfile(xyz_profile);
             if (!xyz2src)
-                return false;
+                return NULL;
 
             cmsDoTransform(xyz2src, &bp_XYZ, src_black, 1);
             cmsDeleteTransform(xyz2src);
@@ -318,7 +279,7 @@ static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
         // Build the parametric BT.1886 transfer curve, one per channel
         for (int i = 0; i < 3; i++) {
             const double gamma = 2.40;
-            double binv = pow(src_black[i], 1.0/gamma);
+            double binv = pow(MPMAX(0, src_black[i]), 1.0/gamma);
             tonecurve[i] = cmsBuildParametricToneCurve(cms, 6,
                     (double[4]){gamma, 1.0 - binv, binv, 0.0});
         }
@@ -330,12 +291,12 @@ static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
     }
 
     if (!tonecurve[0])
-        return false;
+        return NULL;
 
     if (!tonecurve[1]) tonecurve[1] = tonecurve[0];
     if (!tonecurve[2]) tonecurve[2] = tonecurve[0];
 
-    cmsHPROFILE *vid_profile = cmsCreateRGBProfileTHR(cms, &wp_xyY, &prim_xyY,
+    cmsHPROFILE vid_profile = cmsCreateRGBProfileTHR(cms, &wp_xyY, &prim_xyY,
                                                       tonecurve);
 
     if (tonecurve[2] != tonecurve[0]) cmsFreeToneCurve(tonecurve[2]);
@@ -346,7 +307,7 @@ static cmsHPROFILE get_vid_profile(struct gl_lcms *p, cmsContext cms,
 }
 
 bool gl_lcms_get_lut3d(struct gl_lcms *p, struct lut3d **result_lut3d,
-                       enum mp_csp_prim prim, enum mp_csp_trc trc,
+                       enum pl_color_primaries prim, enum pl_color_transfer trc,
                        struct AVBufferRef *vid_profile)
 {
     int s_r, s_g, s_b;
@@ -363,15 +324,20 @@ bool gl_lcms_get_lut3d(struct gl_lcms *p, struct lut3d **result_lut3d,
     if (vid_profile) {
         MP_VERBOSE(p, "Got an embedded ICC profile.\n");
         p->vid_profile = av_buffer_ref(vid_profile);
-        if (!p->vid_profile)
-            abort();
+        MP_HANDLE_OOM(p->vid_profile);
     }
 
-    if (!parse_3dlut_size(p->opts->size_str, &s_r, &s_g, &s_b))
+    if (!gl_parse_3dlut_size(p->opts->size_str, &s_r, &s_g, &s_b))
         return false;
 
     if (!gl_lcms_has_profile(p))
         return false;
+
+    // For simplicity, default to 65x65x65, which is large enough to cover
+    // typical profiles with good accuracy while not being too wasteful
+    s_r = s_r ? s_r : 65;
+    s_g = s_g ? s_g : 65;
+    s_b = s_b ? s_b : 65;
 
     void *tmp = talloc_new(NULL);
     uint16_t *output = talloc_array(tmp, uint16_t, s_r * s_g * s_b * 4);
@@ -379,34 +345,31 @@ bool gl_lcms_get_lut3d(struct gl_lcms *p, struct lut3d **result_lut3d,
     cmsContext cms = NULL;
 
     char *cache_file = NULL;
-    if (p->opts->cache_dir && p->opts->cache_dir[0]) {
+    if (p->opts->cache) {
         // Gamma is included in the header to help uniquely identify it,
         // because we may change the parameter in the future or make it
         // customizable, same for the primaries.
-        char *cache_info = talloc_asprintf(tmp,
-                "ver=1.4, intent=%d, size=%dx%dx%d, prim=%d, trc=%d, "
-                "contrast=%d\n",
-                p->opts->intent, s_r, s_g, s_b, prim, trc, p->opts->contrast);
-
-        uint8_t hash[32];
-        struct AVSHA *sha = av_sha_alloc();
-        if (!sha)
-            abort();
-        av_sha_init(sha, 256);
-        av_sha_update(sha, cache_info, strlen(cache_info));
+        bstr cache_info = {0};
+        bstr_xappend_asprintf(tmp, &cache_info,
+            "ver=1.4, intent=%d, size=%dx%dx%d, prim=%d, trc=%d, "
+            "contrast=%d\n",
+            p->opts->intent, s_r, s_g, s_b, prim, trc, p->opts->contrast);
         if (vid_profile)
-            av_sha_update(sha, vid_profile->data, vid_profile->size);
-        av_sha_update(sha, p->icc_data, p->icc_size);
-        av_sha_final(sha, hash);
-        av_free(sha);
+            bstr_xappend(tmp, &cache_info, (bstr){vid_profile->data, vid_profile->size});
+        bstr_xappend(tmp, &cache_info, (bstr){p->icc_data, p->icc_size});
+        bstr hashstr = mp_hash_to_bstr(tmp, cache_info.start, cache_info.len, "SHA256");
 
-        char *cache_dir = mp_get_user_path(tmp, p->global, p->opts->cache_dir);
-        cache_file = talloc_strdup(tmp, "");
-        for (int i = 0; i < sizeof(hash); i++)
-            cache_file = talloc_asprintf_append(cache_file, "%02X", hash[i]);
-        cache_file = mp_path_join(tmp, cache_dir, cache_file);
+        char *cache_dir = p->opts->cache_dir;
+        if (cache_dir && cache_dir[0]) {
+            cache_dir = mp_get_user_path(tmp, p->global, cache_dir);
+        } else {
+            cache_dir = mp_find_user_file(tmp, p->global, "cache", "");
+        }
 
-        mp_mkdirp(cache_dir);
+        if (cache_dir && cache_dir[0]) {
+            cache_file = mp_path_join_bstr(tmp, bstr0(cache_dir), hashstr);
+            mp_mkdirp(cache_dir);
+        }
     }
 
     // check cache
@@ -441,7 +404,8 @@ bool gl_lcms_get_lut3d(struct gl_lcms *p, struct lut3d **result_lut3d,
     cmsHTRANSFORM trafo = cmsCreateTransformTHR(cms, vid_hprofile, TYPE_RGB_16,
                                                 profile, TYPE_RGBA_16,
                                                 p->opts->intent,
-                                                cmsFLAGS_HIGHRESPRECALC |
+                                                cmsFLAGS_NOCACHE |
+                                                cmsFLAGS_NOOPTIMIZE |
                                                 cmsFLAGS_BLACKPOINTCOMPENSATION);
     cmsCloseProfile(profile);
     cmsCloseProfile(vid_hprofile);
@@ -460,18 +424,16 @@ bool gl_lcms_get_lut3d(struct gl_lcms *p, struct lut3d **result_lut3d,
             }
             size_t base = (b * s_r * s_g + g * s_r) * 4;
             cmsDoTransform(trafo, input, output + base, s_r);
+            // The transform does not write the extra channel
+            for (int r = 0; r < s_r; r++)
+                output[base + r * 4 + 3] = 0;
         }
     }
 
     cmsDeleteTransform(trafo);
 
-    if (cache_file) {
-        FILE *out = fopen(cache_file, "wb");
-        if (out) {
-            fwrite(output, talloc_get_size(output), 1, out);
-            fclose(out);
-        }
-    }
+    if (cache_file)
+        mp_save_to_file(cache_file, output, talloc_get_size(output));
 
 done: ;
 
@@ -498,12 +460,6 @@ error_exit:
 
 #else /* HAVE_LCMS2 */
 
-const struct m_sub_options mp_icc_conf = {
-    .opts = (const m_option_t[]) { {0} },
-    .size = sizeof(struct mp_icc_opts),
-    .defaults = &(const struct mp_icc_opts) {0},
-};
-
 struct gl_lcms *gl_lcms_init(void *talloc_ctx, struct mp_log *log,
                              struct mpv_global *global,
                              struct mp_icc_opts *opts)
@@ -514,8 +470,8 @@ struct gl_lcms *gl_lcms_init(void *talloc_ctx, struct mp_log *log,
 void gl_lcms_update_options(struct gl_lcms *p) { }
 bool gl_lcms_set_memory_profile(struct gl_lcms *p, bstr profile) {return false;}
 
-bool gl_lcms_has_changed(struct gl_lcms *p, enum mp_csp_prim prim,
-                         enum mp_csp_trc trc, struct AVBufferRef *vid_profile)
+bool gl_lcms_has_changed(struct gl_lcms *p, enum pl_color_primaries prim,
+                         enum pl_color_transfer trc, struct AVBufferRef *vid_profile)
 {
     return false;
 }
@@ -526,10 +482,40 @@ bool gl_lcms_has_profile(struct gl_lcms *p)
 }
 
 bool gl_lcms_get_lut3d(struct gl_lcms *p, struct lut3d **result_lut3d,
-                       enum mp_csp_prim prim, enum mp_csp_trc trc,
+                       enum pl_color_primaries prim, enum pl_color_transfer trc,
                        struct AVBufferRef *vid_profile)
 {
     return false;
 }
 
 #endif
+
+static inline OPT_STRING_VALIDATE_FUNC(validate_3dlut_size_opt)
+{
+    int p1, p2, p3;
+    return gl_parse_3dlut_size(*value, &p1, &p2, &p3) ? 0 : M_OPT_INVALID;
+}
+
+#define OPT_BASE_STRUCT struct mp_icc_opts
+const struct m_sub_options mp_icc_conf = {
+    .opts = (const m_option_t[]) {
+        {"use-embedded-icc-profile", OPT_BOOL(use_embedded)},
+        {"icc-profile", OPT_STRING(profile), .flags = M_OPT_FILE},
+        {"icc-profile-auto", OPT_BOOL(profile_auto)},
+        {"icc-cache", OPT_BOOL(cache)},
+        {"icc-cache-dir", OPT_STRING(cache_dir), .flags = M_OPT_FILE},
+        {"icc-intent", OPT_INT(intent)},
+        {"icc-force-contrast", OPT_CHOICE(contrast, {"no", 0}, {"inf", -1}),
+            M_RANGE(0, 1000000)},
+        {"icc-3dlut-size", OPT_STRING_VALIDATE(size_str, validate_3dlut_size_opt)},
+        {"icc-use-luma", OPT_BOOL(icc_use_luma)},
+        {0}
+    },
+    .size = sizeof(struct mp_icc_opts),
+    .defaults = &(const struct mp_icc_opts) {
+        .size_str = "auto",
+        .intent = PL_INTENT_RELATIVE_COLORIMETRIC,
+        .use_embedded = true,
+        .cache = true,
+    },
+};

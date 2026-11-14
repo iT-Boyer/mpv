@@ -214,6 +214,9 @@ It provides following parameters change track metadata:
 ``byterate``
     Number of bytes per second this stream uses. (Purely informational.)
 
+``program_id``
+    Assign this track to a program (integer, default: -1 meaning unset).
+
 ``index``
     The numeric index of the track this should map to (default: -1). This is
     the 0-based index of the virtual stream as seen by the player, enumerating
@@ -287,12 +290,13 @@ This has the following parameters:
     the opened URL are ignored.)
 
 ``codec``
-    The mpv codec name that is expected. Although mpv tries to initialize a
-    decoder with it currently (and will fail track selection if it does not
-    initialize successfully), it is not used for decoding - decoding still uses
-    the information retrieved from opening the actual media information, and may
-    be a different codec (you should try to avoid this, of course). Defaults to
-    ``null``.
+    The mpv codec name or RFC 6381 codec string (e.g. ``avc1.64001F``) that is
+    expected. Although mpv tries to initialize a decoder with it currently (and
+    will fail track selection if it does not initialize successfully), it is
+    not used for decoding - decoding still uses the information retrieved from
+    opening the actual media information, and may be a different codec (you
+    should try to avoid this, of course). Unknown audio and video codecs are
+    ignored. Defaults to ``null``.
 
     Above also applies for similar fields such as ``w``.  These fields are
     mostly to help with user track pre-selection.
@@ -366,8 +370,7 @@ tracks. In this case, it's not obvious, which virtual tracks the EDL show should
 expose when being played.
 
 Currently, mpv will apply an arbitrary heuristic which tracks the EDL file
-should expose. (Before mpv 0.30.0, it always used the first source file in the
-segment list.)
+should expose.
 
 You can set the ``layout`` option to ``this`` to make a specific entry define
 the track layout.

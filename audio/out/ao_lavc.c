@@ -26,15 +26,18 @@
 #include <limits.h>
 
 #include <libavutil/common.h>
+#include <libavutil/samplefmt.h>
 
 #include "config.h"
 #include "options/options.h"
 #include "common/common.h"
 #include "audio/aframe.h"
+#include "audio/chmap_avchannel.h"
 #include "audio/format.h"
 #include "audio/fmt-conversion.h"
 #include "filters/filter_internal.h"
 #include "filters/f_utils.h"
+#include "misc/lavc_compat.h"
 #include "mpv_talloc.h"
 #include "ao.h"
 #include "internal.h"
@@ -63,9 +66,13 @@ static bool write_frame(struct ao *ao, struct mp_frame frame);
 
 static bool supports_format(const AVCodec *codec, int format)
 {
-    for (const enum AVSampleFormat *sampleformat = codec->sample_fmts;
-         sampleformat && *sampleformat != AV_SAMPLE_FMT_NONE;
-         sampleformat++)
+    const enum AVSampleFormat *sampleformat;
+    int ret = mp_avcodec_get_supported_config(NULL, codec,
+                                              AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                                              (const void **)&sampleformat);
+    if (ret >= 0 && !sampleformat)
+        return true;
+    for (; ret >= 0 && *sampleformat != AV_SAMPLE_FMT_NONE; sampleformat++)
     {
         if (af_from_avformat(*sampleformat) == format)
             return true;
@@ -86,22 +93,12 @@ static void select_format(struct ao *ao, const AVCodec *codec)
     }
 }
 
-static void on_ready(void *ptr)
-{
-    struct ao *ao = ptr;
-    struct priv *ac = ao->priv;
-
-    ac->worst_time_base = encoder_get_mux_timebase_unlocked(ac->enc);
-
-    ao_add_events(ao, AO_EVENT_INITIAL_UNBLOCK);
-}
-
 // open & setup audio device
 static int init(struct ao *ao)
 {
     struct priv *ac = ao->priv;
 
-    ac->enc = encoder_context_alloc(ao->encode_lavc_ctx, STREAM_AUDIO, ao->log);
+    ac->enc = mp_encoder_context_alloc(ao->encode_lavc_ctx, STREAM_AUDIO, ao->log);
     if (!ac->enc)
         return -1;
     talloc_steal(ac, ac->enc);
@@ -109,8 +106,14 @@ static int init(struct ao *ao)
     AVCodecContext *encoder = ac->enc->encoder;
     const AVCodec *codec = encoder->codec;
 
-    int samplerate = af_select_best_samplerate(ao->samplerate,
-                                               codec->supported_samplerates);
+    const int *samplerates;
+    int ret = mp_avcodec_get_supported_config(NULL, codec,
+                                              AV_CODEC_CONFIG_SAMPLE_RATE,
+                                              (const void **)&samplerates);
+
+    int samplerate = 0;
+    if (ret >= 0)
+        samplerate = af_select_best_samplerate(ao->samplerate, samplerates);
     if (samplerate > 0)
         ao->samplerate = samplerate;
 
@@ -124,8 +127,7 @@ static int init(struct ao *ao)
     if (!ao_chmap_sel_adjust2(ao, &sel, &ao->channels, false))
         goto fail;
     mp_chmap_reorder_to_lavc(&ao->channels);
-    encoder->channels = ao->channels.num;
-    encoder->channel_layout = mp_chmap_to_lavc(&ao->channels);
+    mp_chmap_to_av_layout(&encoder->ch_layout, &ao->channels);
 
     encoder->sample_fmt = AV_SAMPLE_FMT_NONE;
 
@@ -135,9 +137,10 @@ static int init(struct ao *ao)
     encoder->sample_fmt = af_to_avformat(ao->format);
     encoder->bits_per_raw_sample = ac->sample_size * 8;
 
-    if (!encoder_init_codec_and_muxer(ac->enc, on_ready, ao))
+    if (!mp_encoder_init_codec_and_muxer(ac->enc))
         goto fail;
 
+    ac->worst_time_base = mp_encoder_get_mux_timebase_unlocked(ac->enc);
     ac->pcmhack = 0;
     if (encoder->frame_size <= 1)
         ac->pcmhack = av_get_bits_per_sample(encoder->codec_id) / 8;
@@ -167,7 +170,7 @@ static int init(struct ao *ao)
     return 0;
 
 fail:
-    pthread_mutex_unlock(&ao->encode_lavc_ctx->lock);
+    mp_mutex_unlock(&ao->encode_lavc_ctx->lock);
     ac->shutdown = true;
     return -1;
 }
@@ -176,21 +179,11 @@ fail:
 static void uninit(struct ao *ao)
 {
     struct priv *ac = ao->priv;
-    struct encode_lavc_context *ectx = ao->encode_lavc_ctx;
 
     if (!ac->shutdown) {
-        double outpts = ac->expected_next_pts;
-
-        pthread_mutex_lock(&ectx->lock);
-        if (!ac->enc->options->rawts)
-            outpts += ectx->discontinuity_pts_offset;
-        pthread_mutex_unlock(&ectx->lock);
-
-        outpts += encoder_get_offset(ac->enc);
-
         if (!write_frame(ao, MP_EOF_FRAME))
             MP_WARN(ao, "could not flush last frame\n");
-        encoder_encode(ac->enc, NULL);
+        mp_encoder_encode(ac->enc, NULL);
     }
 
     talloc_free(ac->filter_root);
@@ -204,8 +197,7 @@ static void encode(struct ao *ao, struct mp_aframe *af)
     double outpts = mp_aframe_get_pts(af);
 
     AVFrame *frame = mp_aframe_to_avframe(af);
-    if (!frame)
-        abort();
+    MP_HANDLE_OOM(frame);
 
     frame->pts = rint(outpts * av_q2d(av_inv_q(encoder->time_base)));
 
@@ -225,7 +217,7 @@ static void encode(struct ao *ao, struct mp_aframe *af)
     ac->lastpts = frame_pts;
 
     frame->quality = encoder->global_quality;
-    encoder_encode(ac->enc, frame);
+    mp_encoder_encode(ac->enc, frame);
     av_frame_free(&frame);
 }
 
@@ -266,7 +258,7 @@ static bool audio_write(struct ao *ao, void **data, int samples)
     double outpts = pts;
 
     // for ectx PTS fields
-    pthread_mutex_lock(&ectx->lock);
+    mp_mutex_lock(&ectx->lock);
 
     if (!ectx->options->rawts) {
         // Fix and apply the discontinuity pts offset.
@@ -285,9 +277,6 @@ static bool audio_write(struct ao *ao, void **data, int samples)
         outpts = pts + ectx->discontinuity_pts_offset;
     }
 
-    // Shift pts by the pts offset first.
-    outpts += encoder_get_offset(ac->enc);
-
     // Calculate expected pts of next audio frame (input side).
     ac->expected_next_pts = pts + mp_aframe_get_size(af) / (double) ao->samplerate;
 
@@ -298,7 +287,7 @@ static bool audio_write(struct ao *ao, void **data, int samples)
             ectx->next_in_pts = nextpts;
     }
 
-    pthread_mutex_unlock(&ectx->lock);
+    mp_mutex_unlock(&ectx->lock);
 
     mp_aframe_set_pts(af, outpts);
 
@@ -330,7 +319,6 @@ const struct ao_driver audio_out_lavc = {
     .encode = true,
     .description = "audio encoding using libavcodec",
     .name      = "lavc",
-    .initially_blocked = true,
     .write_frames = true,
     .priv_size = sizeof(struct priv),
     .init      = init,

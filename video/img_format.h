@@ -20,15 +20,10 @@
 
 #include <inttypes.h>
 
+#include "config.h"
 #include "osdep/endian.h"
 #include "misc/bstr.h"
 #include "video/csputils.h"
-
-#if BYTE_ORDER == BIG_ENDIAN
-#define MP_SELECT_LE_BE(LE, BE) BE
-#else
-#define MP_SELECT_LE_BE(LE, BE) LE
-#endif
 
 #define MP_MAX_PLANES 4
 #define MP_NUM_COMPONENTS 4
@@ -152,7 +147,7 @@ struct mp_imgfmt_desc {
 struct mp_imgfmt_desc mp_imgfmt_get_desc(int imgfmt);
 
 // Return the number of component types, or 0 if unknown.
-int mp_imgfmt_desc_get_num_comps(struct mp_imgfmt_desc *desc);
+int mp_imgfmt_desc_get_num_comps(const struct mp_imgfmt_desc *desc);
 
 // For MP_IMGFLAG_PACKED_SS_YUV formats (packed sub-sampled YUV): positions of
 // further luma samples. luma_offsets must be an array of align_x size, and the
@@ -160,9 +155,9 @@ int mp_imgfmt_desc_get_num_comps(struct mp_imgfmt_desc *desc);
 // luma pixel. luma_offsets[0] == mp_imgfmt_desc.comps[0].offset.
 bool mp_imgfmt_get_packed_yuv_locations(int imgfmt, uint8_t *luma_offsets);
 
-// MP_CSP_AUTO for YUV, MP_CSP_RGB or MP_CSP_XYZ otherwise.
+// PL_COLOR_SYSTEM_UNKNOWN for YUV, PL_COLOR_SYSTEM_RGB or PL_COLOR_SYSTEM_XYZ otherwise.
 // (Because IMGFMT/AV_PIX_FMT conflate format and csp for RGB and XYZ.)
-enum mp_csp mp_imgfmt_get_forced_csp(int imgfmt);
+enum pl_color_system mp_imgfmt_get_forced_csp(int imgfmt);
 
 enum mp_component_type {
     MP_COMPONENT_TYPE_UNKNOWN = 0,
@@ -189,7 +184,7 @@ struct mp_regular_imgfmt {
     // See mp_imgfmt_get_forced_csp(). Normally code should use
     // mp_image_params.colors. This field is only needed to map the format
     // unambiguously to FFmpeg formats.
-    enum mp_csp forced_csp;
+    enum pl_color_system forced_csp;
 
     // Size of each component in bytes.
     uint8_t component_size;
@@ -252,6 +247,11 @@ enum mp_imgfmt {
     IMGFMT_BGR24,               // 3 bytes per pixel
     IMGFMT_RGB24,
 
+    IMGFMT_X2RGB10,             // 2pad 10r 10g 10b (MSB to LSB)
+    IMGFMT_X2BGR10,             // 2pad 10b 10g 10r (MSB to LSB)
+
+    IMGFMT_RGBAF16,
+
     // Like e.g. IMGFMT_ARGB, but has a padding byte instead of alpha
     IMGFMT_0RGB,
     IMGFMT_BGR0,
@@ -276,7 +276,6 @@ enum mp_imgfmt {
     IMGFMT_DXVA2,           // IDirect3DSurface9 (NV12/P010/P016)
     IMGFMT_MMAL,            // MMAL_BUFFER_HEADER_T
     IMGFMT_MEDIACODEC,      // AVMediaCodecBuffer
-    IMGFMT_DRMPRIME,        // AVDRMFrameDescriptor
     IMGFMT_CUDA,            // CUDA Buffer
 
     // Not an actual format; base for mpv-specific descriptor table.
@@ -303,9 +302,6 @@ enum mp_imgfmt {
     IMGFMT_411PF,
     IMGFMT_411APF,
 
-    // Accessed with bit-shifts, uint32_t units.
-    IMGFMT_RGB30,               // 2pad 10r 10g 10b (MSB to LSB)
-
     // Fringe formats for fringe RGB format repacking.
     IMGFMT_Y1,      // gray with 1 bit per pixel
     IMGFMT_GBRP1,   // planar RGB with N bits per color component
@@ -319,6 +315,8 @@ enum mp_imgfmt {
     IMGFMT_VDPAU_OUTPUT,    // VdpOutputSurface
     IMGFMT_VAAPI,
     IMGFMT_VIDEOTOOLBOX,    // CVPixelBufferRef
+    IMGFMT_VULKAN,          // VKImage
+    IMGFMT_DRMPRIME,        // AVDRMFrameDescriptor
 
     // Generic pass-through of AV_PIX_FMT_*. Used for formats which don't have
     // a corresponding IMGFMT_ value.
@@ -340,5 +338,7 @@ char **mp_imgfmt_name_list(void);
 
 int mp_imgfmt_select_best(int dst1, int dst2, int src);
 int mp_imgfmt_select_best_list(int *dst, int num_dst, int src);
+bool mp_imgfmt_is_subsampled(enum mp_imgfmt fmt);
+bool mp_imgfmt_is_420_subsampled(enum mp_imgfmt fmt);
 
 #endif /* MPLAYER_IMG_FORMAT_H */

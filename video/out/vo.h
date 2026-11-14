@@ -29,6 +29,8 @@
 #include "video/img_format.h"
 #include "common/common.h"
 #include "options/options.h"
+#include "osdep/threads.h"
+#include "player/clipboard/clipboard.h"
 
 enum {
     // VO needs to redraw
@@ -45,14 +47,11 @@ enum {
     VO_EVENT_LIVE_RESIZING              = 1 << 5,
     // For VOCTRL_GET_HIDPI_SCALE changes.
     VO_EVENT_DPI                        = 1 << 6,
-    // Special thing for encode mode (vo_driver.initially_blocked).
-    // Part of VO_EVENTS_USER to make vo_is_ready_for_frame() work properly.
-    VO_EVENT_INITIAL_UNBLOCK            = 1 << 7,
-    VO_EVENT_FOCUS                      = 1 << 8,
+    VO_EVENT_FOCUS                      = 1 << 7,
 
     // Set of events the player core may be interested in.
     VO_EVENTS_USER = VO_EVENT_RESIZE | VO_EVENT_WIN_STATE | VO_EVENT_DPI |
-                     VO_EVENT_INITIAL_UNBLOCK | VO_EVENT_FOCUS,
+                     VO_EVENT_FOCUS | VO_EVENT_AMBIENT_LIGHTING_CHANGED,
 };
 
 enum mp_voctrl {
@@ -64,9 +63,10 @@ enum mp_voctrl {
     VOCTRL_PAUSE,
     /* start/resume playback */
     VOCTRL_RESUME,
+    /* signal a redraw occurred */
+    VOCTRL_REDRAW,
 
     VOCTRL_SET_PANSCAN,
-    VOCTRL_SET_EQUALIZER,
 
     // Triggered by any change to mp_vo_opts. This is for convenience. In theory,
     // you could install your own listener.
@@ -75,12 +75,7 @@ enum mp_voctrl {
     /* private to vo_gpu */
     VOCTRL_LOAD_HWDEC_API,
 
-    // Redraw the image previously passed to draw_image() (basically, repeat
-    // the previous draw_image call). If this is handled, the OSD should also
-    // be updated and redrawn. Optional; emulated if not available.
-    VOCTRL_REDRAW_FRAME,
-
-    // Only used internally in vo_opengl_cb
+    // Only used internally in vo_libmpv
     VOCTRL_PREINIT,
     VOCTRL_UNINIT,
     VOCTRL_RECONFIG,
@@ -91,6 +86,8 @@ enum mp_voctrl {
     VOCTRL_PERFORMANCE_DATA,            // struct voctrl_performance_data*
 
     VOCTRL_SET_CURSOR_VISIBILITY,       // bool*
+
+    VOCTRL_CONTENT_TYPE,                // enum mp_content_type*
 
     VOCTRL_KILL_SCREENSAVER,
     VOCTRL_RESTORE_SCREENSAVER,
@@ -117,13 +114,32 @@ enum mp_voctrl {
     VOCTRL_UPDATE_RENDER_OPTS,
 
     VOCTRL_GET_ICC_PROFILE,             // bstr*
-    VOCTRL_GET_AMBIENT_LUX,             // int*
+    VOCTRL_GET_AMBIENT_LUX,             // double*
     VOCTRL_GET_DISPLAY_FPS,             // double*
     VOCTRL_GET_HIDPI_SCALE,             // double*
     VOCTRL_GET_DISPLAY_RES,             // int[2]
+    VOCTRL_GET_WINDOW_ID,               // int64_t*
 
-    /* private to vo_gpu */
+    /* private to vo_gpu and vo_gpu_next */
     VOCTRL_EXTERNAL_RESIZE,
+
+    // Begin VO dragging.
+    VOCTRL_BEGIN_DRAGGING,
+
+    // Native context menu
+    VOCTRL_SHOW_MENU,
+    VOCTRL_UPDATE_MENU,
+
+    // Clipboard
+    VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
+    VOCTRL_SET_CLIPBOARD,
+};
+
+// Helper to expose what kind of content is currently playing to the VO.
+enum mp_content_type {
+    MP_CONTENT_NONE, // used for force-window
+    MP_CONTENT_IMAGE,
+    MP_CONTENT_VIDEO,
 };
 
 #define VO_TRUE         true
@@ -137,7 +153,7 @@ struct voctrl_playback_state {
     bool taskbar_progress;
     bool playing;
     bool paused;
-    int percent_pos;
+    uint8_t position;
 };
 
 // VOCTRL_PERFORMANCE_DATA
@@ -151,14 +167,12 @@ struct mp_pass_perf {
 };
 
 #define VO_PASS_PERF_MAX 64
+#define VO_PASS_DESC_MAX_LEN 256
 
 struct mp_frame_perf {
     int count;
     struct mp_pass_perf perf[VO_PASS_PERF_MAX];
-    // The owner of this struct does not have ownership over the names, and
-    // they may change at any time - so this struct should not be stored
-    // anywhere or the results reused
-    char *desc[VO_PASS_PERF_MAX];
+    char desc[VO_PASS_PERF_MAX][VO_PASS_DESC_MAX_LEN];
 };
 
 struct voctrl_performance_data {
@@ -166,8 +180,14 @@ struct voctrl_performance_data {
 };
 
 struct voctrl_screenshot {
-    bool scaled, subs, osd, high_bit_depth;
+    bool scaled, subs, osd, high_bit_depth, native_csp;
     struct mp_image *res;
+};
+
+struct voctrl_clipboard {
+    struct clipboard_data data;
+    struct clipboard_access_params params;
+    void *talloc_ctx;
 };
 
 enum {
@@ -177,9 +197,23 @@ enum {
     VO_CAP_FRAMEDROP    = 1 << 1,
     // VO does not allow frames to be retained (vo_mediacodec_embed).
     VO_CAP_NORETAIN     = 1 << 2,
+    // VO supports applying film grain
+    VO_CAP_FILM_GRAIN   = 1 << 3,
+    // VO is drawn untimed and is never redrawn
+    VO_CAP_UNTIMED      = 1 << 4,
+    // VO is responsible for freeing frames.
+    VO_CAP_FRAMEOWNER   = 1 << 5,
+    // VO does handle mp_image_params.vflip
+    VO_CAP_VFLIP        = 1 << 6,
+};
+
+enum {
+    // Require DR buffers to be host-cached (i.e. fast readback)
+    VO_DR_FLAG_HOST_CACHED = 1 << 0,
 };
 
 #define VO_MAX_REQ_FRAMES 10
+#define VO_MAX_SWAPCHAIN_DEPTH 8
 
 struct vo;
 struct osd_state;
@@ -195,11 +229,11 @@ struct vo_extra {
 };
 
 struct vo_frame {
-    // If > 0, realtime when frame should be shown, in mp_time_us() units.
+    // If > 0, realtime when frame should be shown, in mp_time_ns() units.
     // If 0, present immediately.
     int64_t pts;
-    // Approximate frame duration, in us.
-    int duration;
+    // Approximate frame duration, in ns.
+    double duration;
     // Realtime of estimated distance between 2 vsync events.
     double vsync_interval;
     // "ideal" display time within the vsync
@@ -207,6 +241,10 @@ struct vo_frame {
     // "ideal" frame duration (can be different from num_vsyncs*vsync_interval
     // up to a vsync) - valid for the entire frame, i.e. not changed for repeats
     double ideal_frame_duration;
+    // "ideal" frame vsync point relative to the pts
+    double ideal_frame_vsync;
+    // "ideal" frame duration relative to the pts
+    double ideal_frame_vsync_duration;
     // how often the frame will be repeated (does not include OSD redraws)
     int num_vsyncs;
     // Set if the current frame is repeated from the previous. It's guaranteed
@@ -236,6 +274,8 @@ struct vo_frame {
     // VO if frames are dropped.
     int num_frames;
     struct mp_image *frames[VO_MAX_REQ_FRAMES];
+    // Speed unadjusted, approximate frame duration inferred from past frames
+    double approx_duration;
     // ID for frames[0] (== current). If current==NULL, the number is
     // meaningless. Otherwise, it's an unique ID for the frame. The ID for
     // a frame is guaranteed not to change (instant redraws will use the same
@@ -248,13 +288,13 @@ struct vo_frame {
 // Presentation feedback. See get_vsync() for how backends should fill this
 // struct.
 struct vo_vsync_info {
-    // mp_time_us() timestamp at which the last queued frame will likely be
+    // mp_time_ns() timestamp at which the last queued frame will likely be
     // displayed (this is in the future, unless the frame is instantly output).
-    // -1 if unset or unsupported.
+    // 0 or lower if unset or unsupported.
     // This implies the latency of the output.
     int64_t last_queue_display_time;
 
-    // Time between 2 vsync events in microseconds. The difference should be the
+    // Time between 2 vsync events in nanoseconds. The difference should be the
     // from 2 times sampled from the same reference point (it should not be the
     // difference between e.g. the end of scanout and the start of the next one;
     // it must be continuous).
@@ -278,17 +318,8 @@ struct vo_driver {
     // Encoding functionality, which can be invoked via --o only.
     bool encode;
 
-    // This requires waiting for a VO_EVENT_INITIAL_UNBLOCK event before the
-    // first frame can be sent. Doing vo_reconfig*() calls is allowed though.
-    // Encode mode uses this, the core uses vo_is_ready_for_frame() to
-    // implicitly check for this.
-    bool initially_blocked;
-
     // VO_CAP_* bits
     int caps;
-
-    // Disable video timing, push frames as quickly as possible, never redraw.
-    bool untimed;
 
     const char *name;
     const char *description;
@@ -341,8 +372,10 @@ struct vo_driver {
      * allocated image. It's even possible that only 1 plane uses the buffer
      * allocated by the get_image function. The VO has to check for this.
      *
-     * stride_align is always a value >=1 that is a power of 2. The stride
-     * values of the returned image must be divisible by this value.
+     * stride_align is always a value >=1. The stride values of the returned
+     * image must be divisible by this value. This may be a non power of two.
+     *
+     * flags is a combination of VO_DR_FLAG_* flags.
      *
      * Currently, the returned image must have exactly 1 AVBufferRef set, for
      * internal implementation simplicity.
@@ -351,7 +384,7 @@ struct vo_driver {
      * will silently fallback to a default allocator
      */
     struct mp_image *(*get_image)(struct vo *vo, int imgfmt, int w, int h,
-                                  int stride_align);
+                                  int stride_align, int flags);
 
     /*
      * Thread-safe variant of get_image. Set at most one of these callbacks.
@@ -359,26 +392,20 @@ struct vo_driver {
      * vo_driver.uninit is not called before this function returns.
      */
     struct mp_image *(*get_image_ts)(struct vo *vo, int imgfmt, int w, int h,
-                                     int stride_align);
-
-    /*
-     * Render the given frame to the VO's backbuffer. This operation will be
-     * followed by a draw_osd and a flip_page[_timed] call.
-     * mpi belongs to the VO; the VO must free it eventually.
-     *
-     * This also should draw the OSD.
-     *
-     * Deprecated for draw_frame. A VO should have only either callback set.
-     */
-    void (*draw_image)(struct vo *vo, struct mp_image *mpi);
+                                     int stride_align, int flags);
 
     /* Render the given frame. Note that this is also called when repeating
      * or redrawing frames.
      *
-     * frame is freed by the caller, but the callee can still modify the
+     * frame is freed by the caller if the callee did not assume ownership
+     * of the frames, but in any case the callee can still modify the
      * contained data and references.
+     *
+     * Return false to signal to the core that rendering is being skipped for
+     * this particular frame. vo.c will sleep for the expected duration of that
+     * frame before advancing forward.
      */
-    void (*draw_frame)(struct vo *vo, struct vo_frame *frame);
+    bool (*draw_frame)(struct vo *vo, struct vo_frame *frame);
 
     /*
      * Blit/Flip buffer to the screen. Must be called after each frame!
@@ -407,7 +434,7 @@ struct vo_driver {
      * immediately.
      */
     void (*wakeup)(struct vo *vo);
-    void (*wait_events)(struct vo *vo, int64_t until_time_us);
+    void (*wait_events)(struct vo *vo, int64_t until_time_ns);
 
     /*
      * Closes driver. Should restore the original state of the system.
@@ -438,11 +465,13 @@ struct vo {
     struct mp_log *log; // Using e.g. "[vo/vdpau]" as prefix
     void *priv;
     struct mpv_global *global;
-    struct vo_x11_state *x11;
-    struct vo_w32_state *w32;
-    struct vo_cocoa_state *cocoa;
-    struct vo_wayland_state *wl;
-    struct vo_android_state *android;
+    union {
+        struct vo_x11_state *x11;
+        struct vo_w32_state *w32;
+        struct vo_wayland_state *wl;
+        struct vo_android_state *android;
+        struct vo_drm_state *drm;
+    };
     struct mp_hwdec_devices *hwdec_devs;
     struct input_ctx *input_ctx;
     struct osd_state *osd;
@@ -458,22 +487,39 @@ struct vo {
     //     be accessed unsynchronized (read-only).
 
     int config_ok;      // Last config call was successful?
-    struct mp_image_params *params; // Configured parameters (as in vo_reconfig)
+
+    // --- The following fields are synchronized by params_mutex, most of
+    //     the params are set only in the vo_reconfig and safe to read
+    //     unsynchronized. Some of the parameters are updated in draw_frame,
+    //     which are still safe to read in the play loop, but for correctness
+    //     generic getter is protected by params_mutex.
+    mp_mutex params_mutex;
+    // Configured parameters (changed in vo_reconfig)
+    struct mp_image_params *params;
+    // Whether the VO sets the max_pq_y/avg_pq_y fields on draw_frame.
+    bool has_peak_detect_values;
+    // Target display parameters (VO is responsible for re-/setting)
+    struct mp_image_params *target_params;
 
     // --- The following fields can be accessed only by the VO thread, or from
     //     anywhere _if_ the VO thread is suspended (use vo->dispatch).
 
     struct m_config_cache *opts_cache; // cache for ->opts
     struct mp_vo_opts *opts;
-    struct m_config_cache *gl_opts_cache;
-    struct m_config_cache *eq_opts_cache;
 
     bool want_redraw;   // redraw as soon as possible
+    int64_t previous_redraw_time;
 
     // current window state
     int dwidth;
     int dheight;
     float monitor_par;
+
+    // current GPU context (--vo=gpu and --vo=gpu-next only)
+    const char *context_name;
+
+    // composition swapchain (--d3d11-output-mode=composition only)
+    void *display_swapchain;
 };
 
 struct mpv_global;
@@ -484,8 +530,10 @@ int vo_reconfig2(struct vo *vo, struct mp_image *img);
 int vo_control(struct vo *vo, int request, void *data);
 void vo_control_async(struct vo *vo, int request, void *data);
 bool vo_is_ready_for_frame(struct vo *vo, int64_t next_pts);
+bool vo_is_visible(struct vo *vo);
 void vo_queue_frame(struct vo *vo, struct vo_frame *frame);
 void vo_wait_frame(struct vo *vo);
+void vo_wait_on_vo(struct vo *vo, bool wait);
 bool vo_still_displaying(struct vo *vo);
 void vo_request_wakeup_on_done(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
@@ -501,17 +549,20 @@ void vo_query_formats(struct vo *vo, uint8_t *list);
 void vo_event(struct vo *vo, int event);
 int vo_query_and_reset_events(struct vo *vo, int events);
 struct mp_image *vo_get_current_frame(struct vo *vo);
-void vo_set_queue_params(struct vo *vo, int64_t offset_us, int num_req_frames);
+void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
+                         int num_frame_refs);
 int vo_get_num_req_frames(struct vo *vo);
-int64_t vo_get_vsync_interval(struct vo *vo);
+int vo_get_num_frame_refs(struct vo *vo);
+double vo_get_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_interval(struct vo *vo);
 double vo_get_estimated_vsync_jitter(struct vo *vo);
 double vo_get_display_fps(struct vo *vo);
+void * vo_get_display_swapchain(struct vo *vo);
 double vo_get_delay(struct vo *vo);
 void vo_discard_timing_info(struct vo *vo);
 struct vo_frame *vo_get_current_vo_frame(struct vo *vo);
 struct mp_image *vo_get_image(struct vo *vo, int imgfmt, int w, int h,
-                              int stride_align);
+                              int stride_align, int flags);
 
 void vo_wakeup(struct vo *vo);
 void vo_wait_default(struct vo *vo, int64_t until_time);
@@ -527,5 +578,8 @@ void vo_get_src_dst_rects(struct vo *vo, struct mp_rect *out_src,
                           struct mp_rect *out_dst, struct mp_osd_res *out_osd);
 
 struct vo_frame *vo_frame_ref(struct vo_frame *frame);
+
+struct mp_image_params vo_get_current_params(struct vo *vo);
+struct mp_image_params vo_get_target_params(struct vo *vo);
 
 #endif /* MPLAYER_VIDEO_OUT_H */

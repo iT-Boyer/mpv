@@ -90,7 +90,7 @@ static bool android_init(struct ra_ctx *ctx)
 
     mpegl_load_functions(&p->gl, ctx->log);
 
-    struct ra_gl_ctx_params params = {
+    struct ra_ctx_params params = {
         .swap_buffers = android_swap_buffers,
     };
 
@@ -109,6 +109,13 @@ static bool android_reconfig(struct ra_ctx *ctx)
     if (!vo_android_surface_size(ctx->vo, &w, &h))
         return false;
 
+    // Update window geometry to prevent screen tearing
+    ANativeWindow *native_window = vo_android_native_window(ctx->vo);
+    if (native_window) {
+        int32_t current_format = ANativeWindow_getFormat(native_window);
+        ANativeWindow_setBuffersGeometry(native_window, w, h, current_format);
+    }
+
     ctx->vo->dwidth = w;
     ctx->vo->dheight = h;
     ra_gl_ctx_resize(ctx->swapchain, w, h, 0);
@@ -123,6 +130,7 @@ static int android_control(struct ra_ctx *ctx, int *events, int request, void *a
 const struct ra_ctx_fns ra_ctx_android = {
     .type           = "opengl",
     .name           = "android",
+    .description    = "Android/EGL",
     .reconfig       = android_reconfig,
     .control        = android_control,
     .init           = android_init,

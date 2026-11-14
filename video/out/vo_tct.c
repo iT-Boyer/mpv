@@ -16,7 +16,6 @@
  */
 
 #include <stdio.h>
-#include <unistd.h>
 #include <config.h>
 
 #if HAVE_POSIX
@@ -30,6 +29,7 @@
 #include "osdep/terminal.h"
 #include "vo.h"
 #include "sub/osd.h"
+#include "terminal_swapchain.h"
 #include "video/sws_utils.h"
 #include "video/mp_image.h"
 
@@ -37,44 +37,38 @@
 
 #define ALGO_PLAIN 1
 #define ALGO_HALF_BLOCKS 2
-#define ESC_HIDE_CURSOR "\033[?25l"
-#define ESC_RESTORE_CURSOR "\033[?25h"
-#define ESC_CLEAR_SCREEN "\033[2J"
-#define ESC_CLEAR_COLORS "\033[0m"
-#define ESC_GOTOXY "\033[%d;%df"
-#define ESC_COLOR_BG "\033[48;2;%d;%d;%dm"
-#define ESC_COLOR_FG "\033[38;2;%d;%d;%dm"
-#define ESC_COLOR256_BG "\033[48;5;%dm"
-#define ESC_COLOR256_FG "\033[38;5;%dm"
+
 #define DEFAULT_WIDTH 80
 #define DEFAULT_HEIGHT 25
 
-struct vo_tct_opts {
-    int algo;
-    int width;   // 0 -> default
-    int height;  // 0 -> default
-    int term256;  // 0 -> true color
+static const bstr TERM_ESC_COLOR256_BG     = bstr0_lit("\033[48;5");
+static const bstr TERM_ESC_COLOR256_FG     = bstr0_lit("\033[38;5");
+static const bstr TERM_ESC_COLOR24BIT_BG   = bstr0_lit("\033[48;2");
+static const bstr TERM_ESC_COLOR24BIT_FG   = bstr0_lit("\033[38;2");
+
+static const bstr UNICODE_LOWER_HALF_BLOCK = bstr0_lit("\xe2\x96\x84");
+
+enum vo_tct_buffering {
+    VO_TCT_BUFFER_PIXEL,
+    VO_TCT_BUFFER_LINE,
+    VO_TCT_BUFFER_FRAME
 };
 
-#define OPT_BASE_STRUCT struct vo_tct_opts
-static const struct m_sub_options vo_tct_conf = {
-    .opts = (const m_option_t[]) {
-        {"vo-tct-algo", OPT_CHOICE(algo,
-            {"plain", ALGO_PLAIN},
-            {"half-blocks", ALGO_HALF_BLOCKS})},
-        {"vo-tct-width", OPT_INT(width)},
-        {"vo-tct-height", OPT_INT(height)},
-        {"vo-tct-256", OPT_FLAG(term256)},
-        {0}
-    },
-    .defaults = &(const struct vo_tct_opts) {
-        .algo = ALGO_HALF_BLOCKS,
-    },
-    .size = sizeof(struct vo_tct_opts),
+struct vo_tct_opts {
+    int algo;
+    int buffering;
+    int width;   // 0 -> default
+    int height;  // 0 -> default
+    bool term256;  // 0 -> true color
+};
+
+struct lut_item {
+    char str[4];
+    uint8_t width;
 };
 
 struct priv {
-    struct vo_tct_opts *opts;
+    struct vo_tct_opts opts;
     size_t buffer_size;
     int swidth;
     int sheight;
@@ -82,6 +76,8 @@ struct priv {
     struct mp_rect src;
     struct mp_rect dst;
     struct mp_sws_context *sws;
+    struct terminal_swapchain *swapchain;
+    struct lut_item lut[256];
 };
 
 // Convert RGB24 to xterm-256 8-bit value
@@ -113,47 +109,63 @@ static int rgb_to_x256(uint8_t r, uint8_t g, uint8_t b)
     return color_err <= gray_err ? 16 + color_index() : 232 + gray_index;
 }
 
-static void write_plain(
+static void print_seq3(bstr *frame, struct lut_item *lut, bstr prefix,
+                       uint8_t r, uint8_t g, uint8_t b)
+{
+    bstr_xappend(NULL, frame, prefix);
+    bstr_xappend(NULL, frame, (bstr){ lut[r].str, lut[r].width });
+    bstr_xappend(NULL, frame, (bstr){ lut[g].str, lut[g].width });
+    bstr_xappend(NULL, frame, (bstr){ lut[b].str, lut[b].width });
+    bstr_xappend0(NULL, frame, "m");
+}
+
+static void print_seq1(bstr *frame, struct lut_item *lut, bstr prefix, uint8_t c)
+{
+    bstr_xappend(NULL, frame, prefix);
+    bstr_xappend(NULL, frame, (bstr){ lut[c].str, lut[c].width });
+    bstr_xappend0(NULL, frame, "m");
+}
+
+static void write_plain(bstr *frame,
     const int dwidth, const int dheight,
     const int swidth, const int sheight,
     const unsigned char *source, const int source_stride,
-    bool term256)
+    bool term256, struct lut_item *lut)
 {
-    assert(source);
+    mp_assert(source);
     const int tx = (dwidth - swidth) / 2;
     const int ty = (dheight - sheight) / 2;
     for (int y = 0; y < sheight; y++) {
         const unsigned char *row = source + y * source_stride;
-        printf(ESC_GOTOXY, ty + y, tx);
+        bstr_xappend_asprintf(NULL, frame, TERM_ESC_GOTO_YX, ty + y + 1, tx + 1);
         for (int x = 0; x < swidth; x++) {
             unsigned char b = *row++;
             unsigned char g = *row++;
             unsigned char r = *row++;
             if (term256) {
-                printf(ESC_COLOR256_BG, rgb_to_x256(r, g, b));
+                print_seq1(frame, lut, TERM_ESC_COLOR256_BG, rgb_to_x256(r, g, b));
             } else {
-                printf(ESC_COLOR_BG, r, g, b);
+                print_seq3(frame, lut, TERM_ESC_COLOR24BIT_BG, r, g, b);
             }
-            printf(" ");
+            bstr_xappend0(NULL, frame, " ");
         }
-        printf(ESC_CLEAR_COLORS);
+        bstr_xappend0(NULL, frame, TERM_ESC_CLEAR_COLORS);
     }
-    printf("\n");
 }
 
-static void write_half_blocks(
+static void write_half_blocks(bstr *frame,
     const int dwidth, const int dheight,
     const int swidth, const int sheight,
     unsigned char *source, int source_stride,
-    bool term256)
+    bool term256, struct lut_item *lut)
 {
-    assert(source);
+    mp_assert(source);
     const int tx = (dwidth - swidth) / 2;
     const int ty = (dheight - sheight) / 2;
     for (int y = 0; y < sheight * 2; y += 2) {
         const unsigned char *row_up = source + y * source_stride;
         const unsigned char *row_down = source + (y + 1) * source_stride;
-        printf(ESC_GOTOXY, ty + y / 2, tx);
+        bstr_xappend_asprintf(NULL, frame, TERM_ESC_GOTO_YX, ty + y / 2 + 1, tx + 1);
         for (int x = 0; x < swidth; x++) {
             unsigned char b_up = *row_up++;
             unsigned char g_up = *row_up++;
@@ -162,17 +174,16 @@ static void write_half_blocks(
             unsigned char g_down = *row_down++;
             unsigned char r_down = *row_down++;
             if (term256) {
-                printf(ESC_COLOR256_BG, rgb_to_x256(r_up, g_up, b_up));
-                printf(ESC_COLOR256_FG, rgb_to_x256(r_down, g_down, b_down));
+                print_seq1(frame, lut, TERM_ESC_COLOR256_BG, rgb_to_x256(r_up, g_up, b_up));
+                print_seq1(frame, lut, TERM_ESC_COLOR256_FG, rgb_to_x256(r_down, g_down, b_down));
             } else {
-                printf(ESC_COLOR_BG, r_up, g_up, b_up);
-                printf(ESC_COLOR_FG, r_down, g_down, b_down);
+                print_seq3(frame, lut, TERM_ESC_COLOR24BIT_BG, r_up, g_up, b_up);
+                print_seq3(frame, lut, TERM_ESC_COLOR24BIT_FG, r_down, g_down, b_down);
             }
-            printf("\xe2\x96\x84");  // UTF8 bytes of U+2584 (lower half block)
+            bstr_xappend(NULL, frame, UNICODE_LOWER_HALF_BLOCK);
         }
-        printf(ESC_CLEAR_COLORS);
+        bstr_xappend0(NULL, frame, TERM_ESC_CLEAR_COLORS);
     }
-    printf("\n");
 }
 
 static void get_win_size(struct vo *vo, int *out_width, int *out_height) {
@@ -182,10 +193,12 @@ static void get_win_size(struct vo *vo, int *out_width, int *out_height) {
 
     terminal_get_size(out_width, out_height);
 
-    if (p->opts->width > 0)
-        *out_width = p->opts->width;
-    if (p->opts->height > 0)
-        *out_height = p->opts->height;
+    if (p->opts.width > 0)
+        *out_width = p->opts.width;
+    if (p->opts.height > 0)
+        *out_height = p->opts.height;
+    // The bottom row is left to the status line.
+    *out_height = MPMAX(*out_height - 1, 1);
 }
 
 static int reconfig(struct vo *vo, struct mp_image_params *params)
@@ -193,6 +206,14 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
     struct priv *p = vo->priv;
 
     get_win_size(vo, &vo->dwidth, &vo->dheight);
+
+    // Fit the video to the cell aspect the terminal reports, 2:1 as a fallback.
+    int rows = 0, cols = 0, px_w = 0, px_h = 0;
+    terminal_get_size2(&rows, &cols, &px_w, &px_h);
+    double par = 2;
+    if (rows > 0 && cols > 0 && px_w > 0 && px_h > 0)
+        par = ((double)px_h / rows) / ((double)px_w / cols);
+    vo->monitor_par = vo->opts->monitor_pixel_aspect * par;
 
     struct mp_osd_res osd;
     vo_get_src_dst_rects(vo, &p->src, &p->dst, &osd);
@@ -208,69 +229,104 @@ static int reconfig(struct vo *vo, struct mp_image_params *params)
         .p_h = 1,
     };
 
-    const int mul = (p->opts->algo == ALGO_PLAIN ? 1 : 2);
+    const int mul = (p->opts.algo == ALGO_PLAIN ? 1 : 2);
     if (p->frame)
         talloc_free(p->frame);
     p->frame = mp_image_alloc(IMGFMT, p->swidth, p->sheight * mul);
     if (!p->frame)
         return -1;
 
+    mp_image_clear(p->frame, 0, 0, p->frame->w, p->frame->h);
+
     if (mp_sws_reinit(p->sws) < 0)
         return -1;
 
-    printf(ESC_HIDE_CURSOR);
-    printf(ESC_CLEAR_SCREEN);
+    bstr_xappend(NULL, terminal_swapchain_next(p->swapchain),
+                 (bstr)bstr0_lit(TERM_ESC_CLEAR_SCREEN));
+
     vo->want_redraw = true;
     return 0;
 }
 
-static void draw_image(struct vo *vo, mp_image_t *mpi)
+static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
-    struct mp_image src = *mpi;
+    struct mp_image *src = frame->current;
+    if (!src)
+        goto done;
     // XXX: pan, crop etc.
-    mp_sws_scale(p->sws, p->frame, &src);
-    talloc_free(mpi);
+    mp_sws_scale(p->sws, p->frame, src);
+
+done:
+    return VO_TRUE;
 }
 
 static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
-    if (p->opts->algo == ALGO_PLAIN) {
-        write_plain(
-            vo->dwidth, vo->dheight, p->swidth, p->sheight,
-            p->frame->planes[0], p->frame->stride[0],
-            p->opts->term256);
-    } else {
-        write_half_blocks(
-            vo->dwidth, vo->dheight, p->swidth, p->sheight,
-            p->frame->planes[0], p->frame->stride[0],
-            p->opts->term256);
+
+    if (terminal_swapchain_size_changed(p->swapchain)) {
+        int width, height;
+        get_win_size(vo, &width, &height);
+        if (vo->dwidth != width || vo->dheight != height)
+            reconfig(vo, vo->params);
     }
-    fflush(stdout);
+
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    bstr_xappend0(NULL, out, TERM_ESC_SYNC_UPDATE_BEGIN);
+    if (p->opts.algo == ALGO_PLAIN) {
+        write_plain(out,
+            vo->dwidth, vo->dheight, p->swidth, p->sheight,
+            p->frame->planes[0], p->frame->stride[0],
+            p->opts.term256, p->lut);
+    } else {
+        write_half_blocks(out,
+            vo->dwidth, vo->dheight, p->swidth, p->sheight,
+            p->frame->planes[0], p->frame->stride[0],
+            p->opts.term256, p->lut);
+    }
+    bstr_xappend_asprintf(NULL, out, TERM_ESC_GOTO_YX, vo->dheight + 1, 1);
+    bstr_xappend0(NULL, out, TERM_ESC_SYNC_UPDATE_END);
+    terminal_swapchain_present(p->swapchain, out);
 }
 
 static void uninit(struct vo *vo)
 {
-    printf(ESC_RESTORE_CURSOR);
-    printf(ESC_CLEAR_SCREEN);
-    printf(ESC_GOTOXY, 0, 0);
     struct priv *p = vo->priv;
-    if (p->frame)
-        talloc_free(p->frame);
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_RESTORE_CURSOR));
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_NORMAL_SCREEN));
+    terminal_swapchain_present(p->swapchain, out);
+    terminal_set_mouse_input(false);
+    terminal_swapchain_destroy(p->swapchain);
+    talloc_free(p->frame);
 }
 
 static int preinit(struct vo *vo)
 {
-    // most terminal characters aren't 1:1, so we default to 2:1.
-    // if user passes their own value of choice, it'll be scaled accordingly.
-    vo->monitor_par = vo->opts->monitor_pixel_aspect * 2;
-
     struct priv *p = vo->priv;
-    p->opts = mp_get_config_group(vo, vo->global, &vo_tct_conf);
     p->sws = mp_sws_alloc(vo);
     p->sws->log = vo->log;
     mp_sws_enable_cmdline_opts(p->sws, vo->global);
+
+    for (int i = 0; i < MP_ARRAY_SIZE(p->lut); ++i) {
+        char* out = p->lut[i].str;
+        *out++ = ';';
+        if (i >= 100)
+            *out++ = '0' + (i / 100);
+        if (i >= 10)
+            *out++ = '0' + ((i / 10) % 10);
+        *out++ = '0' + (i % 10);
+        p->lut[i].width = out - p->lut[i].str;
+    }
+
+    p->swapchain = terminal_swapchain_create(vo);
+    bstr *out = terminal_swapchain_acquire(p->swapchain);
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_HIDE_CURSOR));
+    bstr_xappend(NULL, out, (bstr)bstr0_lit(TERM_ESC_ALT_SCREEN));
+    terminal_swapchain_present(p->swapchain, out);
+    terminal_set_mouse_input(true);
+
     return 0;
 }
 
@@ -281,8 +337,15 @@ static int query_format(struct vo *vo, int format)
 
 static int control(struct vo *vo, uint32_t request, void *data)
 {
+    struct priv *p = vo->priv;
+    if (request == VOCTRL_CHECK_EVENTS) {
+        terminal_swapchain_check_events(p->swapchain);
+        return VO_TRUE;
+    }
     return VO_NOTIMPL;
 }
+
+#define OPT_BASE_STRUCT struct priv
 
 const struct vo_driver video_out_tct = {
     .name = "tct",
@@ -291,9 +354,27 @@ const struct vo_driver video_out_tct = {
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    .draw_image = draw_image,
+    .draw_frame = draw_frame,
     .flip_page = flip_page,
     .uninit = uninit,
     .priv_size = sizeof(struct priv),
-    .global_opts = &vo_tct_conf,
+    .priv_defaults = &(const struct priv) {
+        .opts.algo = ALGO_HALF_BLOCKS,
+        .opts.buffering = VO_TCT_BUFFER_LINE,
+    },
+    .options = (const m_option_t[]) {
+        {"algo", OPT_CHOICE(opts.algo,
+            {"plain", ALGO_PLAIN},
+            {"half-blocks", ALGO_HALF_BLOCKS})},
+        {"width", OPT_INT(opts.width)},
+        {"height", OPT_INT(opts.height)},
+        {"256", OPT_BOOL(opts.term256)},
+        {"buffering", OPT_CHOICE(opts.buffering,
+            {"pixel", VO_TCT_BUFFER_PIXEL},
+            {"line", VO_TCT_BUFFER_LINE},
+            {"frame", VO_TCT_BUFFER_FRAME}),
+            .deprecation_message = "frames are written in one piece"},
+        {0}
+    },
+    .options_prefix = "vo-tct",
 };

@@ -23,6 +23,8 @@ The exact syntax is:
     See the ``vf`` command (and ``toggle`` sub-command) for further explanations
     and examples.
 
+    This is an object settings list option. See `List Options`_ for details.
+
     The general filter entry syntax is:
 
         ``["@"<label-name>":"] ["!"] <filter-name> [ "=" <filter-parameter-list> ]``
@@ -33,7 +35,7 @@ The exact syntax is:
 
     and the ``filter-parameter-list``:
 
-        ``<filter-parameter> | <filter-parameter> "," <filter-parameter-list>``
+        ``<filter-parameter> | <filter-parameter> ":" <filter-parameter-list>``
 
     and ``filter-parameter``:
 
@@ -44,23 +46,21 @@ The exact syntax is:
     the ``lavfi`` filter, which uses a very similar syntax as mpv (MPlayer
     historically) to specify filters and their parameters.
 
+.. note::
+
+    ``--vf`` can only take a single track as input, even if the filter supports
+    dynamic input. Filters that require multiple inputs can't be used.
+    Use ``--lavfi-complex`` for such a use case. This also applies for ``--af``.
+
 Filters can be manipulated at run time. You can use ``@`` labels as described
 above in combination with the ``vf`` command (see `COMMAND INTERFACE`_) to get
 more control over this. Initially disabled filters with ``!`` are useful for
 this as well.
 
-You can also set defaults for each filter. The defaults are applied before the
-normal filter parameters. This is deprecated and never worked for the
-libavfilter bridge.
-
-``--vf-defaults=<filter1[=parameter1:parameter2:...],filter2,...>``
-    Set defaults for each filter. (Deprecated. ``--af-defaults`` is deprecated
-    as well.)
-
 .. note::
 
     To get a full list of available video filters, see ``--vf=help`` and
-    http://ffmpeg.org/ffmpeg-filters.html .
+    https://ffmpeg.org/ffmpeg-filters.html .
 
     Also, keep in mind that most actual filters are available via the ``lavfi``
     wrapper, which gives you access to most of libavfilter's filters. This
@@ -105,15 +105,10 @@ filter list.
     compared. (Passing multiple filters is currently still possible, but
     deprecated.)
 
-``-vf-toggle=filter``
+``--vf-toggle=filter``
     Add the given filter to the list if it was not present yet, or remove it
     from the list if it was present. Matching of filters works as described in
     ``--vf-remove``.
-
-``--vf-del=filter``
-    Sort of like ``--vf-remove``, but also accepts an index number. Index
-    numbers start at 0, negative numbers address the end of the list (-1 is the
-    last). Deprecated.
 
 ``--vf-clr``
     Completely empties the filter list.
@@ -141,6 +136,11 @@ Available mpv-only filters are:
 
             For a list of available formats, use ``--vf=format=fmt=help``.
 
+        .. note::
+
+            Conversion between hardware formats is supported in some cases.
+            eg: ``cuda`` to ``vulkan``, or ``vaapi`` to ``vulkan``.
+
     ``<convert=yes|no>``
         Force conversion of color parameters (default: no).
 
@@ -163,6 +163,9 @@ Available mpv-only filters are:
 
         If input and output video parameters are the same, conversion is always
         skipped.
+
+        When converting between hardware formats, this parameter has no effect,
+        and the only conversion that is done is the format conversion.
 
         .. admonition:: Examples
 
@@ -191,7 +194,7 @@ Available mpv-only filters are:
         space if the system video driver supports it, but not input and output
         levels. The ``scale`` video filter can configure color space and input
         levels, but only if the output format is RGB (if the video output driver
-        supports RGB output, you can force this with ``-vf scale,format=rgba``).
+        supports RGB output, you can force this with ``--vf=scale,format=rgba``).
 
         If this option is set to ``auto`` (which is the default), the video's
         color space flag will be used. If that flag is unset, the color space
@@ -203,10 +206,13 @@ Available mpv-only filters are:
         Available color spaces are:
 
         :auto:          automatic selection (default)
-        :bt.601:        ITU-R BT.601 (SD)
-        :bt.709:        ITU-R BT.709 (HD)
-        :bt.2020-ncl:   ITU-R BT.2020 non-constant luminance system
-        :bt.2020-cl:    ITU-R BT.2020 constant luminance system
+        :bt.601:        ITU-R Rec. BT.601 (SD)
+        :bt.709:        ITU-R Rec. BT.709 (HD)
+        :bt.2020-ncl:   ITU-R Rec. BT.2020 (non-constant luminance)
+        :bt.2020-cl:    ITU-R Rec. BT.2020 (constant luminance)
+        :bt.2100-pq:    ITU-R Rec. BT.2100 ICtCp PQ variant
+        :bt.2100-hlg:   ITU-R Rec. BT.2100 ICtCp HLG variant
+        :dolbyvision:   Dolby Vision
         :smpte-240m:    SMPTE-240M
 
     ``<colorlevels>``
@@ -239,7 +245,8 @@ Available mpv-only filters are:
         corresponding primaries are used. Otherwise, if the video height is
         exactly 576 (PAL), BT.601-625 is used. If it's exactly 480 or 486 (NTSC),
         BT.601-525 is used. If the video resolution is anything else, BT.709 is
-        used.
+        used. Untagged XYZ content is decoded into DCI-P3, or into BT.2020
+        when its transfer is linear light.
 
         Available primaries are:
 
@@ -255,15 +262,15 @@ Available mpv-only filters are:
         :dci-p3:       DCI-P3 (Digital Cinema)
         :v-gamut:      Panasonic V-Gamut primaries
 
-    ``<gamma>``
-       Gamma function the source file was encoded with. Normally this should be set
+    ``<transfer>`` or ``<gamma>``
+       Transfer function the source file was encoded with. Normally this should be set
        in the file header, but when playing broken or mistagged files this can be
        used to override the setting.
 
        This option only affects video output drivers that perform color management.
 
        If this option is set to ``auto`` (which is the default), the gamma will
-       be set to BT.1886 for YCbCr content, sRGB for RGB content and Linear for
+       be set to BT.1886 for YCbCr content, sRGB for RGB content and st428 for
        XYZ content.
 
        Available gamma functions are:
@@ -284,6 +291,7 @@ Available mpv-only filters are:
        :v-log:        Panasonic V-Log transfer curve
        :s-log1:       Sony S-Log1 transfer curve
        :s-log2:       Sony S-Log2 transfer curve
+       :st428:        Digital Cinema Distribution Master (XYZ)
 
     ``<sig-peak>``
         Reference peak illumination for the video file, relative to the
@@ -308,14 +316,54 @@ Available mpv-only filters are:
        :709-1886:     Scene-referred using the BT709+BT1886 interaction
        :gamma1.2:     Scene-referred using a pure power OOTF (gamma=1.2)
 
+    ``<dolbyvision=yes|no>``
+        Whether or not to include Dolby Vision metadata (default: yes). If
+        disabled, any Dolby Vision metadata will be stripped from frames.
+
+    ``<hdr10plus=yes|no>``
+        Whether or not to include HDR10+ metadata (default: yes). If
+        disabled, any HDR10+ metadata will be stripped from frames.
+
+    ``<enhancement-layer=yes|no>``
+        Whether or not to apply the image enhancement layer (default: yes).
+        If disabled, the enhancement-layer frame paired with each base-layer
+        frame is discarded. Currently this controls Dolby Vision Profile 7 FEL
+        application.
+
+    ``<min-luma>``
+        Set the minimum luminance value for the mastering display metadata.
+        This is a float value in nits (cd/m²).
+
+        .. note::
+
+            0.0 means undefined, which is the default. To set 0.0 as actual value,
+            use a very small value like 1e-6.
+
+    ``<max-luma>``
+        Set the maximum luminance value for the mastering display metadata.
+        This is a float value in nits (cd/m²).
+
+    ``<max_cll>``
+        Set the maximum content light level for the mastering display
+        metadata. This is a float value in nits (cd/m²).
+
+    ``<max_fall>``
+        Set the maximum frame-average light level for the mastering
+        display metadata. This is a float value in nits (cd/m²).
+
+    ``<film-grain=yes|no>``
+        Whether or not to include film grain metadata (default: yes). If
+        disabled, any film grain metadata will be stripped from frames.
+
+    ``<chroma-location>``
+        Set the chroma loc of the video. Use
+        ``--vf=format:chroma-location=help`` to list all available modes.
+
     ``<stereo-in>``
         Set the stereo mode the video is assumed to be encoded in. Use
         ``--vf=format:stereo-in=help`` to list all available modes. Check with
-        the ``stereo3d`` filter documentation to see what the names mean.
-
-    ``<stereo-out>``
-        Set the stereo mode the video should be displayed as. Takes the
-        same values as the ``stereo-in`` option.
+        the ``stereo3d`` filter documentation to see what the names mean. The
+        default ``no`` keeps the mode signaled by the source.
 
     ``<rotate>``
         Set the rotation the video is assumed to be encoded with in degrees.
@@ -339,13 +387,14 @@ Available mpv-only filters are:
         Force a specific scaler backend, if applicable. This is a debug option
         and could go away any time.
 
-    ``<alpha=auto|straight|premul>``
+    ``<alpha=auto|straight|premul|none>``
         Set the kind of alpha the video uses. Undefined effect if the image
         format has no alpha channel (could be ignored or cause an error,
         depending on how mpv internals evolve). Setting this may or may not
         cause downstream image processing to treat alpha differently, depending
         on support. With ``convert`` and zimg used, this will convert the alpha.
         libswscale and other FFmpeg components completely ignore this.
+        ``none`` is available only starting from libplacebo vN.344.0.
 
 ``lavfi=graph[:sws-flags[:o=opts]]``
     Filter video using FFmpeg's libavfilter.
@@ -389,7 +438,7 @@ Available mpv-only filters are:
         option gives the flags which should be passed to libswscale. This
         option is numeric and takes a bit-wise combination of ``SWS_`` flags.
 
-        See ``http://git.videolan.org/?p=ffmpeg.git;a=blob;f=libswscale/swscale.h``.
+        See ``https://git.videolan.org/?p=ffmpeg.git;a=blob;f=libswscale/swscale.h``.
 
     ``<o>``
         Set AVFilterGraph options. These should be documented by FFmpeg.
@@ -417,7 +466,7 @@ Available mpv-only filters are:
             subtitle colors and video under the influence of the video equalizer
             settings.
 
-``vapoursynth=file:buffered-frames:concurrent-frames``
+``vapoursynth=file:buffered-frames:concurrent-frames:user-data``
     Loads a VapourSynth filter script. This is intended for streamed
     processing: mpv actually provides a source filter, instead of using a
     native VapourSynth video source. The mpv source will answer frame
@@ -457,7 +506,7 @@ Available mpv-only filters are:
             ::
 
                 import vapoursynth as vs
-                core = vs.get_core()
+                from vapoursynth import core
                 core.std.AddBorders(video_in, 10, 10, 20, 20).set_output()
 
         .. warning::
@@ -543,6 +592,10 @@ Available mpv-only filters are:
         By default, this uses the special value ``auto``, which sets the option
         to the number of detected logical CPU cores.
 
+    ``user-data``
+        Optional arbitrary string that is passed to the script. Default to empty
+        string if not set.
+
     The following ``.vpy`` script variables are defined by mpv:
 
     ``video_in``
@@ -560,12 +613,22 @@ Available mpv-only filters are:
         completely broken (e.g. 0 or NaN). Even if the value is correct,
         if another filter changes the real FPS (by dropping or inserting
         frames), the value of this variable will not be useful. Note that
-        the ``--fps`` command line option overrides this value.
+        the ``--container-fps-override`` command line option overrides this value.
 
         Useful for some filters which insist on having a FPS.
 
     ``display_fps``
         Refresh rate of the current display. Note that this value can be 0.
+
+    ``display_res``
+        Resolution of the current display. This is an integer array with the
+        first entry corresponding to the width and the second entry corresponding
+        to the height. These values can be 0. Note that this will not respond to
+        monitor changes and may not work on all platforms.
+
+    ``user_data``
+        User data passed from the filter. This variable always exists, and defaults
+        to empty string.
 
 ``vavpp``
     VA-API video post processing. Requires the system to support VA-API,
@@ -598,7 +661,7 @@ Available mpv-only filters are:
 
     ``reversal-bug=<yes|no>``
         :no:  Use the API as it was interpreted by older Mesa drivers. While
-              this interpretation was more obvious and inuitive, it was
+              this interpretation was more obvious and intuitive, it was
               apparently wrong, and not shared by Intel driver developers.
         :yes: Use Intel interpretation of surface forward and backwards
               references (default). This is what Intel drivers and newer Mesa
@@ -657,19 +720,107 @@ Available mpv-only filters are:
             Apply high quality VDPAU scaling (needs capable hardware).
 
 ``d3d11vpp``
-    Direct3D 11 video post processing. Currently requires D3D11 hardware
-    decoding for use.
+    Direct3D 11 video post-processing. Requires a D3D11 context and works best
+    with hardware decoding. Software frames are automatically uploaded to hardware
+    for processing.
 
+    ``format``
+        Convert to the selected image format, e.g., nv12, p010, etc. (default: don't change).
+        Format names can be queried with ``--vf=d3d11vpp=format=help``.
+        Note that only a limited subset is supported, and actual support depends
+        on your hardware. Normally, this shouldn't be changed unless some
+        processing only works with a specific format, in which case it can be
+        selected here.
     ``deint=<yes|no>``
         Whether deinterlacing is enabled (default: no).
+    ``scale``
+        Scaling factor for the video frames (default: 1.0).
+    ``scaling-mode=<standard,intel,nvidia>``
+        Select the scaling mode to be used. Note that this only enables the
+        appropriate processing extensions; whether it actually works or not
+        depends on your hardware and the settings in your GPU driver's control
+        panel (default: standard).
+
+        standard
+            Default scaling mode as decided by d3d11vpp implementation.
+        intel
+            Intel Video Super Resolution.
+        nvidia
+            NVIDIA RTX Super Resolution.
     ``interlaced-only=<yes|no>``
         If ``yes``, only deinterlace frames marked as interlaced (default: no).
-    ``mode=<blend|bob|adaptive|mocomp|ivctc|none>``
+    ``mode=<blend|bob|adaptive|mocomp|ivtc|none>``
         Tries to select a video processor with the given processing capability.
-        If a video processor supports multiple capabilities, it is not clear
-        which algorithm is actually selected. ``none`` always falls back. On
-        most if not all hardware, this option will probably do nothing, because
-        a video processor usually supports all modes or none.
+        If a video processor supports multiple capabilities, it is not guaranteed
+        which algorithm will actually be selected, this is left to the driver.
+        However, ``blend`` and ``bob`` modes are enforced by not passing reference
+        frames and adjusting the output frame rate. The other modes are used to
+        select an appropriate video processor, but the algorithm chosen depends
+        on the driver and the content. ``ivtc`` mode outputs at the half rate.
+
+    .. note::
+
+        ``ivtc`` mode only performs field matching and does not drop duplicate
+        frames. Duplicated frames can be removed manually using the ``decimate``
+        filter: ``--vf=d3d11vpp="deint:mode=ivtc,format=nv12,decimate=5"`` for
+        3:2 pulldown cadence. ``format=nv12`` is required to download frames back
+        to the CPU for decimation, the format should match the underlying format
+        of the d3d11 frame.
+
+    ``nvidia-true-hdr``
+        Enable NVIDIA RTX Video HDR processing. This only converts SDR to HDR,
+        so it is ignored when the source is already HDR.
+
+``amf_frc``
+    AMD Frame Rate Conversion filter. Requires AMD hardware and drivers
+    supporting AMF FRC.
+
+    AMF FRC is a technique for achieving high-end video frame rate conversion
+    results from lower frame rate video inputs. The filter doubles the input
+    frame rate by generating intermediate frames.
+
+    AMF FRC only supports D3D11 input currently. Use `--hwdec=d3d11va` or
+    `--vf-pre=format=d3d11` to upload the data. `--d3d11va-zero-copy` is also
+    recommended for better performance.
+
+    ``profile=<auto|low|high|super>``
+        Selects the quality profile for frame rate conversion.
+
+        ``auto`` (default)
+            Select profile based on input resolution. Uses ``high`` for
+            resolutions up to 1440p, and ``super`` for 1440p and higher.
+        ``low``
+            Less levels of hierarchical motion search. Only recommended for
+            extremely low resolutions.
+        ``high``
+            Recommended for any resolution up to 1440p.
+        ``super``
+            More levels of hierarchical motion search. Recommended for
+            resolutions 1440p or higher.
+
+    ``mv-search=<native|performance>``
+        Selects the motion vector search mode.
+
+        ``native`` (default)
+            Conduct motion search on the full resolution of source images.
+        ``performance``
+            Conduct motion search on the down scaled source images.
+            Recommended for APU or low end GPU for better performance.
+
+    ``fallback``
+        In case confidence is too low to do interpolation, fall back to simple
+        frame blending. If not set, the filter will repeat the last frame instead.
+        (default: no)
+
+    ``indicator``
+        Specifies whether or not the FRC indicator square is shown in the top
+        left corner of the video. (default: no)
+
+    ``future-frame``
+        When enabled, the information contained in the next frame in the
+        sequence will be used in FRC interpolation calculations, in addition to
+        the current pair of frames. This will introduce one extra frame time of
+        latency. (default: yes)
 
 ``fingerprint=...``
     Compute video frame fingerprints and provide them as metadata. Actually, it
@@ -738,16 +889,26 @@ Available mpv-only filters are:
         which leads to lost frames.
 
     ``print=yes|no``
-        Print computed fingerprints the the terminal (default: no). This is
+        Print computed fingerprints to the terminal (default: no). This is
         mostly for testing and such. Scripts should use ``vf-metadata`` to
         read information from this filter instead.
 
 ``gpu=...``
-    Convert video to RGB using the OpenGL renderer normally used with
-    ``--vo=gpu``. This requires that the EGL implementation supports off-screen
-    rendering on the default display. (This is the case with Mesa.)
+    Convert video to RGB using the Vulkan or OpenGL renderer normally used with
+    ``--vo=gpu``. In case of OpenGL, this requires that the EGL implementation
+    supports off-screen rendering on the default display. (This is the case with
+    Mesa.)
 
     Sub-options:
+
+    ``api=<type>``
+        The value ``type`` selects the rendering API. You can also pass
+        ``help`` to get a complete list of compiled in backends.
+
+        egl
+            EGL (default if available)
+        vulkan
+            Vulkan
 
     ``w=<pixels>``, ``h=<pixels>``
         Size of the output in pixels (default: 0). If not positive, this will
@@ -776,4 +937,3 @@ Available mpv-only filters are:
         Do not use this with ``--vo=gpu``. It will apply filtering twice, since
         most ``--vo=gpu`` options are unconditionally applied to the ``gpu``
         filter. There is no mechanism in mpv to prevent this.
-

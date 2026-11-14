@@ -18,8 +18,6 @@
 /// \file
 /// \ingroup Properties
 
-#include "config.h"
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,101 +26,168 @@
 
 #include <libavutil/common.h>
 
-#include "libmpv/client.h"
+#include "mpv/client.h"
 
 #include "mpv_talloc.h"
 #include "m_option.h"
 #include "m_property.h"
 #include "common/msg.h"
 #include "common/common.h"
+#include "player/client.h"
 
-static int m_property_multiply(struct mp_log *log,
-                               const struct m_property *prop_list,
-                               const char *property, double f, void *ctx)
+static int compare_prop_name(const void *pa, const void *pb)
 {
-    union m_option_value val = {0};
-    struct m_option opt = {0};
-    int r;
-
-    r = m_property_do(log, prop_list, property, M_PROPERTY_GET_CONSTRICTED_TYPE,
-                      &opt, ctx);
-    if (r != M_PROPERTY_OK)
-        return r;
-    assert(opt.type);
-
-    if (!opt.type->multiply)
-        return M_PROPERTY_NOT_IMPLEMENTED;
-
-    r = m_property_do(log, prop_list, property, M_PROPERTY_GET, &val, ctx);
-    if (r != M_PROPERTY_OK)
-        return r;
-    opt.type->multiply(&opt, &val, f);
-    r = m_property_do(log, prop_list, property, M_PROPERTY_SET, &val, ctx);
-    m_option_free(&opt, &val);
-    return r;
+    const struct m_property *a = pa, *b = pb;
+    return strcmp(a->name, b->name);
 }
 
-struct m_property *m_property_list_find(const struct m_property *list,
+void m_property_list_sort(struct m_property_list *list)
+{
+    qsort(list->props, list->num, sizeof(list->props[0]), compare_prop_name);
+}
+
+static int search_prop_name(const void *pkey, const void *pelem)
+{
+    const struct m_property *prop = pelem;
+    return bstrcmp0(*(const bstr *)pkey, prop->name);
+}
+
+static struct m_property *find_prop(const struct m_property_list *list,
+                                    bstr name)
+{
+    return bsearch(&name, list->props, list->num, sizeof(list->props[0]),
+                   search_prop_name);
+}
+
+struct m_property *m_property_list_find(const struct m_property_list *list,
                                         const char *name)
 {
-    for (int n = 0; list && list[n].name; n++) {
-        if (strcmp(list[n].name, name) == 0)
-            return (struct m_property *)&list[n];
-    }
-    return NULL;
+    return find_prop(list, bstr0(name));
 }
 
-static int do_action(const struct m_property *prop_list, const char *name,
-                     int action, void *arg, void *ctx)
+// Find the property for name, which may have the form "base/key". *key is set
+// to the part after the slash, or to NULL if there is none.
+static struct m_property *resolve_name(const struct m_property_list *list,
+                                       const char *name, const char **key)
 {
-    struct m_property *prop;
-    struct m_property_action_arg ka;
+    *key = NULL;
     const char *sep = strchr(name, '/');
     if (sep && sep[1]) {
-        char base[128];
-        snprintf(base, sizeof(base), "%.*s", (int)(sep - name), name);
-        prop = m_property_list_find(prop_list, base);
-        ka = (struct m_property_action_arg) {
-            .key = sep + 1,
+        *key = sep + 1;
+        return find_prop(list, bstr_splice(bstr0(name), 0, sep - name));
+    }
+    return find_prop(list, bstr0(name));
+}
+
+static int do_action(struct m_property *prop, const char *key, int action,
+                     void *arg, void *ctx)
+{
+    if (key) {
+        struct m_property_action_arg ka = {
+            .key = key,
             .action = action,
             .arg = arg,
         };
-        action = M_PROPERTY_KEY_ACTION;
-        arg = &ka;
-    } else
-        prop = m_property_list_find(prop_list, name);
-    if (!prop)
-        return M_PROPERTY_UNKNOWN;
+        return prop->call(ctx, prop, M_PROPERTY_KEY_ACTION, &ka);
+    }
     return prop->call(ctx, prop, action, arg);
 }
 
-// (as a hack, log can be NULL on read-only paths)
-int m_property_do(struct mp_log *log, const struct m_property *prop_list,
-                  const char *name, int action, void *arg, void *ctx)
+static int m_property_multiply(struct mp_log *log, struct m_property *prop,
+                               const char *key, double f, void *ctx,
+                               struct m_option *opt)
 {
-    union m_option_value val = {0};
+    union m_option_value val = m_option_value_default;
     int r;
 
-    struct m_option opt = {0};
-    r = do_action(prop_list, name, M_PROPERTY_GET_TYPE, &opt, ctx);
-    if (r <= 0)
+    mp_require(log);
+    if (!opt->type->multiply)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+
+    r = do_action(prop, key, M_PROPERTY_GET, &val, ctx);
+    if (r != M_PROPERTY_OK)
         return r;
-    assert(opt.type);
+    opt->type->multiply(opt, &val, f);
+    r = do_action(prop, key, M_PROPERTY_SET, &val, ctx);
+    m_option_free(opt, &val);
+    return r;
+}
+
+static int m_property_switch(struct mp_log *log, struct m_property *prop,
+                             const char *key, void *arg, void *ctx,
+                             struct m_option *opt)
+{
+    union m_option_value val = m_option_value_default;
+    int r;
+
+    mp_require(log);
+    struct m_property_switch_arg *sarg = arg;
+    if ((r = do_action(prop, key, M_PROPERTY_SWITCH, arg, ctx)) !=
+        M_PROPERTY_NOT_IMPLEMENTED)
+        return r;
+    // Fallback to m_option
+    if (!opt->type->add)
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    if ((r = do_action(prop, key, M_PROPERTY_GET, &val, ctx)) <= 0)
+        return r;
+    opt->type->add(opt, &val, sarg->inc, sarg->wrap);
+    r = do_action(prop, key, M_PROPERTY_SET, &val, ctx);
+    m_option_free(opt, &val);
+    return r;
+}
+
+// (as a hack, log can be NULL on read-only paths)
+int m_property_do(struct mp_log *log, const struct m_property_list *prop_list,
+                  const char *name, int action, void *arg, void *ctx)
+{
+    union m_option_value val = m_option_value_default;
+    int r;
+
+    const char *key;
+    struct m_property *prop = resolve_name(prop_list, name, &key);
+    if (!prop)
+        return M_PROPERTY_UNKNOWN;
+
+    struct m_option opt = {0};
+    bool get_opt_required[M_PROPERTY_MAX_ACTION] = {
+        [M_PROPERTY_FIXED_LEN_PRINT] = true, [M_PROPERTY_PRINT] = true,
+        [M_PROPERTY_PRINT_UNCUT] = true, [M_PROPERTY_GET_STRING] = true,
+        [M_PROPERTY_MULTIPLY] = true, [M_PROPERTY_SWITCH] = true,
+        [M_PROPERTY_GET_NODE] = true, [M_PROPERTY_SET_NODE] = true,
+    };
+    if (get_opt_required[action]) {
+        r = do_action(prop, key, M_PROPERTY_GET_TYPE, &opt, ctx);
+        if (r <= 0)
+            return r;
+        mp_assert(opt.type);
+        // Make sure dynamic range from properties with M_PROPERTY_GET_CONSTRICTED_TYPE is applied
+        struct m_option copt = {0};
+        r = do_action(prop, key, M_PROPERTY_GET_CONSTRICTED_TYPE, &copt, ctx);
+        if (r == M_PROPERTY_OK) {
+            opt.min = copt.min;
+            opt.max = copt.max;
+        }
+    }
 
     switch (action) {
+    case M_PROPERTY_PRINT_UNCUT:
+    case M_PROPERTY_FIXED_LEN_PRINT:
     case M_PROPERTY_PRINT: {
-        if ((r = do_action(prop_list, name, M_PROPERTY_PRINT, arg, ctx)) >= 0)
+        if ((r = do_action(prop, key, action, arg, ctx)) >= 0)
+            return r;
+        if (action == M_PROPERTY_PRINT_UNCUT &&
+            (r = do_action(prop, key, M_PROPERTY_PRINT, arg, ctx)) >= 0)
             return r;
         // Fallback to m_option
-        if ((r = do_action(prop_list, name, M_PROPERTY_GET, &val, ctx)) <= 0)
+        if ((r = do_action(prop, key, M_PROPERTY_GET, &val, ctx)) <= 0)
             return r;
-        char *str = m_option_pretty_print(&opt, &val);
+        char *str = m_option_pretty_print(&opt, &val, action == M_PROPERTY_FIXED_LEN_PRINT);
         m_option_free(&opt, &val);
         *(char **)arg = str;
         return str != NULL;
     }
     case M_PROPERTY_GET_STRING: {
-        if ((r = do_action(prop_list, name, M_PROPERTY_GET, &val, ctx)) <= 0)
+        if ((r = do_action(prop, key, M_PROPERTY_GET, &val, ctx)) <= 0)
             return r;
         char *str = m_option_print(&opt, &val);
         m_option_free(&opt, &val);
@@ -134,46 +199,27 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
         return m_property_do(log, prop_list, name, M_PROPERTY_SET_NODE, &node, ctx);
     }
     case M_PROPERTY_MULTIPLY: {
-        return m_property_multiply(log, prop_list, name, *(double *)arg, ctx);
+        return m_property_multiply(log, prop, key, *(double *)arg, ctx, &opt);
     }
     case M_PROPERTY_SWITCH: {
-        if (!log)
-            return M_PROPERTY_ERROR;
-        struct m_property_switch_arg *sarg = arg;
-        if ((r = do_action(prop_list, name, M_PROPERTY_SWITCH, arg, ctx)) !=
-            M_PROPERTY_NOT_IMPLEMENTED)
-            return r;
-        // Fallback to m_option
-        r = m_property_do(log, prop_list, name, M_PROPERTY_GET_CONSTRICTED_TYPE,
-                          &opt, ctx);
-        if (r <= 0)
-            return r;
-        assert(opt.type);
-        if (!opt.type->add)
-            return M_PROPERTY_NOT_IMPLEMENTED;
-        if ((r = do_action(prop_list, name, M_PROPERTY_GET, &val, ctx)) <= 0)
-            return r;
-        opt.type->add(&opt, &val, sarg->inc, sarg->wrap);
-        r = do_action(prop_list, name, M_PROPERTY_SET, &val, ctx);
-        m_option_free(&opt, &val);
-        return r;
+        return m_property_switch(log, prop, key, arg, ctx, &opt);
     }
     case M_PROPERTY_GET_CONSTRICTED_TYPE: {
-        r = do_action(prop_list, name, action, arg, ctx);
+        r = do_action(prop, key, action, arg, ctx);
         if (r >= 0 || r == M_PROPERTY_UNAVAILABLE)
             return r;
-        if ((r = do_action(prop_list, name, M_PROPERTY_GET_TYPE, arg, ctx)) >= 0)
+        if ((r = do_action(prop, key, M_PROPERTY_GET_TYPE, arg, ctx)) >= 0)
             return r;
         return M_PROPERTY_NOT_IMPLEMENTED;
     }
     case M_PROPERTY_SET: {
-        return do_action(prop_list, name, M_PROPERTY_SET, arg, ctx);
+        return do_action(prop, key, M_PROPERTY_SET, arg, ctx);
     }
     case M_PROPERTY_GET_NODE: {
-        if ((r = do_action(prop_list, name, M_PROPERTY_GET_NODE, arg, ctx)) !=
+        if ((r = do_action(prop, key, M_PROPERTY_GET_NODE, arg, ctx)) !=
             M_PROPERTY_NOT_IMPLEMENTED)
             return r;
-        if ((r = do_action(prop_list, name, M_PROPERTY_GET, &val, ctx)) <= 0)
+        if ((r = do_action(prop, key, M_PROPERTY_GET, &val, ctx)) <= 0)
             return r;
         struct mpv_node *node = arg;
         int err = m_option_get_node(&opt, NULL, node, &val);
@@ -190,28 +236,28 @@ int m_property_do(struct mp_log *log, const struct m_property *prop_list,
     case M_PROPERTY_SET_NODE: {
         if (!log)
             return M_PROPERTY_ERROR;
-        if ((r = do_action(prop_list, name, M_PROPERTY_SET_NODE, arg, ctx)) !=
+        if ((r = do_action(prop, key, M_PROPERTY_SET_NODE, arg, ctx)) !=
             M_PROPERTY_NOT_IMPLEMENTED)
             return r;
-        int err = m_option_set_node_or_string(log, &opt, name, &val, arg);
+        int err = m_option_set_node_or_string(log, &opt, bstr0(name), &val, arg);
         if (err == M_OPT_UNKNOWN) {
             r = M_PROPERTY_NOT_IMPLEMENTED;
         } else if (err < 0) {
             r = M_PROPERTY_INVALID_FORMAT;
         } else {
-            r = do_action(prop_list, name, M_PROPERTY_SET, &val, ctx);
+            r = do_action(prop, key, M_PROPERTY_SET, &val, ctx);
         }
         m_option_free(&opt, &val);
         return r;
     }
     default:
-        return do_action(prop_list, name, action, arg, ctx);
+        return do_action(prop, key, action, arg, ctx);
     }
 }
 
-bool m_property_split_path(const char *path, bstr *prefix, char **rem)
+bool m_property_split_path(const char *path, bstr *prefix, const char **rem)
 {
-    char *next = strchr(path, '/');
+    const char *next = strchr(path, '/');
     if (next) {
         *prefix = bstr_splice(bstr0(path), 0, next - path);
         *rem = next + 1;
@@ -236,14 +282,13 @@ static void m_property_unkey(int *action, void **arg)
     }
 }
 
-static int m_property_do_bstr(const struct m_property *prop_list, bstr name,
+static int m_property_do_bstr(const struct m_property_list *prop_list, bstr name,
                               int action, void *arg, void *ctx)
 {
-    char name0[64];
-    if (name.len >= sizeof(name0))
-        return M_PROPERTY_UNKNOWN;
-    snprintf(name0, sizeof(name0), "%.*s", BSTR_P(name));
-    return m_property_do(NULL, prop_list, name0, action, arg, ctx);
+    char *name0 = bstrdup0(NULL, name);
+    int ret = m_property_do(NULL, prop_list, name0, action, arg, ctx);
+    talloc_free(name0);
+    return ret;
 }
 
 static void append_str(char **s, int *len, bstr append)
@@ -254,18 +299,21 @@ static void append_str(char **s, int *len, bstr append)
     *len = *len + append.len;
 }
 
-static int expand_property(const struct m_property *prop_list, char **ret,
-                           int *ret_len, bstr prop, bool silent_error, void *ctx)
+static int expand_property(const struct m_property_list *prop_list, char **ret,
+                           int *ret_len, bstr prop, bool silent_error, void *ctx,
+                           int print_action)
 {
     bool cond_yes = bstr_eatstart0(&prop, "?");
     bool cond_no = !cond_yes && bstr_eatstart0(&prop, "!");
     bool test = cond_yes || cond_no;
     bool raw = bstr_eatstart0(&prop, "=");
+    bool fixed_len = !raw && bstr_eatstart0(&prop, ">");
     bstr comp_with = {0};
     bool comp = test && bstr_split_tok(prop, "==", &prop, &comp_with);
     if (test && !comp)
         raw = true;
-    int method = raw ? M_PROPERTY_GET_STRING : M_PROPERTY_PRINT;
+    int method = raw ? M_PROPERTY_GET_STRING : print_action;
+    method = fixed_len ? M_PROPERTY_FIXED_LEN_PRINT : method;
 
     char *s = NULL;
     int r = m_property_do_bstr(prop_list, prop, method, &s, ctx);
@@ -285,21 +333,25 @@ static int expand_property(const struct m_property *prop_list, char **ret,
     return skip;
 }
 
-char *m_properties_expand_string(const struct m_property *prop_list,
-                                 const char *str0, void *ctx)
+char *m_properties_expand_string(const struct m_property_list *prop_list,
+                                 const char *str0, void *ctx, int print_action)
 {
     char *ret = NULL;
     int ret_len = 0;
     bool skip = false;
     int level = 0, skip_level = 0;
     bstr str = bstr0(str0);
+    int last_brace = bstrrchr(str, '}');
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    int n = 0;
+#endif
 
     while (str.len) {
         if (level > 0 && bstr_eatstart0(&str, "}")) {
             if (skip && level <= skip_level)
                 skip = false;
             level--;
-        } else if (bstr_startswith0(str, "${") && bstr_find0(str, "}") >= 0) {
+        } else if (bstr_startswith0(str, "${") && str.start - (unsigned char *)str0 < last_brace) {
             str = bstr_cut(str, 2);
             level++;
 
@@ -310,9 +362,14 @@ char *m_properties_expand_string(const struct m_property *prop_list,
             str = bstr_cut(str, term_pos);
             bool have_fallback = bstr_eatstart0(&str, ":");
 
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+            if (n++ > 10)
+                break;
+#endif
+
             if (!skip) {
                 skip = expand_property(prop_list, &ret, &ret_len, name,
-                                       have_fallback, ctx);
+                                       have_fallback, ctx, print_action);
                 if (skip)
                     skip_level = level;
             }
@@ -342,27 +399,22 @@ char *m_properties_expand_string(const struct m_property *prop_list,
 }
 
 void m_properties_print_help_list(struct mp_log *log,
-                                  const struct m_property *list)
+                                  const struct m_property_list *list)
 {
-    int count = 0;
-
     mp_info(log, "Name\n\n");
-    for (int i = 0; list[i].name; i++) {
-        const struct m_property *p = &list[i];
-        mp_info(log, " %s\n", p->name);
-        count++;
-    }
-    mp_info(log, "\nTotal: %d properties\n", count);
+    for (int i = 0; i < list->num; i++)
+        mp_info(log, " %s\n", list->props[i].name);
+    mp_info(log, "\nTotal: %d properties\n", list->num);
 }
 
-int m_property_flag_ro(int action, void* arg, int var)
+int m_property_bool_ro(int action, void* arg, bool var)
 {
     switch (action) {
     case M_PROPERTY_GET:
-        *(int *)arg = !!var;
+        *(bool *)arg = !!var;
         return M_PROPERTY_OK;
     case M_PROPERTY_GET_TYPE:
-        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_FLAG};
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_BOOL};
         return M_PROPERTY_OK;
     }
     return M_PROPERTY_NOT_IMPLEMENTED;
@@ -435,6 +487,23 @@ int m_property_strdup_ro(int action, void* arg, const char *var)
     return M_PROPERTY_NOT_IMPLEMENTED;
 }
 
+int m_property_read_sub_validate(void *ctx, struct m_property *prop,
+                                 int action, void *arg)
+{
+    m_property_unkey(&action, &arg);
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET:
+    case M_PROPERTY_PRINT:
+    case M_PROPERTY_KEY_ACTION:
+        return M_PROPERTY_VALID;
+    default:
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    };
+}
+
 // This allows you to make a list of values (like from a struct) available
 // as a number of sub-properties. The property list is set up with the current
 // property values on the stack before calling this function.
@@ -446,7 +515,8 @@ int m_property_read_sub(const struct m_sub_property *props, int action, void *ar
     case M_PROPERTY_GET_TYPE:
         *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
         return M_PROPERTY_OK;
-    case M_PROPERTY_GET: {
+    case M_PROPERTY_GET:
+    case M_PROPERTY_GET_NODE: {
         struct mpv_node node;
         node.format = MPV_FORMAT_NODE_MAP;
         node.u.list = talloc_zero(NULL, mpv_node_list);
@@ -532,7 +602,8 @@ int m_property_read_list(int action, void *arg, int count,
     case M_PROPERTY_GET_TYPE:
         *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
         return M_PROPERTY_OK;
-    case M_PROPERTY_GET: {
+    case M_PROPERTY_GET:
+    case M_PROPERTY_GET_NODE: {
         struct mpv_node node;
         node.format = MPV_FORMAT_NODE_ARRAY;
         node.u.list = talloc_zero(NULL, mpv_node_list);
@@ -543,12 +614,14 @@ int m_property_read_list(int action, void *arg, int count,
             sub->format = MPV_FORMAT_NONE;
             int r;
             r = get_item(n, M_PROPERTY_GET_NODE, sub, ctx);
-            if (r == M_PROPERTY_NOT_IMPLEMENTED) {
+            if (r >= 0) {
+                talloc_steal(node.u.list, node_get_alloc(sub));
+            } else if (r == M_PROPERTY_NOT_IMPLEMENTED) {
                 struct m_option opt = {0};
                 r = get_item(n, M_PROPERTY_GET_TYPE, &opt, ctx);
                 if (r != M_PROPERTY_OK)
                     goto err;
-                union m_option_value val = {0};
+                union m_option_value val = m_option_value_default;
                 r = get_item(n, M_PROPERTY_GET, &val, ctx);
                 if (r != M_PROPERTY_OK)
                     goto err;
@@ -592,19 +665,17 @@ int m_property_read_list(int action, void *arg, int count,
             return M_PROPERTY_NOT_IMPLEMENTED;
         }
         // This is expected of the form "123" or "123/rest"
-        char *next = strchr(ka->key, '/');
-        char *end = NULL;
-        const char *key_end = ka->key + strlen(ka->key);
+        char *end;
         long int item = strtol(ka->key, &end, 10);
         // not a number, trailing characters, etc.
-        if ((end != key_end || ka->key == key_end) && end != next)
+        if (end == ka->key || (end[0] == '/' && !end[1]))
             return M_PROPERTY_UNKNOWN;
         if (item < 0 || item >= count)
             return M_PROPERTY_UNKNOWN;
-        if (next) {
+        if (*end) {
             // Sub-path
             struct m_property_action_arg n_ka = *ka;
-            n_ka.key = next + 1;
+            n_ka.key = end + 1;
             return get_item(item, M_PROPERTY_KEY_ACTION, &n_ka, ctx);
         } else {
             // Direct query

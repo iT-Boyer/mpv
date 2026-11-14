@@ -39,6 +39,7 @@ struct mp_refqueue {
     int needed_past_frames;
     int needed_future_frames;
     int flags;
+    int field_parity;
 
     bool second_field; // current frame has to output a second field yet
     bool eof;
@@ -68,8 +69,7 @@ struct mp_refqueue *mp_refqueue_alloc(struct mp_filter *f)
     q->filter = f;
 
     q->conv = mp_autoconvert_create(f);
-    if (!q->conv)
-        abort();
+    MP_HANDLE_OOM(q->conv);
 
     q->in = q->conv->f->pins[1];
     mp_pin_connect(q->conv->f->pins[0], f->ppins[0]);
@@ -87,7 +87,7 @@ void mp_refqueue_add_in_format(struct mp_refqueue *q, int fmt, int subfmt)
 // The minimum number of frames required before and after the current frame.
 void mp_refqueue_set_refs(struct mp_refqueue *q, int past, int future)
 {
-    assert(past >= 0 && future >= 0);
+    mp_assert(past >= 0 && future >= 0);
     q->needed_past_frames = past;
     q->needed_future_frames = MPMAX(future, 1); // at least 1 for determining PTS
 }
@@ -96,6 +96,11 @@ void mp_refqueue_set_refs(struct mp_refqueue *q, int past, int future)
 void mp_refqueue_set_mode(struct mp_refqueue *q, int flags)
 {
     q->flags = flags;
+}
+
+void mp_refqueue_set_parity(struct mp_refqueue *q, int parity)
+{
+    q->field_parity = parity;
 }
 
 // Whether the current frame should be deinterlaced.
@@ -115,7 +120,13 @@ bool mp_refqueue_is_top_field(struct mp_refqueue *q)
     if (!mp_refqueue_has_output(q))
         return false;
 
-    return !!(q->queue[q->pos]->fields & MP_IMGFIELD_TOP_FIRST) ^ q->second_field;
+    bool tff = q->field_parity == MP_FIELD_PARITY_TFF;
+    bool bff = q->field_parity == MP_FIELD_PARITY_BFF;
+    bool ret = (!!(q->queue[q->pos]->fields & MP_IMGFIELD_TOP_FIRST) ^ q->second_field
+                && !tff && !bff); // Default parity
+    ret = ret || (tff && !q->second_field); // Check if top field is forced
+    ret = ret || (bff && q->second_field); // Check if bottom field is forced
+    return ret;
 }
 
 // Whether top-field-first mode is enabled.
@@ -124,7 +135,9 @@ bool mp_refqueue_top_field_first(struct mp_refqueue *q)
     if (!mp_refqueue_has_output(q))
         return false;
 
-    return q->queue[q->pos]->fields & MP_IMGFIELD_TOP_FIRST;
+    bool tff = q->field_parity == MP_FIELD_PARITY_TFF;
+    bool bff = q->field_parity == MP_FIELD_PARITY_BFF;
+    return ((q->queue[q->pos]->fields & MP_IMGFIELD_TOP_FIRST) || tff) && !bff;
 }
 
 // Discard all state.
@@ -141,12 +154,12 @@ void mp_refqueue_flush(struct mp_refqueue *q)
 
 static void mp_refqueue_add_input(struct mp_refqueue *q, struct mp_image *img)
 {
-    assert(img);
+    mp_assert(img);
 
     MP_TARRAY_INSERT_AT(q, q->queue, q->num_queue, 0, img);
     q->pos++;
 
-    assert(q->pos >= 0 && q->pos < q->num_queue);
+    mp_assert(q->pos >= 0 && q->pos < q->num_queue);
 }
 
 static bool mp_refqueue_need_input(struct mp_refqueue *q)
@@ -163,12 +176,12 @@ static bool output_next_field(struct mp_refqueue *q)
 {
     if (q->second_field)
         return false;
-    if (!(q->flags & MP_MODE_OUTPUT_FIELDS))
+    if (!mp_refqueue_output_fields(q))
         return false;
     if (!mp_refqueue_should_deint(q))
         return false;
 
-    assert(q->pos >= 0);
+    mp_assert(q->pos >= 0);
 
     // If there's no (reasonable) timestamp, also skip the field.
     if (q->pos == 0)
@@ -197,16 +210,16 @@ static void mp_refqueue_next(struct mp_refqueue *q)
     q->pos--;
     q->second_field = false;
 
-    assert(q->pos >= -1 && q->pos < q->num_queue);
+    mp_assert(q->pos >= -1 && q->pos < q->num_queue);
 
     // Discard unneeded past frames.
     while (q->num_queue - (q->pos + 1) > q->needed_past_frames) {
-        assert(q->num_queue > 0);
+        mp_assert(q->num_queue > 0);
         talloc_free(q->queue[q->num_queue - 1]);
         q->num_queue--;
     }
 
-    assert(q->pos >= -1 && q->pos < q->num_queue);
+    mp_assert(q->pos >= -1 && q->pos < q->num_queue);
 }
 
 // Advance current field, depending on interlace flags.
@@ -267,8 +280,6 @@ struct mp_image *mp_refqueue_execute_reinit(struct mp_refqueue *q)
     mp_refqueue_flush(q);
 
     q->in_format = mp_image_new_ref(cur);
-    if (!q->in_format)
-        abort();
     mp_image_unref_data(q->in_format);
 
     mp_refqueue_add_input(q, cur);
@@ -322,7 +333,7 @@ bool mp_refqueue_can_output(struct mp_refqueue *q)
 
     if (!q->in_format || !!q->in_format->hwctx != !!img->hwctx ||
         (img->hwctx && img->hwctx->data != q->in_format->hwctx->data) ||
-        !mp_image_params_equal(&q->in_format->params, &img->params))
+        !mp_image_params_static_equal(&q->in_format->params, &img->params))
     {
         q->next = img;
         q->eof = true;
@@ -356,4 +367,9 @@ void mp_refqueue_write_out_pin(struct mp_refqueue *q, struct mp_image *mpi)
 struct mp_image *mp_refqueue_get_format(struct mp_refqueue *q)
 {
     return q->in_format;
+}
+
+bool mp_refqueue_output_fields(struct mp_refqueue *q)
+{
+    return q->flags & MP_MODE_OUTPUT_FIELDS;
 }

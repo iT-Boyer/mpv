@@ -32,9 +32,36 @@ API changes
 
 ::
 
+ --- mpv 0.42.0 ---
+ 2.6    - add MPV_RENDER_API_TYPE_D3D11 render API backend, along with
+          MPV_RENDER_PARAM_D3D11_INIT_PARAMS and MPV_RENDER_PARAM_D3D11_FBO,
+          and a new render_d3d11.h header.
+ --- mpv 0.40.0 ---
+ 2.5    - Deprecate MPV_RENDER_PARAM_AMBIENT_LIGHT. no replacement.
+ --- mpv 0.39.0 ---
+ 2.4    - mpv_render_param with the MPV_RENDER_PARAM_ICC_PROFILE argument no
+          longer has incorrect assumptions about memory allocation and can be
+          correctly used.
+ --- mpv 0.38.0 ---
+ 2.3    - partially revert the changes from API version 1.27, remove libmpv as
+          the default VO and move it to the bottom of the auto-probing order.
+          This restores the prior behavior on all platforms other than macOS,
+          but still auto selects libmpv/cocoa-cb on macOS if it was built with
+          support for cocoa-cb.
+ --- mpv 0.37.0 ---
+ 2.2    - add mpv_time_ns()
+ --- mpv 0.36.0 ---
+ 2.1    - add mpv_del_property()
+ --- mpv 0.35.0 ---
+ 2.0    - remove headers/functions of the obsolete opengl_cb API
+        - remove mpv_opengl_init_params.extra_exts field
+        - remove deprecated mpv_detach_destroy. Use mpv_destroy instead.
+        - remove obsolete mpv_suspend and mpv_resume
+        - remove deprecated SCRIPT_INPUT_DISPATCH, PAUSE and UNPAUSE, TRACKS_CHANGED
+          TRACK_SWITCHED, METADATA_UPDATE, CHAPTER_CHANGE events
  --- mpv 0.33.0 ---
  1.109  - add MPV_RENDER_API_TYPE_SW and related (software rendering API)
-        - inactivate the opengl_cb API (always fails to initialize now)
+        - deactivate the opengl_cb API (always fails to initialize now)
           The opengl_cb API was deprecated over 2 years ago. Use the render API
           instead.
  1.108  - Deprecate MPV_EVENT_IDLE
@@ -54,7 +81,6 @@ API changes
           It is a good idea to write better wrappers for your use, though.
  --- mpv 0.31.0 ---
  1.107  - Deprecate MPV_EVENT_TICK
-
  --- mpv 0.30.0 ---
  1.106  - Add cancel_fn to mpv_stream_cb_info
  1.105  - Fix deadlock problems with MPV_RENDER_PARAM_ADVANCED_CONTROL and if
@@ -72,7 +98,6 @@ API changes
         - add mpv_abort_async_command()
  1.102  - rename struct mpv_opengl_drm_osd_size to mpv_opengl_drm_draw_surface_size
         - rename MPV_RENDER_PARAM_DRM_OSD_SIZE to MPV_RENDER_PARAM_DRM_DRAW_SURFACE_SIZE
-
  --- mpv 0.29.0 ---
  1.101  - add MPV_RENDER_PARAM_ADVANCED_CONTROL and related API
         - add MPV_RENDER_PARAM_NEXT_FRAME_INFO and related symbols
@@ -264,7 +289,6 @@ API changes
         - extend the "--start" option; a leading "+", which was previously
           insignificant is now significant
         - add "cache-free" and "cache-used" properties
-        - OSX: the "coreaudio" AO spdif code is split into a separate AO
+        - macOS: the "coreaudio" AO spdif code is split into a separate AO
  --- mpv 0.4.0 ---
  1.0    - the API is declared stable
-

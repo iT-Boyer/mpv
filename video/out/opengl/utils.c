@@ -23,10 +23,6 @@
 #include <stdarg.h>
 #include <assert.h>
 
-#include <libavutil/sha.h>
-#include <libavutil/intreadwrite.h>
-#include <libavutil/mem.h>
-
 #include "osdep/io.h"
 
 #include "common/common.h"
@@ -80,11 +76,11 @@ void gl_upload_tex(GL *gl, GLenum target, GLenum format, GLenum type,
                    int x, int y, int w, int h)
 {
     int bpp = gl_bytes_per_pixel(format, type);
-    const uint8_t *data = dataptr;
+    uintptr_t data = (uintptr_t)dataptr;
     int y_max = y + h;
     if (w <= 0 || h <= 0 || !bpp)
         return;
-    assert(stride > 0);
+    mp_assert(stride > 0);
     gl->PixelStorei(GL_UNPACK_ALIGNMENT, get_alignment(stride));
     int slice = h;
     if (gl->mpgl_caps & MPGL_CAP_ROW_LENGTH) {
@@ -95,11 +91,11 @@ void gl_upload_tex(GL *gl, GLenum target, GLenum format, GLenum type,
             slice = 1; // very inefficient, but at least it works
     }
     for (; y + slice <= y_max; y += slice) {
-        gl->TexSubImage2D(target, 0, x, y, w, slice, format, type, data);
+        gl->TexSubImage2D(target, 0, x, y, w, slice, format, type, (void *)data);
         data += stride * slice;
     }
     if (y < y_max)
-        gl->TexSubImage2D(target, 0, x, y, w, y_max - y, format, type, data);
+        gl->TexSubImage2D(target, 0, x, y, w, y_max - y, format, type, (void *)data);
     if (gl->mpgl_caps & MPGL_CAP_ROW_LENGTH)
         gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     gl->PixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -108,7 +104,7 @@ void gl_upload_tex(GL *gl, GLenum target, GLenum format, GLenum type,
 bool gl_read_fbo_contents(GL *gl, int fbo, int dir, GLenum format, GLenum type,
                           int w, int h, uint8_t *dst, int dst_stride)
 {
-    assert(dir == 1 || dir == -1);
+    mp_assert(dir == 1 || dir == -1);
     if (fbo == 0 && gl->es)
         return false; // ES can't read from front buffer
     gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -146,7 +142,7 @@ static void gl_vao_enable_attribs(struct gl_vao *vao)
         default:
             abort();
         }
-        assert(e->dim_m == 1);
+        mp_assert(e->dim_m == 1);
 
         gl->EnableVertexAttribArray(n);
         gl->VertexAttribPointer(n, e->dim_v, type, normalized,
@@ -158,8 +154,8 @@ void gl_vao_init(struct gl_vao *vao, GL *gl, int stride,
                  const struct ra_renderpass_input *entries,
                  int num_entries)
 {
-    assert(!vao->vao);
-    assert(!vao->buffer);
+    mp_assert(!vao->vao);
+    mp_assert(!vao->buffer);
 
     *vao = (struct gl_vao){
         .gl = gl,
@@ -221,7 +217,7 @@ static void gl_vao_unbind(struct gl_vao *vao)
 }
 
 // Draw the vertex data (as described by the gl_vao_entry entries) in ptr
-// to the screen. num is the number of vertexes. prim is usually GL_TRIANGLES.
+// to the screen. num is the number of vertices. prim is usually GL_TRIANGLES.
 // If ptr is NULL, then skip the upload, and use the data uploaded with the
 // previous call.
 void gl_vao_draw_data(struct gl_vao *vao, GLenum prim, void *ptr, size_t num)

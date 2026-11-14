@@ -1,6 +1,7 @@
 #include "audio/aframe.h"
 #include "audio/out/ao.h"
 #include "common/global.h"
+#include "common/msg.h"
 #include "options/m_config.h"
 #include "options/m_option.h"
 #include "video/out/vo.h"
@@ -9,6 +10,7 @@
 
 #include "f_autoconvert.h"
 #include "f_auto_filters.h"
+#include "f_enhancement_pair.h"
 #include "f_lavfi.h"
 #include "f_output_chain.h"
 #include "f_utils.h"
@@ -42,6 +44,11 @@ struct chain {
     struct mp_user_filter *input, *output, *convert_wrapper;
     struct mp_autoconvert *convert;
 
+    // Enhancement-layer pair filter wrapper (tail of post_filters). NULL when
+    // no EL is paired.
+    struct mp_user_filter *el_pair;
+    struct sh_stream *el_sh;
+
     struct vo *vo;
     struct ao *ao;
 
@@ -67,10 +74,11 @@ struct mp_user_filter {
 
     bool last_is_active;
 
-    int64_t last_in_pts, last_out_pts;
+    double last_in_pts, last_out_pts;
 
     bool failed;
     bool error_eof_sent;
+    bool in_eof;
 };
 
 static void update_output_caps(struct chain *p)
@@ -100,23 +108,29 @@ static void check_in_format_change(struct mp_user_filter *u,
         struct mp_image *img = frame.data;
 
         if (!mp_image_params_equal(&img->params, &u->last_in_vformat)) {
-            MP_VERBOSE(p, "[%s] %s\n", u->name,
-                       mp_image_params_to_str(&img->params));
-            u->last_in_vformat = img->params;
-
             if (u == p->input) {
                 p->public.input_params = img->params;
+            } else if (u == p->output) {
+                p->public.output_params = img->params;
+            }
+
+            if (!mp_image_params_static_equal(&img->params, &u->last_in_vformat)) {
+                MP_VERBOSE(p, "[%s] %s\n", u->name,
+                           mp_image_params_to_str(&img->params));
 
                 // Unfortunately there's no good place to update these.
                 // But a common case is enabling HW decoding, which
                 // might init some support of them in the VO, and update
                 // the VO's format list.
-                update_output_caps(p);
-            } else if (u == p->output) {
-                p->public.output_params = img->params;
-            }
+                //
+                // But as this is only relevant to the "convert" filter, don't
+                // do this for the other filters as it is wasted work.
+                if (strcmp(u->name, "convert") == 0)
+                    update_output_caps(p);
 
-            p->public.reconfig_happened = true;
+                p->public.reconfig_happened = true;
+            }
+            u->last_in_vformat = img->params;
         }
     }
 
@@ -139,14 +153,14 @@ static void check_in_format_change(struct mp_user_filter *u,
     }
 }
 
-static void process_user(struct mp_filter *f)
+static void user_wrapper_process(struct mp_filter *f)
 {
     struct mp_user_filter *u = f->priv;
     struct chain *p = u->p;
 
     mp_filter_set_error_handler(u->f, f);
     const char *name = u->label ? u->label : u->name;
-    assert(u->name);
+    mp_assert(u->name);
 
     if (!u->failed && mp_filter_has_failed(u->f)) {
         if (u == p->convert_wrapper) {
@@ -163,7 +177,11 @@ static void process_user(struct mp_filter *f)
     }
 
     if (u->failed) {
-        if (u == p->convert_wrapper) {
+        // The convert_wrapper failure is fatal so we must signal EOF. Similarly,
+        // if this wrapper forwarded EOF into the inner filter, that EOF may
+        // be lost. Reset filter may have discarded this frame from failed filter.
+        // Synthesize EOF so downstream doesn't stall indefinitely.
+        if (u == p->convert_wrapper || u->in_eof) {
             if (mp_pin_in_needs_data(f->ppins[1])) {
                 if (!u->error_eof_sent)
                     mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
@@ -184,6 +202,9 @@ static void process_user(struct mp_filter *f)
         double pts = mp_frame_get_pts(frame);
         if (pts != MP_NOPTS_VALUE)
             u->last_in_pts = pts;
+
+        if (frame.type == MP_FRAME_EOF)
+            u->in_eof = true;
 
         mp_pin_in_write(u->f->pins[0], frame);
     }
@@ -206,15 +227,16 @@ static void process_user(struct mp_filter *f)
     }
 }
 
-static void reset_user(struct mp_filter *f)
+static void user_wrapper_reset(struct mp_filter *f)
 {
     struct mp_user_filter *u = f->priv;
 
     u->error_eof_sent = false;
+    u->in_eof = false;
     u->last_in_pts = u->last_out_pts = MP_NOPTS_VALUE;
 }
 
-static void destroy_user(struct mp_filter *f)
+static void user_wrapper_destroy(struct mp_filter *f)
 {
     struct mp_user_filter *u = f->priv;
 
@@ -227,9 +249,9 @@ static void destroy_user(struct mp_filter *f)
 static const struct mp_filter_info user_wrapper_filter = {
     .name = "user_filter_wrapper",
     .priv_size = sizeof(struct mp_user_filter),
-    .process = process_user,
-    .reset = reset_user,
-    .destroy = destroy_user,
+    .process = user_wrapper_process,
+    .reset = user_wrapper_reset,
+    .destroy = user_wrapper_destroy,
 };
 
 static struct mp_user_filter *create_wrapper_filter(struct chain *p)
@@ -262,7 +284,7 @@ static void relink_filter_list(struct chain *p)
             MP_TARRAY_APPEND(p, p->all_filters, p->num_all_filters, filters[i]);
     }
 
-    assert(p->num_all_filters > 0);
+    mp_assert(p->num_all_filters > 0);
 
     p->filters_in = NULL;
     p->filters_out = NULL;
@@ -274,9 +296,12 @@ static void relink_filter_list(struct chain *p)
             mp_pin_connect(f->pins[0], p->filters_out);
         p->filters_out = f->pins[1];
     }
+
+    mp_pin_set_manual_connection_for(p->filters_in, p->f);
+    mp_pin_set_manual_connection_for(p->filters_out, p->f);
 }
 
-static void process(struct mp_filter *f)
+static void output_chain_process(struct mp_filter *f)
 {
     struct chain *p = f->priv;
 
@@ -305,7 +330,7 @@ static void process(struct mp_filter *f)
     }
 }
 
-static void reset(struct mp_filter *f)
+static void output_chain_reset(struct mp_filter *f)
 {
     struct chain *p = f->priv;
 
@@ -335,17 +360,17 @@ void mp_output_chain_reset_harder(struct mp_output_chain *c)
     }
 }
 
-static void destroy(struct mp_filter *f)
+static void output_chain_destroy(struct mp_filter *f)
 {
-    reset(f);
+    output_chain_reset(f);
 }
 
 static const struct mp_filter_info output_chain_filter = {
     .name = "output_chain",
     .priv_size = sizeof(struct chain),
-    .process = process,
-    .reset = reset,
-    .destroy = destroy,
+    .process = output_chain_process,
+    .reset = output_chain_reset,
+    .destroy = output_chain_destroy,
 };
 
 static double get_display_fps(struct mp_stream_info *i)
@@ -357,24 +382,71 @@ static double get_display_fps(struct mp_stream_info *i)
     return res;
 }
 
+static void get_display_res(struct mp_stream_info *i, int *res)
+{
+    struct chain *p = i->priv;
+    if (p->vo)
+        vo_control(p->vo, VOCTRL_GET_DISPLAY_RES, res);
+}
+
 void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
 {
     struct chain *p = c->f->priv;
 
     p->stream_info.hwdec_devs = vo ? vo->hwdec_devs : NULL;
     p->stream_info.osd = vo ? vo->osd : NULL;
+    p->stream_info.vflip = vo ? vo->driver->caps & VO_CAP_VFLIP : false;
     p->stream_info.rotate90 = vo ? vo->driver->caps & VO_CAP_ROTATE90 : false;
     p->stream_info.dr_vo = vo;
     p->vo = vo;
     update_output_caps(p);
 }
 
+void mp_output_chain_set_el_stream(struct mp_output_chain *c,
+                                   struct sh_stream *el_sh)
+{
+    struct chain *p = c->f->priv;
+
+    mp_assert(p->type == MP_OUTPUT_CHAIN_VIDEO);
+
+    if (p->el_sh == el_sh && (!el_sh || p->el_pair))
+        return;
+
+    if (p->el_pair) {
+        for (int n = 0; n < p->num_post_filters; n++) {
+            if (p->post_filters[n] == p->el_pair) {
+                MP_TARRAY_REMOVE_AT(p->post_filters, p->num_post_filters, n);
+                break;
+            }
+        }
+        talloc_free(p->el_pair->wrapper);
+        p->el_pair = NULL;
+        p->el_sh = NULL;
+    }
+
+    if (el_sh) {
+        struct mp_user_filter *u = create_wrapper_filter(p);
+        u->name = "el_pair";
+        u->f = mp_enhancement_pair_create(u->wrapper, el_sh);
+        if (!u->f) {
+            MP_WARN(p, "Failed to set up enhancement-layer pairing.\n");
+            talloc_free(u->wrapper);
+        } else {
+            MP_TARRAY_APPEND(p, p->post_filters, p->num_post_filters, u);
+            p->el_pair = u;
+            p->el_sh = el_sh;
+        }
+    }
+
+    relink_filter_list(p);
+}
+
 void mp_output_chain_set_ao(struct mp_output_chain *c, struct ao *ao)
 {
     struct chain *p = c->f->priv;
 
-    assert(p->public.ao_needs_update); // can't just call it any time
-    assert(!p->ao);
+    mp_assert(p->public.ao_needs_update); // can't just call it any time
+    mp_assert(!p->ao);
 
     p->public.ao_needs_update = false;
 
@@ -457,7 +529,7 @@ static void set_speed_any(struct mp_user_filter **filters, int num_filters,
                           int command, double *speed)
 {
     for (int n = num_filters - 1; n >= 0; n--) {
-        assert(*speed);
+        mp_assert(*speed);
         struct mp_filter_command cmd = {
             .type = command,
             .speed = *speed,
@@ -505,6 +577,17 @@ double mp_output_get_measured_total_delay(struct mp_output_chain *c)
     }
 
     return delay;
+}
+
+bool mp_output_chain_deinterlace_active(struct mp_output_chain *c)
+{
+    struct chain *p = c->f->priv;
+    for (int n = 0; n < p->num_all_filters; n++) {
+        struct mp_user_filter *u = p->all_filters[n];
+        if (strcmp(u->name, "userdeint") == 0)
+            return mp_deint_active(u->f);
+    }
+    return false;
 }
 
 bool mp_output_chain_update_filters(struct mp_output_chain *c,
@@ -605,7 +688,7 @@ bool mp_output_chain_update_filters(struct mp_output_chain *c,
 
 error:
     for (int n = 0; n < num_add; n++)
-        talloc_free(add[n]);
+        talloc_free(add[n]->wrapper);
     talloc_free(add);
     talloc_free(used);
     return false;
@@ -617,6 +700,7 @@ static void create_video_things(struct chain *p)
 
     p->stream_info.priv = p;
     p->stream_info.get_display_fps = get_display_fps;
+    p->stream_info.get_display_res = get_display_res;
 
     p->f->stream_info = &p->stream_info;
 
@@ -626,6 +710,13 @@ static void create_video_things(struct chain *p)
     if (!f->f)
         abort();
     MP_TARRAY_APPEND(p, p->pre_filters, p->num_pre_filters, f);
+
+    f = create_wrapper_filter(p);
+    f->name = "autovflip";
+    f->f = mp_autovflip_create(f->wrapper);
+    if (!f->f)
+        abort();
+    MP_TARRAY_APPEND(p, p->post_filters, p->num_post_filters, f);
 
     f = create_wrapper_filter(p);
     f->name = "autorotate";
@@ -711,7 +802,7 @@ struct mp_output_chain *mp_output_chain_create(struct mp_filter *parent,
 
     relink_filter_list(p);
 
-    reset(f);
+    output_chain_reset(f);
 
     return c;
 }

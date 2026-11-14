@@ -54,6 +54,13 @@ struct ebml_elem_desc {
     int size;
     int field_count;
     const struct ebml_field_desc *fields;
+    bool context_default; // default derives from other elements
+    union {
+        uint64_t u;
+        int64_t i;
+        double f;
+        const char *s;
+    } defval; // default value of a zero-length element
 };
 
 struct ebml_parse_ctx {
@@ -63,7 +70,7 @@ struct ebml_parse_ctx {
     bool no_error_messages;
 };
 
-#include "generated/ebml_types.h"
+#include "ebml_types.h"
 
 #define EBML_ID_INVALID 0xffffffff
 
@@ -78,12 +85,15 @@ struct ebml_parse_ctx {
 #define EBML_UINT_INVALID   UINT64_MAX
 #define EBML_INT_INVALID    INT64_MAX
 
+/* Block Addition Mappings */
+#define MATROSKA_BLOCK_ADD_ID_TYPE_ITU_T_T35 4
+
 bool ebml_is_mkv_level1_id(uint32_t id);
 uint32_t ebml_read_id (stream_t *s);
 uint64_t ebml_read_length (stream_t *s);
 int64_t ebml_read_signed_length(stream_t *s);
-uint64_t ebml_read_uint (stream_t *s);
-int64_t ebml_read_int (stream_t *s);
+bool ebml_read_uint (stream_t *s, uint64_t *out);
+bool ebml_read_int (stream_t *s, int64_t *out);
 int ebml_read_skip(struct mp_log *log, int64_t end, stream_t *s);
 int ebml_resync_cluster(struct mp_log *log, stream_t *s);
 

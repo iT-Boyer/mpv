@@ -16,6 +16,7 @@
  */
 
 #include "video/out/gpu/context.h"
+#include "video/out/present_sync.h"
 #include "video/out/wayland_common.h"
 
 #include "common.h"
@@ -24,36 +25,50 @@
 
 struct priv {
     struct mpvk_ctx vk;
+    bool use_fifo;
 };
 
-static bool wayland_vk_start_frame(struct ra_ctx *ctx)
+static int wayland_vk_color_depth(struct ra_ctx *ctx)
 {
     struct vo_wayland_state *wl = ctx->vo->wl;
-    bool render = !wl->hidden || wl->opts->disable_vsync;
-    wl->frame_wait = true;
+    // If compositor supports color management, assume it is capable of
+    // dithering on its own. Otherwise fallback to 8-bit color depth.
+    return wl->color_manager ? 0 : 8;
+}
 
-    return render;
+static bool wayland_vk_check_visible(struct ra_ctx *ctx)
+{
+    return vo_wayland_check_visible(ctx->vo);
+}
+
+static bool wayland_vk_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+{
+    vo_wayland_handle_color(ctx->vo->wl, params);
+    return true;
+}
+
+static pl_color_space_t wayland_vk_preferred_csp(struct ra_ctx *ctx)
+{
+    return vo_wayland_preferred_csp(ctx->vo);
 }
 
 static void wayland_vk_swap_buffers(struct ra_ctx *ctx)
 {
     struct vo_wayland_state *wl = ctx->vo->wl;
+    struct priv *p = ctx->priv;
 
-    if (!wl->opts->disable_vsync)
+    if ((!p->use_fifo && wl->opts->wl_internal_vsync == 1) || wl->opts->wl_internal_vsync == 2)
         vo_wayland_wait_frame(wl);
 
-    if (wl->presentation)
-        vo_wayland_sync_swap(wl);
+    if (wl->use_present)
+        present_sync_swap(wl->present);
 }
 
 static void wayland_vk_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
 {
     struct vo_wayland_state *wl = ctx->vo->wl;
-    if (wl->presentation) {
-        info->vsync_duration = wl->vsync_duration;
-        info->skipped_vsyncs = wl->last_skipped_vsyncs;
-        info->last_queue_display_time = wl->last_queue_display_time;
-    }
+    if (wl->use_present)
+        present_sync_get_info(wl->present, info);
 }
 
 static void wayland_vk_uninit(struct ra_ctx *ctx)
@@ -83,8 +98,11 @@ static bool wayland_vk_init(struct ra_ctx *ctx)
          .surface = ctx->vo->wl->surface,
     };
 
-    struct ra_vk_ctx_params params = {
-        .start_frame = wayland_vk_start_frame,
+    struct ra_ctx_params params = {
+        .color_depth = wayland_vk_color_depth,
+        .check_visible = wayland_vk_check_visible,
+        .preferred_csp = wayland_vk_preferred_csp,
+        .set_color    = wayland_vk_set_color,
         .swap_buffers = wayland_vk_swap_buffers,
         .get_vsync = wayland_vk_get_vsync,
     };
@@ -96,13 +114,15 @@ static bool wayland_vk_init(struct ra_ctx *ctx)
         goto error;
     }
 
-    /* Because in Wayland clients render whenever they receive a callback from
-     * the compositor, and the fact that the compositor usually stops sending
-     * callbacks once the surface is no longer visible, using FIFO here would
-     * mean the entire player would block on acquiring swapchain images. Hence,
-     * use MAILBOX to guarantee that there'll always be a swapchain image and
-     * the player won't block waiting on those */
-    if (!ra_vk_ctx_init(ctx, vk, params, VK_PRESENT_MODE_MAILBOX_KHR))
+    /* If the Wayland compositor does not support fifo and presentation time
+     * v2 protocols, the compositor will stop sending callbacks if the surface
+     * is no longer visible. This means using FIFO would block the entire vo
+     * thread which is just not good. Use MAILBOX for those compositors to
+     * avoid indefinite blocking. */
+    struct vo_wayland_state *wl = ctx->vo->wl;
+    p->use_fifo = wl->has_fifo && wl->opts->wl_internal_vsync != 2 && wl->presentation &&
+                  wl_proxy_get_version((struct wl_proxy *)wl->presentation) >= 2;
+    if (!ra_vk_ctx_init(ctx, vk, params, p->use_fifo ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR))
         goto error;
 
     ra_add_native_resource(ctx->ra, "wl", ctx->vo->wl->display);
@@ -120,19 +140,17 @@ static bool resize(struct ra_ctx *ctx)
 
     MP_VERBOSE(wl, "Handling resize on the vk side\n");
 
-    const int32_t width = wl->scaling * mp_rect_w(wl->geometry);
-    const int32_t height = wl->scaling * mp_rect_h(wl->geometry);
+    const int32_t width = mp_rect_w(wl->geometry);
+    const int32_t height = mp_rect_h(wl->geometry);
 
     vo_wayland_set_opaque_region(wl, ctx->opts.want_alpha);
+    vo_wayland_handle_scale(wl);
     return ra_vk_ctx_resize(ctx, width, height);
 }
 
 static bool wayland_vk_reconfig(struct ra_ctx *ctx)
 {
-    if (!vo_wayland_reconfig(ctx->vo))
-        return false;
-
-    return true;
+    return vo_wayland_reconfig(ctx->vo);
 }
 
 static int wayland_vk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
@@ -150,9 +168,9 @@ static void wayland_vk_wakeup(struct ra_ctx *ctx)
     vo_wayland_wakeup(ctx->vo);
 }
 
-static void wayland_vk_wait_events(struct ra_ctx *ctx, int64_t until_time_us)
+static void wayland_vk_wait_events(struct ra_ctx *ctx, int64_t until_time_ns)
 {
-    vo_wayland_wait_events(ctx->vo, until_time_us);
+    vo_wayland_wait_events(ctx->vo, until_time_ns);
 }
 
 static void wayland_vk_update_render_opts(struct ra_ctx *ctx)
@@ -165,6 +183,7 @@ static void wayland_vk_update_render_opts(struct ra_ctx *ctx)
 const struct ra_ctx_fns ra_ctx_vulkan_wayland = {
     .type               = "vulkan",
     .name               = "waylandvk",
+    .description        = "Wayland/Vulkan",
     .reconfig           = wayland_vk_reconfig,
     .control            = wayland_vk_control,
     .wakeup             = wayland_vk_wakeup,

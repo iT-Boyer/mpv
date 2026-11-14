@@ -29,6 +29,8 @@
 #include <fcntl.h>
 #include <locale.h>
 
+#include "compiler.h"
+
 #if HAVE_GLOB_POSIX
 #include <glob.h>
 #endif
@@ -73,36 +75,56 @@ static inline int mp_fseeko(FILE* fp, off64_t offset, int whence) {
 #endif
 
 bool mp_set_cloexec(int fd);
+int mp_dup_cloexec(int fd);
 int mp_make_cloexec_pipe(int pipes[2]);
 int mp_make_wakeup_pipe(int pipes[2]);
 void mp_flush_wakeup_pipe(int pipe_end);
 
+FILE *mp_fopen(const char *filename, const char *mode);
+#define fopen(...) mp_fopen(__VA_ARGS__)
+
 #ifdef _WIN32
+
 #include <wchar.h>
 wchar_t *mp_from_utf8(void *talloc_ctx, const char *s);
 char *mp_to_utf8(void *talloc_ctx, const wchar_t *s);
+
+// Use this in win32-specific code rather than PATH_MAX or MAX_PATH.
+// This is necessary because we declare long-path aware support which raises
+// the effective limit without affecting any defines.
+// The actual limit is 32767 but there's a few edge cases that reduce
+// it. So pick this nice round number.
+// Note that this is wchars, not chars.
+#define MP_PATH_MAX (32000)
+
 #endif
 
-#ifdef __CYGWIN__
+#if defined(_WIN32) && !defined(__MINGW32__)
 #include <io.h>
+#include "dirent-win.h"
+#else
+#include <dirent.h>
+#include <unistd.h>
 #endif
 
-#ifdef __MINGW32__
+#ifdef _WIN32
 
 #include <stdio.h>
-#include <dirent.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
-int mp_printf(const char *format, ...);
-int mp_fprintf(FILE *stream, const char *format, ...);
+size_t mp_fwrite(const void *restrict buffer, size_t size, size_t count,
+                 FILE *restrict stream);
+int mp_printf(const char *format, ...) MP_PRINTF_ATTRIBUTE(1, 2);
+int mp_fprintf(FILE *stream, const char *format, ...) MP_PRINTF_ATTRIBUTE(2, 3);
 int mp_open(const char *filename, int oflag, ...);
 int mp_creat(const char *filename, int mode);
-FILE *mp_fopen(const char *filename, const char *mode);
+int mp_rename(const char *oldpath, const char *newpath);
 DIR *mp_opendir(const char *path);
 struct dirent *mp_readdir(DIR *dir);
 int mp_closedir(DIR *dir);
 int mp_mkdir(const char *path, int mode);
+int mp_unlink(const char *path);
 char *mp_win32_getcwd(char *buf, size_t size);
 char *mp_getenv(const char *name);
 
@@ -112,7 +134,13 @@ char *mp_getenv(const char *name);
 #define environ (*mp_penviron())  /* ensure initialization and l-value */
 char ***mp_penviron(void);
 
-off_t mp_lseek(int fd, off_t offset, int whence);
+#undef off_t
+#define off_t int64_t
+off_t mp_lseek64(int fd, off_t offset, int whence);
+int mp_ftruncate64(int fd, off_t length);
+void *mp_dlopen(const char *filename, int flag);
+void *mp_dlsym(void *handle, const char *symbol);
+char *mp_dlerror(void);
 
 // mp_stat types. MSVCRT's dev_t and ino_t are way too short to be unique.
 typedef uint64_t mp_dev_t_;
@@ -157,20 +185,33 @@ int mp_glob(const char *restrict pattern, int flags,
             int (*errfunc)(const char*, int), mp_glob_t *restrict pglob);
 void mp_globfree(mp_glob_t *pglob);
 
+#define fwrite(...) mp_fwrite(__VA_ARGS__)
+#define ftell(...) _ftelli64(__VA_ARGS__)
 #define printf(...) mp_printf(__VA_ARGS__)
 #define fprintf(...) mp_fprintf(__VA_ARGS__)
 #define open(...) mp_open(__VA_ARGS__)
 #define creat(...) mp_creat(__VA_ARGS__)
-#define fopen(...) mp_fopen(__VA_ARGS__)
+#define rename(...) mp_rename(__VA_ARGS__)
 #define opendir(...) mp_opendir(__VA_ARGS__)
 #define readdir(...) mp_readdir(__VA_ARGS__)
 #define closedir(...) mp_closedir(__VA_ARGS__)
 #define mkdir(...) mp_mkdir(__VA_ARGS__)
+#define unlink(...) mp_unlink(__VA_ARGS__)
 #define getcwd(...) mp_win32_getcwd(__VA_ARGS__)
 #define getenv(...) mp_getenv(__VA_ARGS__)
 
 #undef lseek
-#define lseek(...) mp_lseek(__VA_ARGS__)
+#define lseek(...) mp_lseek64(__VA_ARGS__)
+
+#undef ftruncate
+#define ftruncate(...) mp_ftruncate64(__VA_ARGS__)
+
+#define RTLD_NOW 0
+#define RTLD_LOCAL 0
+#define RTLD_GLOBAL 0
+#define dlopen(fn,fg) mp_dlopen((fn), (fg))
+#define dlsym(h,s) mp_dlsym((h), (s))
+#define dlerror mp_dlerror
 
 // Affects both "stat()" and "struct stat".
 #undef stat
@@ -208,14 +249,30 @@ locale_t newlocale(int, const char *, locale_t);
 locale_t uselocale(locale_t);
 void freelocale(locale_t);
 
-#else /* __MINGW32__ */
+#else /* _WIN32 */
 
+#include <dlfcn.h>
 #include <sys/mman.h>
 
 extern char **environ;
 
-#endif /* __MINGW32__ */
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+#include <stdio.h>
+#include <utime.h>
 
-int mp_mkostemps(char *template, int suffixlen, int flags);
+int mp_open(const char *filename, int oflag, ...);
+int mp_mkdir(const char *path, mode_t mode);
+int mp_unlink(const char *path);
+int mp_rename(const char *oldpath, const char *newpath);
+int mp_utime(const char *path, const struct utimbuf *times);
+
+#define open(...) mp_open(__VA_ARGS__)
+#define mkdir(...) mp_mkdir(__VA_ARGS__)
+#define unlink(...) mp_unlink(__VA_ARGS__)
+#define rename(...) mp_rename(__VA_ARGS__)
+#define utime(...) mp_utime(__VA_ARGS__)
+#endif
+
+#endif /* _WIN32 */
 
 #endif

@@ -15,11 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "config.h"
-
 #include <stdlib.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <string.h>
 
 #include <libavcodec/avcodec.h>
@@ -88,6 +85,7 @@ const struct m_sub_options demux_rawaudio_conf = {
         .samplerate = 44100,
         .aformat = PCM(1, 0, 16, 0), // s16le
     },
+    .change_flags = UPDATE_DEMUXER,
 };
 
 #undef PCM
@@ -247,8 +245,7 @@ static int demux_rawvideo_open(demuxer_t *demuxer, enum demux_check check)
     c->disp_h = height;
     if (mp_imgfmt) {
         c->lav_codecpar = avcodec_parameters_alloc();
-        if (!c->lav_codecpar)
-            abort();
+        MP_HANDLE_OOM(c->lav_codecpar);
         c->lav_codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         c->lav_codecpar->codec_id = mp_codec_to_av_codec_id(decoder);
         c->lav_codecpar->format = imgfmt2pixfmt(mp_imgfmt);
@@ -276,7 +273,8 @@ static bool raw_read_packet(struct demuxer *demuxer, struct demux_packet **pkt)
     if (demuxer->stream->eof)
         return false;
 
-    struct demux_packet *dp = new_demux_packet(p->frame_size * p->read_frames);
+    struct demux_packet *dp = new_demux_packet(demuxer->packet_pool,
+                                               p->frame_size * p->read_frames);
     if (!dp) {
         MP_ERR(demuxer, "Can't read packet.\n");
         return true;
